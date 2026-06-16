@@ -14,7 +14,7 @@ CXXFLAGS := -std=c++17 -O2 -pthread $(SIMD)
 OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl)
 OPENSSL_LIBS := $(shell pkg-config --libs openssl)
 
-EMP_CFLAGS := -I$(EMP_PREFIX)/include
+EMP_CFLAGS := -isystem $(EMP_PREFIX)/include -Wno-stringop-overread
 EMP_LIBS := -L$(EMP_PREFIX)/lib -Wl,-rpath,$(EMP_PREFIX)/lib -lemp-tool
 
 BUILD := .build

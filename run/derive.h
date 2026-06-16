@@ -15,7 +15,7 @@
 #define SHACHAIN2PC_RUN_DERIVE_H
 
 #include <emp-tool/emp-tool.h>
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 #include <array>
 #include <cstdint>
@@ -141,14 +141,30 @@ inline void ReleaseVector(std::vector<T>& v) {
 inline std::array<uint8_t, 32> CircuitDigest(const protocol::Circuit& c,
                                              const std::vector<int>& gate_arr) {
   int header[5] = {c.num_gate(), c.num_wire, c.n1, c.n2, c.n3};
-  SHA256_CTX ctx;
-  SHA256_Init(&ctx);
-  SHA256_Update(&ctx, header, sizeof(header));
-  if (!gate_arr.empty()) {
-    SHA256_Update(&ctx, gate_arr.data(), gate_arr.size() * sizeof(int));
-  }
   std::array<uint8_t, 32> dg{};
-  SHA256_Final(dg.data(), &ctx);
+  unsigned int len = 0;
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) {
+    throw std::runtime_error("CircuitDigest: EVP_MD_CTX_new failed");
+  }
+  auto cleanup = [&]() { EVP_MD_CTX_free(ctx); };
+  if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1 ||
+      EVP_DigestUpdate(ctx, header, sizeof(header)) != 1) {
+    cleanup();
+    throw std::runtime_error("CircuitDigest: EVP digest init/update failed");
+  }
+  if (!gate_arr.empty()) {
+    if (EVP_DigestUpdate(ctx, gate_arr.data(),
+                         gate_arr.size() * sizeof(int)) != 1) {
+      cleanup();
+      throw std::runtime_error("CircuitDigest: EVP digest update failed");
+    }
+  }
+  if (EVP_DigestFinal_ex(ctx, dg.data(), &len) != 1 || len != dg.size()) {
+    cleanup();
+    throw std::runtime_error("CircuitDigest: EVP digest final failed");
+  }
+  cleanup();
   return dg;
 }
 

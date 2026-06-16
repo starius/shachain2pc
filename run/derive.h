@@ -132,6 +132,11 @@ inline std::vector<int> ToEmpGateArray(const protocol::Circuit& c) {
   return arr;
 }
 
+template <typename T>
+inline void ReleaseVector(std::vector<T>& v) {
+  std::vector<T>().swap(v);
+}
+
 // CircuitDigest is a SHA-256 over the circuit structure (header + gate array).
 inline std::array<uint8_t, 32> CircuitDigest(const protocol::Circuit& c,
                                              const std::vector<int>& gate_arr) {
@@ -182,7 +187,7 @@ void ExchangeCircuitDigest(IO* io, int party,
 template <typename IO>
 protocol::Value RunDerivation(IO* io, int party, uint64_t index,
                               const protocol::Value& my_share) {
-  const protocol::Circuit c = BuildCircuitForIndex(index);
+  protocol::Circuit c = BuildCircuitForIndex(index);
   std::vector<int> gate_arr = ToEmpGateArray(c);
 
   // Agree on the locally generated circuit before preprocessing; abort fast and
@@ -192,6 +197,9 @@ protocol::Value RunDerivation(IO* io, int party, uint64_t index,
   // Hand emp the validated in-memory circuit (no unchecked file re-parse).
   emp::BristolFormat cf(c.num_gate(), c.num_wire, c.n1, c.n2, c.n3,
                         gate_arr.data());
+  ReleaseVector(c.gates);
+  ReleaseVector(gate_arr);
+  ReleaseVector(cf.wires);  // emp-ag2pc uses cf.gates, not BristolFormat::wires.
 
   const int nin = cf.n1 + cf.n2;
   const std::vector<uint8_t> share_bits = protocol::ValueToBits(my_share);

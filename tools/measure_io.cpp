@@ -73,6 +73,9 @@ int main(int argc, char** argv) {
   int ands = 0;
   for (int i = 0; i < cf.num_gate; ++i)
     if (cf.gates[4 * i + 3] == AND_GATE) ++ands;
+  shachain2pc::run::ReleaseVector(c.gates);
+  shachain2pc::run::ReleaseVector(gate_arr);
+  shachain2pc::run::ReleaseVector(cf.wires);
 
   C2PC<NetIO> twopc(io, party, &cf);
   io->flush();

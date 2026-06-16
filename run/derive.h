@@ -29,12 +29,15 @@
 #include "emp-ag2pc/emp-ag2pc.h"
 
 #include "../protocol/bristol.h"
+#include "../protocol/circuit_gen.h"
 #include "../protocol/wire_layout.h"
 
 namespace shachain2pc::run {
 
 constexpr int kAlice = emp::ALICE;  // 1, garbler, listens
 constexpr int kBob = emp::BOB;      // 2, evaluator, connects
+constexpr const char* kDefaultSha256CompressPath =
+    ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt";
 
 // CheatGuard enforces the abort half of the malicious-security guarantee. emp's
 // authenticated-garbling consistency checks (the per-AND-gate "no match GT!" and
@@ -81,26 +84,36 @@ class CheatGuard {
   bool restored_ = false;
 };
 
-// LoadAndCheck fully parses and validates the circuit: existence, a consistent
-// header, the expected 256+256 -> 256 shape, AND every gate wire index in range
-// (protocol::LoadBristol bounds-checks). This replaces a header-only check that
-// let a structurally-corrupt-but-header-valid circuit reach emp's loader, which
-// indexes its wire/label arrays unchecked and segfaults. Throws on any problem.
-inline protocol::Circuit LoadAndCheck(const std::string& path) {
-  protocol::Circuit c = protocol::LoadBristol(path);
+// CheckDerivationCircuit validates the expected 256+256 -> 256 shape. Gate
+// wire bounds are checked by protocol::LoadBristol for loaded gadgets and by
+// the deterministic builder for generated derivation circuits.
+inline void CheckDerivationCircuit(const protocol::Circuit& c,
+                                   const std::string& description) {
   if (c.n1 != protocol::kValueBits || c.n2 != protocol::kValueBits ||
       c.n3 != protocol::kValueBits) {
     throw std::runtime_error(
-        "shachain2pc: circuit '" + path + "' has wrong shape: expected 256 256 "
+        "shachain2pc: " + description +
+        " has wrong shape: expected 256 256 "
         "256, got " + std::to_string(c.n1) + " " + std::to_string(c.n2) + " " +
         std::to_string(c.n3));
   }
-  return c;
 }
 
-// ValidateCircuitFile validates the file without running anything, so callers
-// can fail fast (e.g. before opening a socket). Throws on any problem.
-inline void ValidateCircuitFile(const std::string& path) { LoadAndCheck(path); }
+// BuildCircuitForIndex locally constructs the canonical derivation circuit for
+// the authorized index. No per-index circuit file is read or shared between the
+// parties; the digest exchange below only confirms both sides generated the
+// same artifact from their local index and SHA-256 gadget.
+inline protocol::Circuit BuildCircuitForIndex(
+    uint64_t index,
+    const std::string& sha_path = kDefaultSha256CompressPath) {
+  if (index > protocol::kMaxIndex) {
+    throw std::runtime_error("shachain2pc: index exceeds 48 bits");
+  }
+  protocol::Circuit sha = protocol::LoadBristol(sha_path);
+  protocol::Circuit c = protocol::BuildDerivationCircuit(sha, index);
+  CheckDerivationCircuit(c, "generated circuit");
+  return c;
+}
 
 // ToEmpGateArray flattens a validated circuit into emp's gate array layout
 // (in0, in1, out, type) so we can hand emp the in-memory circuit instead of
@@ -162,18 +175,18 @@ void ExchangeCircuitDigest(IO* io, int party,
   }
 }
 
-// RunDerivation evaluates the agreed circuit at circuit_path with this party's
-// seed share, returning the 256-bit derived value both parties obtain. Throws
-// (a clean abort) if the circuit is missing/malformed/wrong-shape, if the two
-// parties disagree on the circuit, or if cheating is detected.
+// RunDerivation builds and evaluates the agreed circuit for index with this
+// party's seed share, returning the 256-bit derived value both parties obtain.
+// Throws (a clean abort) if the local circuit cannot be generated, if the two
+// parties disagree on the generated circuit, or if cheating is detected.
 template <typename IO>
-protocol::Value RunDerivation(IO* io, int party, const std::string& circuit_path,
+protocol::Value RunDerivation(IO* io, int party, uint64_t index,
                               const protocol::Value& my_share) {
-  const protocol::Circuit c = LoadAndCheck(circuit_path);
+  const protocol::Circuit c = BuildCircuitForIndex(index);
   std::vector<int> gate_arr = ToEmpGateArray(c);
 
-  // Agree on the circuit before preprocessing; abort fast and clearly on a
-  // mismatch rather than desyncing deep inside the MPC.
+  // Agree on the locally generated circuit before preprocessing; abort fast and
+  // clearly on a mismatch rather than desyncing deep inside the MPC.
   ExchangeCircuitDigest(io, party, CircuitDigest(c, gate_arr));
 
   // Hand emp the validated in-memory circuit (no unchecked file re-parse).

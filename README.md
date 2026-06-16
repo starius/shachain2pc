@@ -12,10 +12,11 @@ derive a secret for an index that was not authorized**, in particular not a
 
 ## How it works
 
-For each index `I` there is **one fixed boolean circuit**, agreed by both
-parties, that computes `seed = aliceShare ⊕ bobShare` and then
-`generate_from_seed(seed, I)` with `I`'s per-link bit-flips baked in as **public
-constants** (not a controllable input). That circuit is evaluated under
+For each index `I` there is **one fixed boolean circuit**. Each party supplies
+the authorized `I` and locally generates that circuit, which computes
+`seed = aliceShare ⊕ bobShare` and then `generate_from_seed(seed, I)` with
+`I`'s per-link bit-flips baked in as **public constants** (not a controllable
+input). The locally generated circuits are digest-checked and then evaluated under
 **authenticated garbling** (EMP [`emp-ag2pc`](https://github.com/emp-toolkit/emp-ag2pc),
 the WRK17 protocol): the parties evaluate exactly the agreed circuit, or the
 protocol **aborts**. So the only reachable output is `H(I)` for the agreed `I` —
@@ -56,15 +57,16 @@ phase is the nuance: this `emp-ag2pc` build *reports* a detected inconsistency o
 and `2pc.h` exposes no status to query. `run/` closes that gap with a
 `CheatGuard` that captures the engine's consistency-check output and turns any
 detection into a hard abort, so the untrusted value is discarded and never
-returned. The malicious demo (`demo/run_cheat.sh`) exercises exactly this: the
-honest evaluator aborts and learns nothing.
+returned.
 
-The agreed index `I` is chosen out of band; each party only runs the protocol
-for an `I` it is willing to authorize, so neither party can unilaterally drive a
-derivation of a future index. As a fast first-line check, the two parties also
-exchange a digest of the circuit before any preprocessing and abort immediately
-on a mismatch (this is *not* the security boundary — authenticated garbling
-still catches a party that commits to one circuit and garbles another).
+The agreed index `I` is chosen out of band; each party passes only an `I` it is
+willing to authorize to `party`, which generates the per-index circuit locally.
+The two parties exchange a digest of those generated circuits before any
+preprocessing and abort immediately on a mismatch. The wrong-index demo
+(`demo/run_cheat.sh`) exercises this path: Alice tries `I′` while Bob authorizes
+`I`, both sides abort, and no value is returned. This digest check is *not* the
+security boundary — authenticated garbling still catches a party that commits to
+one circuit and garbles another.
 
 ## Why this stack
 
@@ -88,8 +90,8 @@ layout.
 | --- | --- |
 | `reference/` | single-party `generate_from_seed` oracle + KATs (no MPC), and `ref_cli` |
 | `protocol/` | the pure, deterministic part: build the Bristol circuit for index `I` (`bristol.*`, `circuit_gen.*`, `wire_layout.h`) — public flips + a SHA-256 chain over the XOR of the two seed shares — and the input/output wire layout |
-| `run/` | drive the two `emp-ag2pc` parties over a socket: feed shares, evaluate, obtain `H(I)`, abort on any cheat (`derive.h`) |
-| `demo/` | two-party binary (`party`), circuit generator (`gen_circuit`), and the honest / malicious demo scripts |
+| `run/` | drive the two `emp-ag2pc` parties over a socket: generate the circuit for `I`, feed shares, evaluate, obtain `H(I)`, abort on any cheat (`derive.h`) |
+| `demo/` | two-party binary (`party`) and the honest / wrong-index demo scripts |
 | `tools/` | offline checks: bit-convention probe, circuit verifier, circuit tamperer, bandwidth meter |
 
 ## Build
@@ -105,25 +107,22 @@ nix develop -c make                        # build everything
 
 ```sh
 nix develop -c ./demo/run_demo.sh    # honest: both derive H(I) == reference
-nix develop -c ./demo/run_cheat.sh   # malicious garbler: evaluator aborts, no value
+nix develop -c ./demo/run_cheat.sh   # wrong-index attempt: both abort, no value
 ```
 
 `run_demo.sh` defaults to `I = ffffffffffff` (StartIndex `2^48−1`, the first
 revealed secret: a 48-block chain, ~5.6M gates). Override with env vars, e.g.
 `I=1 PORT=12345 nix develop -c ./demo/run_demo.sh`.
 
-To run the parties by hand, **first generate the agreed circuit** for the index
-(both parties must load the *same* circuit file for the *same* index — running
-`party` on a path that does not exist fails fast with a clear error). Then start
-party `1` (ALICE, the listener) and party `2` (BOB) pointed at ALICE's IP:
+To run the parties by hand, each side supplies the same authorized index `I`.
+Each process locally generates the canonical circuit for that `I`; no per-index
+circuit file is shared or stored. Start party `1` (ALICE, the listener) and
+party `2` (BOB) pointed at ALICE's IP:
 
 ```sh
-# once, on each host (or generate once and copy the file to both):
-./.build/gen_circuit ffffffffffff circuit.txt          # I = StartIndex (hex)
-
 # ALICE (listener) and BOB (connects to ALICE's IP):
-./.build/party 1 12345 circuit.txt <aliceShareHex>
-./.build/party 2 12345 circuit.txt <bobShareHex> <alice_ip>
+./.build/party 1 12345 ffffffffffff <aliceShareHex>
+./.build/party 2 12345 ffffffffffff <bobShareHex> <alice_ip>
 ```
 
 The two share hexes are each 64 hex chars (32 bytes); the seed is their XOR. On
@@ -155,11 +154,11 @@ The MPC layer itself is exercised by the demo scripts above.
   Each derivation here recomputes from the seed in one circuit
   (`popcount(I) ≤ 48` SHA-256 blocks). Security is preferred over the
   optimization.
-- Both parties derive the circuit independently from the agreed `I`, so they
-  evaluate byte-identical circuits; a party that garbles a *different function*
-  within that structure is caught by authenticated garbling (clean abort), and a
-  malformed or differently-sized circuit is caught by the circuit-digest
-  handshake (also a clean abort, before any preprocessing).
+- Both parties derive the circuit independently from the authorized `I`, so they
+  evaluate byte-identical circuits. If one party enters a different `I`, the
+  circuit-digest handshake aborts before any preprocessing. A party that garbles
+  a *different function* after committing to the same circuit is caught by
+  authenticated garbling (clean abort).
 
 ## Known limitations
 
@@ -173,6 +172,4 @@ The MPC layer itself is exercised by the demo scripts above.
   `IOChannel` over a pre-connected socket (emp's `NetIO` has no fd-adopting
   constructor) — so it is deferred. The connect retry is partly intentional
   (start-order independence). Operationally: start the garbler (listener) first,
-  and/or run the parties under an external timeout/supervisor. Note `party` does
-  not validate the role argument, so a value other than `1`/`2` takes the client
-  path and can hang here.
+  and/or run the parties under an external timeout/supervisor.

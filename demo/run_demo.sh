@@ -17,11 +17,10 @@ E=${E:-abababababababababababababababababababababababababababababababab}
 make -s plain mpc || exit 1
 
 REF=$(./.build/ref_cli "$G" "$E" "$I") || exit 1
-./.build/gen_circuit "$I" .build/demo_circuit.txt || exit 1
 
-./.build/party 1 "$PORT" .build/demo_circuit.txt "$G"            >/tmp/demo_a.out 2>/dev/null &
+./.build/party 1 "$PORT" "$I" "$G"            >/tmp/demo_a.out 2>/dev/null &
 sleep 0.3
-./.build/party 2 "$PORT" .build/demo_circuit.txt "$E" 127.0.0.1  >/tmp/demo_b.out 2>/dev/null
+./.build/party 2 "$PORT" "$I" "$E" 127.0.0.1  >/tmp/demo_b.out 2>/dev/null
 wait
 
 A=$(awk '/RESULT/{print $2}' /tmp/demo_a.out)

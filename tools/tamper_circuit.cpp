@@ -1,8 +1,6 @@
-// Adversary helper for the security demo: produce a tampered copy of an agreed
-// circuit that computes a DIFFERENT function while preserving the gate/wire/AND
-// counts, so the malicious-2PC protocol structure still matches and the run
-// proceeds to completion -- letting us observe that authenticated garbling
-// detects the inconsistency rather than yielding a valid result.
+// Adversary helper for low-level experiments: produce a tampered copy of an
+// agreed circuit that computes a DIFFERENT function while preserving the
+// gate/wire/AND counts, so the malicious-2PC protocol structure still matches.
 #include <cstdio>
 #include <string>
 

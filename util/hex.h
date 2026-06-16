@@ -24,7 +24,22 @@ inline int NibbleVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  throw std::runtime_error(std::string("FromHex32: bad hex char '") + c + "'");
+  throw std::runtime_error(std::string("bad hex char '") + c + "'");
+}
+
+inline uint64_t FromHexU48(const std::string& s) {
+  std::string hex = s;
+  if (hex.size() >= 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
+    hex = hex.substr(2);
+  }
+  if (hex.empty() || hex.size() > 12) {
+    throw std::runtime_error("FromHexU48: expected 1..12 hex chars");
+  }
+  uint64_t v = 0;
+  for (char c : hex) {
+    v = (v << 4) | static_cast<uint64_t>(NibbleVal(c));
+  }
+  return v;
 }
 
 inline std::array<uint8_t, 32> FromHex32(const std::string& s) {

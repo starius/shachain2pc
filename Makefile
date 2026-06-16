@@ -24,8 +24,7 @@ PROTO_SRC := protocol/bristol.cpp protocol/circuit_gen.cpp
 
 # Targets that need only OpenSSL (no emp / no MPC).
 PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
-              $(BUILD)/probe_convention $(BUILD)/gen_circuit \
-              $(BUILD)/tamper_circuit
+              $(BUILD)/probe_convention $(BUILD)/tamper_circuit
 # Targets that link the emp MPC engine.
 EMP_BINS := $(BUILD)/party $(BUILD)/measure_io
 
@@ -49,18 +48,15 @@ $(BUILD)/verify_circuit: tools/verify_circuit.cpp $(PROTO_SRC) $(REF_SRC) | $(BU
 $(BUILD)/probe_convention: tools/probe_convention.cpp $(PROTO_SRC) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) $^ $(OPENSSL_LIBS) -o $@
 
-$(BUILD)/gen_circuit: demo/gen_circuit.cpp $(PROTO_SRC) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) $^ $(OPENSSL_LIBS) -o $@
-
 $(BUILD)/tamper_circuit: tools/tamper_circuit.cpp $(PROTO_SRC) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) $^ $(OPENSSL_LIBS) -o $@
 
-$(BUILD)/party: demo/party.cpp protocol/bristol.cpp | $(BUILD)
+$(BUILD)/party: demo/party.cpp $(PROTO_SRC) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $^ \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
-$(BUILD)/measure_io: tools/measure_io.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
+$(BUILD)/measure_io: tools/measure_io.cpp $(PROTO_SRC) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $^ \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
 test: $(BUILD)/ref_kat $(BUILD)/verify_circuit

@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 
 #include "../run/derive.h"
@@ -37,7 +38,7 @@ static void SetTransportTimeout(emp::NetIO* io) {
 int main(int argc, char** argv) {
   if (argc < 5) {
     std::fprintf(stderr,
-                 "usage: %s <1|2> <port> <circuit_path> <share_hex> [peer_ip]\n"
+                 "usage: %s <1|2> <port> <I_hex> <share_hex> [peer_ip]\n"
                  "  1 = ALICE (garbler, listens), 2 = BOB (evaluator, connects)\n",
                  argv[0]);
     return 2;
@@ -45,25 +46,28 @@ int main(int argc, char** argv) {
   using namespace shachain2pc;
   int party = std::atoi(argv[1]);
   int port = std::atoi(argv[2]);
-  std::string circuit = argv[3];
-  auto share = util::FromHex32(argv[4]);
-  const char* peer = argc > 5 ? argv[5] : "127.0.0.1";
-
-  // Validate the circuit before opening the socket, so a missing/wrong file
-  // fails fast with a clear message instead of blocking on the peer (or letting
-  // emp's loader segfault on a NULL FILE*).
+  uint64_t index = 0;
+  protocol::Value share{};
   try {
-    run::ValidateCircuitFile(circuit);
+    if (party != run::kAlice && party != run::kBob) {
+      throw std::runtime_error("party must be 1 or 2");
+    }
+    if (port <= 0 || port > 65535) {
+      throw std::runtime_error("port must be in 1..65535");
+    }
+    index = util::FromHexU48(argv[3]);
+    share = util::FromHex32(argv[4]);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "ABORT %s\n", e.what());
     return 1;
   }
+  const char* peer = argc > 5 ? argv[5] : "127.0.0.1";
 
   const char* addr = (party == run::kAlice) ? nullptr : peer;
   emp::NetIO* io = new emp::NetIO(addr, port);
   SetTransportTimeout(io);  // bound blocking recv/send so a stalled peer aborts
   try {
-    protocol::Value out = run::RunDerivation(io, party, circuit, share);
+    protocol::Value out = run::RunDerivation(io, party, index, share);
     delete io;
     std::printf("RESULT %s\n", util::ToHex(out).c_str());
     return 0;

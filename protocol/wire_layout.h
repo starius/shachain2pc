@@ -16,6 +16,10 @@ using Value = std::array<uint8_t, 32>;
 // kValueBits is the bit width of a shachain value / seed share.
 constexpr int kValueBits = 256;
 
+// kIndexBits is the BOLT-03 shachain index width.
+constexpr int kIndexBits = 48;
+constexpr uint64_t kMaxIndex = (uint64_t(1) << kIndexBits) - 1;
+
 // MsbBitIndex maps byte j and LSB-position l (0 = least significant) to the
 // MSB-first bit index used on the wires.
 inline int MsbBitIndex(int byte, int lsb) { return 8 * byte + (7 - lsb); }

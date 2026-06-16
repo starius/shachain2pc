@@ -91,6 +91,9 @@ std::vector<uint8_t> PaddingBits() {
 }  // namespace
 
 Circuit BuildDerivationCircuit(const Circuit& sha, uint64_t I) {
+  if (I > kMaxIndex) {
+    throw std::runtime_error("BuildDerivationCircuit: index exceeds 48 bits");
+  }
   if (sha.n1 + sha.n2 != 512 || sha.n3 != kValueBits) {
     throw std::runtime_error("BuildDerivationCircuit: gadget is not 512->256");
   }
@@ -109,7 +112,7 @@ Circuit BuildDerivationCircuit(const Circuit& sha, uint64_t I) {
   }
 
   // For each set chain-bit B from 47 down to 0: flip then hash.
-  for (int bit = 47; bit >= 0; --bit) {
+  for (int bit = kIndexBits - 1; bit >= 0; --bit) {
     if (((I >> bit) & 1) == 0) continue;
     const int idx = FlipBitIndex(bit);
     p[idx] = b.InvW(p[idx]);  // public constant flip

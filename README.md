@@ -1,5 +1,10 @@
 # shachain2pc
 
+> **Warning:** this repository is AI-written demo / proof-of-concept code. It is
+> not production-ready, has not received deep human cryptographic or Lightning
+> security review, and must not be used to protect real funds without that
+> review and substantial hardening.
+
 A self-contained, **maliciously-secure** two-party computation of the
 [BOLT-03](https://github.com/lightning/bolts/blob/master/03-transactions.md)
 shachain per-commitment-secret derivation (`generate_from_seed`).

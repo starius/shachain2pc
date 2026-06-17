@@ -54,18 +54,26 @@ Release-gate benchmark:
 - `I = ffffffffffff`;
 - same host / loopback;
 - same machine used for C++ baseline;
-- Rust ALICE + Rust BOB must be no worse than the C++ baseline within agreed
-  measurement noise.
+- measure C++ ALICE + C++ BOB as the baseline;
+- measure Rust ALICE + Rust BOB as the release gate;
+- measure Rust/C++ mixed mode in both directions as an informative compatibility
+  signal;
+- Rust ALICE + Rust BOB must not be statistically slower than the C++/C++
+  baseline.
 
 Track both:
 
 - wall-clock latency;
 - peak RSS.
 
-Rust v1 may not reach the future memory target because it intentionally preserves
-the current protocol shape. That is acceptable for v1 if it preserves correctness
-and speed. Large memory reductions belong to Rust v2 unless a safe v1-local
-optimization is obvious.
+If Rust/Rust is slower, investigate and address the cause without breaking the
+v1 transition invariants: same algorithm, same relation, same wire behavior, and
+same mixed-mode compatibility.
+
+Rust v1 may not reach the future memory target because it intentionally freezes
+the current protocol shape. That is acceptable for v1 if it preserves
+correctness and speed. Large memory reductions belong to Rust v2 unless a safe
+v1-local optimization is obvious.
 
 ## Why not change the protocol immediately?
 
@@ -103,9 +111,8 @@ C++ party  <->  Rust v1 party
 same CLI        same EMP-compatible wire
 ```
 
-A future proxy can still be useful as a migration/testing tool, but it should not
-be in the main v1 path unless a specific EMP-wire detail proves too invasive to
-keep inside the Rust compatibility layer.
+No proxy is planned for v1. Revisit only if a specific EMP-wire detail proves
+too invasive to keep inside the Rust compatibility layer.
 
 Important distinction:
 
@@ -151,6 +158,10 @@ depends on matching the current behavior.
 
 The first step is a **short v1 compatibility spec plus a probe manifest**, not a
 large abstract protocol document.
+
+The v1 spec should freeze the whole algorithm and wire encoding. The goal is to
+remove implementation discretion: Rust should have a robust, fixed target for
+how each primitive, round, byte encoding, stream, and abort condition behaves.
 
 Order:
 
@@ -216,9 +227,9 @@ These prove that Rust and C++ are computing the same relation before MPC enters:
   - `555555555555`;
   - `ffffffffffff`.
 
-`I = 000000000000` is useful as a compatibility fixture, but it reveals the full
-seed because no SHA-256 round runs. It must be documented and should not be a
-normal production derivation.
+`I = 000000000000` is accepted in Rust v1 for full C++ compatibility. It reveals
+the full seed because no SHA-256 round runs, so the caveat must be documented
+and handled by deployment policy rather than silently changing v1 behavior.
 
 ### Subprotocol interop probes
 
@@ -557,8 +568,8 @@ Rust v1 should remain available as a regression oracle while v2 is developed.
   parties evaluate the same requested `I`; it cannot prove that Lightning channel
   state allowed that `I`.
 - `I == 0` reveals `alice_share XOR bob_share`, i.e. the seed, because no hash
-  round runs. Keep it only as a compatibility/test fixture unless production
-  policy explicitly authorizes it.
+  round runs. Rust v1 accepts it for C++ compatibility; production deployments
+  must decide at the policy layer whether this index is ever allowed.
 
 ## Initial dependency set
 
@@ -569,22 +580,64 @@ Expected Rust dependencies:
 - `thiserror` for errors;
 - `rand_core` / `rand_chacha` for testable randomness;
 - `zeroize` for local secret cleanup;
-- `sha2` for SHA-256;
-- `aes` or `openssl` bindings only if they reproduce EMP AES behavior exactly;
-- OpenSSL bindings are likely needed for EMP-compatible base OT point behavior.
+- `sha2` for SHA-256 where only the digest function matters;
+- RustCrypto `aes` for low-level AES-128 block encryption if it matches EMP
+  probes and meets the speed target;
+- `openssl` / `openssl-sys` for EMP-compatible P-256 base OT point arithmetic
+  and point encoding.
 
 Avoid complete MPC protocol dependencies. The MPC protocol code must live in
 this workspace.
 
-## Open decisions
+### Primitive choice research
 
-1. Exact format of the v1 compatibility spec and probe outputs.
-2. Whether Rust v1 should hard-reject `I == 0` in normal CLI mode or preserve it
-   exactly for full C++ compatibility. If rejected, keep an explicit compatibility
-   test path.
-3. Exact benchmark tolerance around the 1.2s C++ baseline.
-4. Which OpenSSL/Rust crypto primitives reproduce EMP-visible behavior with the
-   least risk.
-5. Whether a proxy is needed later for migration tooling. It is not part of the
-   default v1 plan.
+For v1 compatibility, `rustls` is not the right primitive dependency. Rustls is
+a TLS 1.2/1.3 library. Its crypto provider system controls TLS cipher suites,
+key-exchange groups, signature verification, randomness, and key loading. It
+does not expose the low-level OpenSSL-compatible P-256 point arithmetic and
+point serialization that EMP's base OT uses.
 
+The current EMP path uses:
+
+- OpenSSL P-256 for base OT:
+  - `EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1)`;
+  - `EC_POINT_point2oct(..., POINT_CONVERSION_UNCOMPRESSED, ...)`;
+  - `EC_POINT_oct2point`;
+  - `EC_POINT_mul`, `EC_POINT_add`, `EC_POINT_invert`;
+  - `BN_rand_range`.
+- EMP's own AES-NI AES-128 block encryption for `PRP` and `PRG`.
+- SHA-256 for hashes/KDFs/transcript checks.
+
+Therefore the lowest-risk v1 choices are:
+
+1. Use Rust OpenSSL bindings for the base OT group and point operations. This is
+   the closest match to EMP because EMP itself calls OpenSSL for those objects
+   and encodings.
+2. Use RustCrypto `aes` for raw AES-128 block encryption only if C++ probes
+   confirm exact block-byte behavior and performance is good. If it fails either
+   test, use OpenSSL AES or a small audited compatibility wrapper as a fallback.
+3. Use `sha2` for ordinary SHA-256 digest operations, with C++ probe vectors to
+   confirm every call site hashes the same bytes.
+
+Do not use a pure-Rust P-256 crate for v1 unless probes prove exact compatibility
+with EMP/OpenSSL point encodings and operations. It may be appropriate for Rust
+v2 after the wire/protocol is no longer EMP-compatible.
+
+## Resolved decisions
+
+1. The v1 spec freezes the whole algorithm and wire encoding. Exact probe output
+   formats can be chosen during implementation, but must be canonical and
+   machine-checkable.
+2. Rust v1 accepts `I == 0` for C++ compatibility.
+3. Benchmark C++/C++, Rust/Rust, and mixed C++/Rust. Rust/Rust must not be
+   statistically slower than C++/C++.
+4. Prefer OpenSSL bindings for EMP-compatible base OT point behavior; prefer
+   vetted Rust crates for standard SHA/AES only after probe confirmation.
+5. Proxy is not needed for v1.
+
+## Remaining open decisions
+
+1. Exact machine-readable format for the compatibility spec and probe outputs.
+2. Exact statistical benchmark method and tolerance.
+3. Whether RustCrypto `aes` or OpenSSL AES gives the best combination of exact
+   EMP compatibility and speed.

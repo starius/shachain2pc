@@ -165,7 +165,10 @@ The existing binary does more than a single TCP request/response:
 5. EMP sends raw bytes with no outer message framing. Boolean vectors are packed
    by `IOChannel::send_bool`; blocks are 16-byte `__m128i` values in EMP memory
    order; `send_partial_block<..., 5>` sends the first five bytes of each block.
-6. The current input layout must be preserved exactly:
+6. IKNP uses EMP `OTCO` as base OT, i.e. Chou-Orlandi OT over OpenSSL P-256.
+   The base-OT transcript, point encodings, message order, and
+   `Hash::KDF(point, i)` masks are part of the v1 compatibility contract.
+7. The current input layout must be preserved exactly:
    - BOB's share is placed in wires `[0, n1)`;
    - ALICE's share is placed in wires `[n1, n1+n2)`;
    - the circuit computes `seed = wire[i] XOR wire[256+i]`.
@@ -190,6 +193,7 @@ Order:
    - role behavior;
    - TCP stream schedule;
    - circuit digest format;
+   - base-OT protocol and transcript format;
    - input/output wire layout;
    - abort behavior.
 2. Write the C++ probe manifest:
@@ -223,6 +227,17 @@ Probe output format:
 - probe output must be deterministic unless the probe is explicitly marked as an
   interop/randomized probe.
 
+Base-OT transcript fixtures:
+
+- include deterministic test-only hooks for `OTCO` randomness so the C++ probe
+  can emit complete Chou-Orlandi transcripts for small lengths;
+- freeze sender `A`, receiver `B[i]` points, point length prefixes, ciphertext
+  blocks, choices, `Hash::KDF(point, i)` masks, and recovered outputs;
+- include both choice bits for at least several positions;
+- include the exact `send_pt`/`recv_pt` byte representation, not just abstract
+  points;
+- keep these hooks out of production binaries.
+
 So the very first artifact is a spec small enough to guide the probes. The first
 code artifact is the C++ probe suite.
 
@@ -247,6 +262,7 @@ Probe:
 - EMP PRG behavior;
 - EMP fixed-key AES PRP behavior;
 - garbling hash/TMMO hash for fixed labels;
+- `Hash::KDF(point, id)` for fixed OpenSSL P-256 points and ids;
 - `num_ands -> batch_size/bucket_size` choices;
 - circuit gate counts, wire counts, AND counts, and digest for representative
   indices;
@@ -281,7 +297,7 @@ After deterministic probes pass, test live C++/Rust pairs for progressively
 larger pieces:
 
 - raw stream open/flush behavior over all three streams;
-- base OT;
+- base OT (`OTCO` / Chou-Orlandi) transcript and output masks;
 - IKNP/COT;
 - `LeakyDeltaOT`;
 - `Fpre`;

@@ -2,3 +2,4 @@
 /.build/
 /.sources/
 /circuit.txt
+/rust/target/

@@ -25,6 +25,10 @@
             openssl
             pkg-config
             python3
+            cargo
+            clippy
+            rustc
+            rustfmt
             shellStdenv.cc
           ];
           shellHook = ''

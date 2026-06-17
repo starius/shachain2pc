@@ -1,0 +1,172 @@
+schema = "shachain2pc.compat.v1"
+name = "shachain2pc EMP-ag2pc compatibility v1"
+
+[compat]
+goal = "Rust v1 is a language port only: same CLI, same relation, same EMP-compatible wire behavior."
+probe_schema = "shachain2pc.compat_probe.v1"
+probe_format = "jsonl"
+accept_i_zero = true
+proxy_required = false
+
+[sources]
+emp_path = ".deps/emp"
+emp_git_commit = "f8d04faac7d1a6850dc1f0d099a975c550e3da06"
+emp_include_tree_sha256 = "c4ab76d9a96e33913f3251ae6d079f3261e74142056c472c363c9e56e940cf9a"
+sha256_gadget_path = ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt"
+
+[build]
+cxx_standard = "c++17"
+simd_flags = ["-mssse3", "-msse4.1", "-maes", "-mpclmul"]
+emp_ag2pc_ssp_bytes = 5
+emp_fpre_threads = 1
+
+[cli]
+argv = ["party", "<1|2>", "<port>", "<I_hex>", "<share_hex>", "[peer_ip]"]
+default_peer_ip = "127.0.0.1"
+success_stdout_prefix = "RESULT "
+failure_stderr_prefix = "ABORT "
+preserve_connected_stdout = false
+
+[roles]
+alice_party_id = 1
+bob_party_id = 2
+alice_transport = "listen"
+bob_transport = "connect"
+alice_emp_role = "garbler"
+bob_emp_role = "evaluator"
+
+[index]
+bits = 48
+max_hex = "ffffffffffff"
+max_decimal = "281474976710655"
+zero_hex = "000000000000"
+accept_zero = true
+zero_caveat = "I=0 performs no SHA-256 round and reveals alice_share XOR bob_share."
+
+[value]
+bytes = 32
+bits = 256
+bit_order = "msb_first_per_byte"
+hex_chars = 64
+share_combine = "xor"
+
+[network]
+transport = "tcp"
+stream_count = 3
+streams = ["main", "fpre_io0", "fpre_io2_0"]
+main_connection_order = "alice_listens_bob_connects"
+aux_connection_order = "emp_fpre_constructor_order"
+tcp_nodelay = true
+outer_framing = "none"
+
+[wire.bool]
+format = "emp_iochannel_send_bool"
+packing = "pack eight bool bytes into one byte when uint64-aligned; raw prefix/suffix bytes otherwise"
+unit = "native C++ bool byte values"
+
+[wire.block]
+type = "__m128i"
+bytes = 16
+layout = "native EMP block memory layout"
+make_block = "_mm_set_epi64x(high, low) on x86_64"
+partial_block_bytes = 5
+
+[wire.point]
+curve = "NIST P-256 / prime256v1"
+openssl_nid = "NID_X9_62_prime256v1"
+encoding = "POINT_CONVERSION_UNCOMPRESSED"
+send_pt_prefix = "first 4 bytes of native size_t length, followed by point octets"
+expected_uncompressed_point_len = 65
+
+[relation]
+circuit_generated_from_i = true
+circuit_file_shared = false
+input_bits_alice = 256
+input_bits_bob = 256
+output_bits = 256
+bob_share_wires = "[0,n1)"
+alice_share_wires = "[n1,n1+n2)"
+seed_relation = "seed[i] = wire[i] XOR wire[256+i]"
+alice_output = true
+bob_output = true
+
+[circuit_digest]
+hash = "sha256"
+header_type = "native int[5]"
+header_fields = ["num_gate", "num_wire", "n1", "n2", "n3"]
+gate_array_type = "native int[]"
+gate_array_layout = ["in0", "in1_or_0_for_inv", "out", "emp_gate_type"]
+emp_gate_type_and = 0
+emp_gate_type_xor = 1
+emp_gate_type_not = 2
+
+[mpc]
+engine = "EMP ag2pc C2PC"
+phases = ["circuit_digest_exchange", "function_independent", "function_dependent", "online"]
+fpre_batch_size_min = 320
+fpre_bucket_size_ge_280000 = 3
+fpre_bucket_size_ge_3100 = 4
+fpre_bucket_size_other = 5
+cheat_markers = ["no match", "cheat", "CHEAT", "abort"]
+
+[mpc.garble_hash]
+source = "emp-ag2pc/2pc.h C2PC::Hash"
+prp_key = "zero_block"
+preprocess_variant = "4 rows x 2 blocks"
+preprocess_inputs = ["a", "b", "Delta", "gate_index"]
+preprocess_formula = "A=σ(a,a^Delta); B=σ²(b,b^Delta); rows are A_x XOR B_y XOR makeBlock(4*i+row, output_bit); AES-PRP all 8 blocks"
+online_variant = "2 blocks for selected row"
+online_inputs = ["a", "b", "gate_index", "row"]
+online_formula = "σ(a) XOR σ²(b) XOR makeBlock(4*i+row, output_bit); AES-PRP both blocks"
+
+[ot.base]
+emp_class = "OTCO"
+protocol = "Chou-Orlandi"
+curve = "prime256v1"
+sender_first_message = "A = a*G"
+receiver_message = "B[i] = b_i*G + choice_i*A"
+sender_wire_order = ["send_pt(A)", "recv_pt(B[0]) ... recv_pt(B[length-1])", "send 2 native blocks per i: mask0^data0[i], mask1^data1[i]"]
+receiver_wire_order = ["recv_pt(A)", "send_pt(B[0]) ... send_pt(B[length-1])", "recv 2 native blocks per i: mask0^data0[i], mask1^data1[i]"]
+sender_masks = ["Hash::KDF(a*B[i], i)", "Hash::KDF(a*B[i] - a*A, i)"]
+receiver_mask = "Hash::KDF(b_i*A, i)"
+kdf = "EMP Hash::KDF(point, uint64 little-endian id): SHA256(uncompressed_point || native_u64_id), first 16 digest bytes as block"
+length = 128
+
+[ot.extension]
+emp_class = "IKNP"
+block_size = 2048
+base_ot_class = "OTCO"
+cot_variant = "EMP IKNP COT as used by LeakyDeltaOT"
+
+[probes]
+required = [
+  "emp_block",
+  "emp_bool",
+  "emp_partial_block",
+  "emp_hash",
+  "emp_prp",
+  "emp_prg",
+  "emp_garble_hash",
+  "emp_point",
+  "emp_otco_transcript",
+  "fpre_params",
+  "circuit_digest",
+  "shachain_reference"
+]
+
+[probe_output]
+format = "jsonl"
+canonical_cpp_output = "compat/v1/probes/cpp-compat-probe.jsonl"
+hex = "lowercase_no_0x"
+required_fields = ["schema", "probe", "case", "compat_spec", "inputs", "outputs"]
+deterministic_by_default = true
+
+[benchmark]
+index_hex = "ffffffffffff"
+warmups_per_pairing = 5
+measured_iterations_per_pairing = 30
+pairings = ["cpp_cpp", "rust_rust", "rust_alice_cpp_bob", "cpp_alice_rust_bob"]
+latency_statistic = "median"
+latency_pass_ratio_upper_confidence_bound = 1.05
+confidence = 0.95
+rss_report = ["per_process_peak", "combined_peak"]

@@ -28,9 +28,9 @@ RUN_DEPS := run/derive.h protocol/bristol.h protocol/circuit_gen.h \
 PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
               $(BUILD)/probe_convention $(BUILD)/tamper_circuit
 # Targets that link the emp MPC engine.
-EMP_BINS := $(BUILD)/party $(BUILD)/measure_io
+EMP_BINS := $(BUILD)/party $(BUILD)/measure_io $(BUILD)/compat_probe
 
-.PHONY: all plain mpc clean test demo cheat
+.PHONY: all plain mpc clean test demo cheat compat-probe
 all: plain mpc
 plain: $(PLAIN_BINS)
 mpc: $(EMP_BINS)
@@ -61,6 +61,10 @@ $(BUILD)/measure_io: tools/measure_io.cpp $(PROTO_SRC) $(RUN_DEPS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/measure_io.cpp $(PROTO_SRC) \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
+$(BUILD)/compat_probe: tools/compat_probe.cpp $(PROTO_SRC) $(REF_SRC) $(RUN_DEPS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/compat_probe.cpp \
+	    $(PROTO_SRC) $(REF_SRC) $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
 test: $(BUILD)/ref_kat $(BUILD)/verify_circuit
 	./$(BUILD)/ref_kat
 	./$(BUILD)/verify_circuit
@@ -70,6 +74,9 @@ demo: all
 
 cheat: all
 	./demo/run_cheat.sh
+
+compat-probe: $(BUILD)/compat_probe
+	@./$(BUILD)/compat_probe
 
 clean:
 	rm -rf $(BUILD)

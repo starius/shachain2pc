@@ -1,6 +1,26 @@
 # Rust self-contained party implementation plan
 
-## Goal
+## Decision
+
+Use a conservative two-stage path:
+
+1. **Rust v1: language port only.**
+   Rust v1 preserves the current C++/EMP protocol, current relation, current
+   command-line interface, and current wire behavior. It should be able to run
+   directly against the C++ `party` binary in both directions:
+   - Rust ALICE with C++ BOB;
+   - C++ ALICE with Rust BOB.
+
+2. **Rust v2: protocol evolution.**
+   After Rust v1 is proven, Rust v2 may introduce a clean Rust-native framed
+   protocol, streaming execution, prepare/reveal split, checkpointing, and lower
+   memory use.
+
+Do not combine the language port and the protocol redesign in the first serious
+implementation. The main safety reason is attribution: if something breaks, we
+need to know whether the cause is the Rust port or the protocol change.
+
+## Goal for Rust v1
 
 Build a self-contained Rust implementation of the current `party` binary:
 
@@ -8,49 +28,248 @@ Build a self-contained Rust implementation of the current `party` binary:
 party <1|2> <port> <I_hex> <share_hex> [peer_ip]
 ```
 
-It must be a drop-in replacement for the existing C++ binary at the command-line
-level and, unless explicitly revised later, at the party-to-party wire level:
+Rust v1 must preserve:
 
-- party `1` is ALICE/listener;
-- party `2` is BOB/connector;
-- `I_hex` is the same 48-bit internal shachain index;
-- `share_hex` is the same 32-byte XOR seed share;
-- success prints `RESULT <hex>`;
-- failure prints `ABORT <reason>` and exits non-zero;
-- mixed mode must work: Rust ALICE with C++ BOB, and C++ ALICE with Rust BOB.
+- party `1` as ALICE/listener;
+- party `2` as BOB/connector;
+- default peer IP `127.0.0.1`;
+- `I_hex` as the same 48-bit internal shachain index;
+- `share_hex` as the same 32-byte XOR seed share;
+- success output: `RESULT <hex>`;
+- failure output: `ABORT <reason>` and non-zero exit;
+- the current circuit relation and input layout;
+- the current EMP-ag2pc wire behavior closely enough for mixed C++/Rust runs.
 
-The Rust implementation must not depend on an MPC crate. It may use general
-Rust packages for async/networking and cryptographic primitives, but the EMP
-malicious 2PC pieces used by this project must be implemented in our code.
+Rust v1 must not depend on an MPC crate. It may use general Rust crates for
+async networking, AES/SHA/EC arithmetic, errors, randomness, and zeroization,
+but the MPC protocol logic must live in this repository.
+
+## Performance requirement
+
+Rust-Rust v1 is not acceptable if it is materially slower than the current C++
+baseline. The current worst-case local run is about **1.2s** on the same machine.
+
+Release-gate benchmark:
+
+- `I = ffffffffffff`;
+- same host / loopback;
+- same machine used for C++ baseline;
+- Rust ALICE + Rust BOB must be no worse than the C++ baseline within agreed
+  measurement noise.
+
+Track both:
+
+- wall-clock latency;
+- peak RSS.
+
+Rust v1 may not reach the future memory target because it intentionally preserves
+the current protocol shape. That is acceptable for v1 if it preserves correctness
+and speed. Large memory reductions belong to Rust v2 unless a safe v1-local
+optimization is obvious.
+
+## Why not change the protocol immediately?
+
+Changing the implementation language and the cryptographic protocol at the same
+time is too much risk for this use case. The system is intended to protect
+Lightning revocation secrets; a wrong output can translate into theft of funds.
+
+Rust-native protocol changes are attractive because they can support:
+
+- typed request/response rounds;
+- transcript binding from the start;
+- streaming gate/chunk execution;
+- lower peak memory;
+- precompute-almost-to-output and reveal later;
+- cleaner future review;
+- possible future OT changes.
+
+But those are protocol changes. If they happen during the port, honest test
+failures and security bugs become harder to localize. Therefore v1 stays close
+to C++; v2 changes the protocol only after v1 is a trusted regression oracle.
+
+## Proxy decision
+
+Do **not** build a proxy for v1 by default.
+
+A proxy could make sense only if Rust v1 used a clean framed encoding while C++
+used EMP's raw stream. But if v1 is a faithful port of the current protocol, a
+proxy adds another parser, another process, and another failure mode without
+much security benefit.
+
+Preferred v1 shape:
+
+```text
+C++ party  <->  Rust v1 party
+same CLI        same EMP-compatible wire
+```
+
+A future proxy can still be useful as a migration/testing tool, but it should not
+be in the main v1 path unless a specific EMP-wire detail proves too invasive to
+keep inside the Rust compatibility layer.
+
+Important distinction:
+
+- If a proxy only changes byte encoding for the same logical EMP protocol, it
+  does not need secret material.
+- If a proxy tries to translate C++ EMP into a different Rust-native MPC
+  protocol, it cannot remain a simple neutral translator. Garbled labels, OT
+  outputs, MACs, masks, and authenticated wire state are protocol-specific
+  secret-bearing artifacts. Translating between different MPC protocols would
+  require terminating one or both protocols or creating a new cryptographic
+  bridge.
 
 ## Current C++ contract to preserve
 
-The existing binary does more than just one TCP request/response:
+The existing binary does more than a single TCP request/response:
 
 1. `demo/party.cpp` parses the CLI, creates an EMP `NetIO`, then calls
    `run::RunDerivation`.
-2. `RunDerivation` deterministically builds the circuit from `I`, converts it
-   to EMP's Bristol in-memory format, and exchanges a 32-byte circuit digest.
-   ALICE sends the digest first; BOB receives first.
-3. `emp::C2PC` then runs:
+2. `RunDerivation` builds the circuit from `I`, converts it to EMP's Bristol
+   in-memory format, and exchanges a 32-byte circuit digest. ALICE sends first;
+   BOB receives first.
+3. `emp::C2PC` runs:
    - `function_independent()`;
    - `function_dependent()`;
    - `online(input, output, alice_output = true)`.
 4. EMP `Fpre` opens two additional TCP connections when `fpre_threads = 1`.
-   So the wire-compatible Rust implementation must manage three TCP streams:
-   the main stream plus `io[0]` and `io2[0]`, in EMP's connection order.
+   So mixed-mode Rust must handle three TCP streams:
+   - main stream;
+   - `io[0]`;
+   - `io2[0]`.
 5. EMP sends raw bytes with no outer message framing. Boolean vectors are packed
-   by `IOChannel::send_bool`; blocks are 16-byte `__m128i` values in host memory
+   by `IOChannel::send_bool`; blocks are 16-byte `__m128i` values in EMP memory
    order; `send_partial_block<..., 5>` sends the first five bytes of each block.
 6. The current input layout must be preserved exactly:
    - BOB's share is placed in wires `[0, n1)`;
    - ALICE's share is placed in wires `[n1, n1+n2)`;
    - the circuit computes `seed = wire[i] XOR wire[256+i]`.
 
-Do not "clean up" role names or wire slices during the port. Cross-mode depends
-on matching the current behavior, even where EMP naming is confusing.
+Do not "clean up" role names or wire slices during the v1 port. Mixed mode
+depends on matching the current behavior.
 
-## Architecture
+## First step
+
+The first step is a **short v1 compatibility spec plus a probe manifest**, not a
+large abstract protocol document.
+
+Order:
+
+1. Write down the exact v1 compatibility target:
+   - vendored EMP-ag2pc source/commit or hash;
+   - compile-time constants such as `SSP = 5` and `fpre_threads = 1`;
+   - role behavior;
+   - TCP stream schedule;
+   - circuit digest format;
+   - input/output wire layout;
+   - abort behavior.
+2. Write the C++ probe manifest:
+   - what each probe freezes;
+   - expected output format;
+   - how Rust tests consume it.
+3. Implement the probes.
+
+So the very first artifact is a spec small enough to guide the probes. The first
+code artifact is the C++ probe suite.
+
+## C++/Rust probe strategy
+
+The probes are mandatory. They are the bridge that lets us port in layers
+instead of debugging the full 48-SHA circuit at once.
+
+### Deterministic C++ probes
+
+Small C++ binaries linked against the current code and vendored EMP should emit
+canonical vectors that Rust unit tests compare against.
+
+Probe:
+
+- `makeBlock(high, low)` memory bytes;
+- block XOR, masks, `getLSB`;
+- `sigma(block)`;
+- `send_bool` packing for aligned and unaligned buffers;
+- `send_partial_block<5>`;
+- SHA-256 wrapper behavior;
+- EMP PRG behavior;
+- EMP fixed-key AES PRP behavior;
+- garbling hash/TMMO hash for fixed labels;
+- `num_ands -> batch_size/bucket_size` choices;
+- circuit gate counts, wire counts, AND counts, and digest for representative
+  indices;
+- `GenerateFromSeed(seed, I)` vectors.
+
+These catch the common porting bugs: endian mistakes, AES lane mistakes,
+boolean packing differences, partial-block truncation mistakes, and accidental
+changes to EMP preprocessing parameters.
+
+### Pure circuit/reference probes
+
+These prove that Rust and C++ are computing the same relation before MPC enters:
+
+- `GenerateFromSeed(seed, I)` matches C++;
+- Rust circuit digest equals C++ digest;
+- Rust gate order equals C++ gate order;
+- representative indices include:
+  - `000000000000`;
+  - `000000000001`;
+  - `800000000000`;
+  - `aaaaaaaaaaaa`;
+  - `555555555555`;
+  - `ffffffffffff`.
+
+`I = 000000000000` is useful as a compatibility fixture, but it reveals the full
+seed because no SHA-256 round runs. It must be documented and should not be a
+normal production derivation.
+
+### Subprotocol interop probes
+
+After deterministic probes pass, test live C++/Rust pairs for progressively
+larger pieces:
+
+- raw stream open/flush behavior over all three streams;
+- base OT;
+- IKNP/COT;
+- `LeakyDeltaOT`;
+- `Fpre`;
+- one AND gate;
+- tiny hand-written circuits;
+- SHA-256 compression circuit;
+- full shachain circuit.
+
+Randomized protocols usually cannot be tested by fixed output vectors unless
+both RNGs are fully controlled. For randomized layers, the test is successful
+completion plus protocol invariants in both role directions.
+
+### End-to-end mixed-mode tests
+
+Mandatory configurations:
+
+- C++ ALICE + C++ BOB baseline;
+- Rust ALICE + Rust BOB;
+- Rust ALICE + C++ BOB;
+- C++ ALICE + Rust BOB.
+
+Each result must match the reference shachain implementation.
+
+### Adversarial probes
+
+Honest interop is not enough. A port can pass all honest tests and still weaken
+malicious security. Add tests where one side tampers and the receiver must abort:
+
+- circuit digest mismatch;
+- wrong `I`;
+- changed gate/table bytes;
+- malformed partial block;
+- wrong output label/MAC;
+- skipped send or truncated send;
+- replayed old transcript fragment;
+- mixed session/circuit material;
+- wrong output opening.
+
+Each receiver implementation must be tested against a cheating sender. Detection
+lives on the receiving side, so both Rust-as-receiver and C++-as-receiver cases
+matter.
+
+## Rust workspace architecture
 
 Use a Cargo workspace under `rust/`:
 
@@ -60,6 +279,7 @@ rust/
   crates/
     shachain2pc-types/
     shachain2pc-circuit/
+    shachain2pc-emp-wire/
     shachain2pc-emp-compat/
     shachain2pc-protocol/
   bins/
@@ -75,27 +295,7 @@ Small shared types with no networking and no async runtime:
 - `Value32`;
 - hex parsing/formatting matching `util/hex.h`;
 - output/error conventions;
-- typed wire actions used by the pure protocol engine:
-
-```rust
-enum StreamId {
-    Main,
-    Aux0,
-    Aux1,
-}
-
-enum IoAction {
-    Send { stream: StreamId, bytes: bytes::Bytes },
-    Recv { stream: StreamId, len: usize, tag: RecvTag },
-    Flush { stream: StreamId },
-}
-```
-
-This is the Rust equivalent of "round types". Because EMP is a raw byte stream,
-the correct abstraction is not JSON-like request/response structs. The pure
-engine should instead emit typed send/recv actions and consume typed received
-buffers. Tests can drive these actions in memory; the async protocol layer can
-drive them over TCP.
+- zeroization helpers where practical.
 
 ### `shachain2pc-circuit`
 
@@ -103,36 +303,34 @@ Pure deterministic circuit/reference code:
 
 - port `protocol/bristol.*`;
 - port `protocol/circuit_gen.*`;
-- port the SHA-256 compression gadget loader/generator currently embedded in
-  the C++ path;
+- port the SHA-256 compression gadget path used by C++;
 - port `reference::GenerateFromSeed`;
 - compute the exact same circuit digest as `run::CircuitDigest`.
 
-First milestone must generate the exact same gate order and digest as C++ for
-the test indices. Later streaming optimization is a separate protocol version;
-it cannot be mixed with the existing C++ binary unless the C++ side is changed
-too.
+### `shachain2pc-emp-wire`
+
+Raw EMP wire compatibility:
+
+- block serialization;
+- bool packing/unpacking;
+- partial block send/receive;
+- raw stream helpers;
+- main/Aux0/Aux1 stream scheduling helpers.
+
+Keep EMP wire awkwardness here. The MPC engine may use this crate, but higher
+layers should not hand-code EMP byte packing.
 
 ### `shachain2pc-emp-compat`
 
-This crate owns the self-contained Rust implementation of the subset of EMP
-used here. It should be written as pure state machines plus explicit randomness
-inputs, not direct socket calls.
-
-Needed pieces:
+Self-contained Rust implementation of the subset of EMP used here:
 
 - EMP `block` representation:
   - 16-byte value;
   - `makeBlock(high, low)` compatible with EMP memory layout;
-  - XOR, AND masks, `getLSB`, `sigma`;
-  - exact partial-block serialization.
-- EMP IO encoding:
-  - `send_bool` / `recv_bool` packing;
-  - EC point serialization used by base OT;
-  - raw block serialization.
+  - XOR, masks, `getLSB`, `sigma`.
 - EMP hashes/PRG/PRP:
   - SHA-256 digest behavior;
-  - fixed-key AES PRP behavior used by EMP;
+  - fixed-key AES PRP behavior;
   - PRG behavior used for blocks/bools.
 - OT stack used by `LeakyDeltaOT`:
   - base OT;
@@ -147,29 +345,13 @@ Needed pieces:
   - `function_independent`;
   - `function_dependent`;
   - `online`;
-  - EMP-compatible consistency failure detection.
+  - first-class consistency-check errors.
 
-The crate API should look like:
+Do not scrape stdout for failures like the C++ `CheatGuard` workaround. Rust
+should turn every consistency failure into a typed `Err`.
 
-```rust
-struct EngineState { /* role, circuit, phase, crypto state */ }
-
-enum EngineEvent {
-    Start,
-    Received { stream: StreamId, tag: RecvTag, bytes: bytes::Bytes },
-    Random { tag: RandomTag, bytes: bytes::Bytes },
-}
-
-struct EngineStep {
-    state: EngineState,
-    actions: Vec<IoAction>,
-    result: Option<Value32>,
-}
-```
-
-The important property is that tests can run ALICE and BOB by repeatedly
-matching `Send` actions to peer `Recv` actions without real networking. The
-Tokio layer should be only an interpreter for `IoAction`.
+The internal implementation should still be structured as state machines where
+reasonable, but v1's public wire is EMP-compatible raw bytes.
 
 ### `shachain2pc-protocol`
 
@@ -178,8 +360,10 @@ Async orchestration over real sockets:
 - open the main TCP stream using the current role behavior;
 - open/accept Aux0 and Aux1 in the same order EMP uses;
 - apply socket timeouts equivalent to the C++ tool;
-- drive the `shachain2pc-emp-compat` engine until result/abort;
-- expose a single async API:
+- build the circuit for `I`;
+- exchange the circuit digest;
+- drive `shachain2pc-emp-compat`;
+- expose:
 
 ```rust
 async fn derive(
@@ -191,8 +375,8 @@ async fn derive(
 ) -> Result<Value32, Error>;
 ```
 
-The protocol layer must not contain MPC math. It only owns scheduling, TCP,
-timeouts, and translating IO errors into clean aborts.
+The protocol layer owns scheduling, TCP, timeouts, and clean error reporting. It
+should not contain MPC math.
 
 ### `party` binary
 
@@ -204,76 +388,57 @@ Thin CLI wrapper:
 - print `RESULT <hex>` on success;
 - print `ABORT <reason>` on error.
 
-For strict command-line drop-in behavior, also decide whether to print
-`connected` like EMP `NetIO` currently does. The current demo scripts tolerate
-extra lines, but cross-tool users may rely on that output.
-
-## Compatibility strategy
-
-There are two possible strategies:
-
-1. **EMP wire-compatible Rust port.**
-   This is the plan above. It is more work, but it satisfies mixed mode.
-
-2. **New Rust-native wire protocol.**
-   This is easier and could use clean typed request/response messages, but it
-   would not work against the current C++ binary. It would need an explicit
-   protocol version and both parties would have to use Rust.
-
-Because the requested requirement says drop-in replacement, same party ABI, and
-cross mode, choose strategy 1 first.
+Do not preserve EMP's incidental `connected` stdout line by default. The stable
+contract is result/abort plus exit code. If needed later, add an explicit
+compatibility flag or env var.
 
 ## Implementation phases
 
-### Phase 0: Freeze C++ behavior with probes
+### Phase 0: Compatibility spec and probes
 
-Add small C++ probe binaries or test hooks that emit deterministic vectors for:
-
-- `makeBlock`, block serialization, `getLSB`, `sigma`;
-- `send_bool` packing for aligned and unaligned buffers;
-- `send_partial_block<5>`;
-- `Hash`, `PRG`, `PRP`;
-- circuit digest for representative indices;
-- `GenerateFromSeed` reference vectors.
-
-These probes are not the Rust implementation, but they prevent guessing at EMP
-ABI details.
-
-### Phase 1: Rust workspace, CLI, reference, circuit
-
-Create the workspace and implement:
-
-- hex parsing;
-- `GenerateFromSeed`;
-- circuit generation;
-- circuit digest;
-- `party` argument parsing and output formatting, initially behind a stub
-  protocol.
+Create the v1 compatibility spec and probe manifest, then implement C++ probes.
 
 Acceptance:
 
-- Rust reference matches C++ reference for all existing KATs;
-- Rust circuit digest matches C++ for `I = 0`, `1`, alternating-bit indices,
-  and `0xffffffffffff`.
+- C++ probes build in the existing environment;
+- probe outputs are deterministic where expected;
+- Rust test harness can consume probe output.
+
+### Phase 1: Rust workspace, types, reference, circuit
+
+Implement:
+
+- workspace layout;
+- CLI-compatible parsing helpers;
+- `GenerateFromSeed`;
+- circuit generation;
+- circuit digest.
+
+Acceptance:
+
+- Rust reference matches C++ reference vectors;
+- Rust circuit digest and gate counts match C++ probes;
+- no MPC code is needed yet.
 
 ### Phase 2: EMP wire substrate
 
-Implement the low-level compatibility layer:
+Implement:
 
 - block memory layout;
 - bool packing;
-- partial blocks;
-- raw stream action interpreter;
-- main/Aux0/Aux1 TCP connection ordering.
+- partial block handling;
+- raw stream helpers;
+- three-stream connection schedule.
 
 Acceptance:
 
-- Rust encoding tests pass against the C++ probes;
-- a Rust mock can exchange bytes with a C++ probe over all three streams.
+- Rust encoding tests pass against C++ probes;
+- Rust can exchange raw bytes with small C++ stream probes over all three
+  streams.
 
 ### Phase 3: Crypto primitives and OT
 
-Port the exact EMP subset:
+Port:
 
 - AES PRG/PRP behavior;
 - SHA-256 wrapper behavior;
@@ -281,16 +446,15 @@ Port the exact EMP subset:
 - IKNP COT;
 - `LeakyDeltaOT`.
 
-Use Rust crypto crates where they can reproduce EMP's externally visible
-behavior exactly. If a crate's encoding or arithmetic does not match EMP, wrap
-or replace that piece locally.
+Use Rust crypto crates only where they reproduce EMP-visible behavior exactly.
+For base OT, OpenSSL bindings are likely safer than pure-Rust curve crates if
+the compatibility target is EMP/OpenSSL point encoding.
 
 Acceptance:
 
-- deterministic seeded tests match C++ probes where deterministic seeding is
-  possible;
-- randomized interop tests complete base OT and IKNP between Rust and C++ in
-  both directions.
+- deterministic primitive vectors match C++ probes;
+- randomized interop tests complete base OT and IKNP/COT between Rust and C++ in
+  both role directions.
 
 ### Phase 4: Fpre and C2PC
 
@@ -302,16 +466,13 @@ Implement:
 - `function_dependent`;
 - `online`.
 
-Keep this as a state machine emitting `IoAction`s. Do not put Tokio calls inside
-the MPC code.
-
 Acceptance:
 
-- Rust/Rust in-memory engine evaluates tiny circuits correctly;
+- Rust/Rust evaluates tiny circuits correctly;
 - Rust/C++ mixed mode evaluates tiny circuits correctly;
-- malicious/tampered tiny-circuit tests abort rather than return a result.
+- one-AND and small-circuit adversarial tests abort on tampering.
 
-### Phase 5: Full shachain party
+### Phase 5: Full shachain party v1
 
 Wire the circuit crate to the EMP-compatible engine and async protocol.
 
@@ -320,8 +481,9 @@ Acceptance:
 - Rust/Rust derives the same values as C++ reference;
 - Rust ALICE + C++ BOB works;
 - C++ ALICE + Rust BOB works;
+- worst-case Rust/Rust performance is no worse than the C++ baseline;
 - test indices include:
-  - `000000000000`;
+  - `000000000000` compatibility fixture;
   - `000000000001`;
   - `800000000000`;
   - `aaaaaaaaaaaa`;
@@ -333,47 +495,74 @@ Acceptance:
 Add automated tests:
 
 - unit tests for pure circuit/reference code;
-- in-memory protocol tests using pure action drivers;
+- primitive probe tests;
+- subprotocol interop tests;
 - local Tokio integration tests;
-- cross-mode integration tests using the existing C++ `.build/party`;
-- transcript regression tests for byte counts and message ordering;
-- negative tests for digest mismatch, wrong role, malformed CLI, peer timeout,
-  and known cheat/tamper cases.
+- mixed C++/Rust end-to-end tests;
+- transcript/message-order regression tests;
+- adversarial/tamper tests;
+- latency and peak-RSS benchmark jobs.
 
-The cross-mode tests are mandatory. Without them, "same ABI" is not proven.
+The mixed-mode and adversarial tests are mandatory. Honest correctness alone
+does not support a malicious-security claim.
 
-### Phase 7: Documentation and security review
+### Phase 7: Documentation and human review package
 
 Document:
 
-- the Rust crate boundaries;
-- the exact command-line contract;
-- the exact compatibility target: current EMP-ag2pc source vendored in
-  `.deps/emp/include`;
-- the warning that this is still a demo/PoC until human-reviewed;
-- the `I == 0` caveat: deriving index zero reveals `alice_share XOR bob_share`
-  because no SHA-256 round runs. Compatibility mode preserves current behavior,
-  but production Lightning policy should reject or tightly gate it.
+- the v1 compatibility target;
+- crate boundaries;
+- command-line contract;
+- known local-secret handling limitations, especially `share_hex` in argv;
+- the `I == 0` seed-reveal caveat;
+- warnings that the project is AI-written, a demo/PoC, and not production-ready;
+- what has and has not been proven by tests.
+
+Prepare a review package for a human cryptographer/security engineer before any
+use with real funds.
+
+## Rust v2 future plan
+
+Rust v2 is where protocol changes belong.
+
+Possible v2 goals:
+
+- clean framed binary protocol with a versioned handshake;
+- typed request/response round functions;
+- transcript hash bound into every commitment, OT context, garbling context,
+  circuit/relation digest, output opening, and `I`;
+- streaming execution that avoids holding the full 48-SHA circuit and all
+  garbling state in memory;
+- peak memory target near 10MB if practical;
+- prepare/reveal split:
+  - prepare phase runs almost all expensive MPC for an authorized `I`;
+  - reveal phase opens only the final value after final authorization;
+- checkpointed authenticated shared state if it can be done without allowing a
+  malicious party to steer to `I'`;
+- possible future OT/backend changes.
+
+Rust v1 should remain available as a regression oracle while v2 is developed.
 
 ## Security notes
 
-- Reimplementing malicious 2PC and OT is high risk. The Rust port should be
-  treated as a new cryptographic implementation, not as a refactor.
-- The first security target is behavioral equivalence with the current
-  EMP-backed PoC, not a new proof.
-- Cross-mode compatibility does not itself prove security; it proves ABI
-  compatibility. Security still depends on the EMP-ag2pc protocol assumptions
-  and on faithfully porting every check.
-- Secret shares must not be logged. Use `zeroize` for local share buffers where
-  possible, but remember that command-line arguments are still visible to the
-  local host environment.
-- Authorization of `I` remains outside the binary. The binary can prove both
-  parties computed the same requested `I`; it cannot prove that this `I` was
-  allowed by Lightning channel state.
+- Reimplementing malicious 2PC and OT is high risk. Rust v1 is a new
+  cryptographic implementation even if it preserves C++ behavior.
+- C++ interop proves compatibility and helps detect porting bugs. It does not by
+  itself prove security.
+- Honest tests prove correctness, not malicious security. Adversarial tests and
+  human review are required.
+- Secret shares must not be logged. `zeroize` helps local buffers but does not
+  solve command-line argument exposure through `ps`/`/proc`.
+- Authorization of `I` remains outside the binary. The binary can ensure both
+  parties evaluate the same requested `I`; it cannot prove that Lightning channel
+  state allowed that `I`.
+- `I == 0` reveals `alice_share XOR bob_share`, i.e. the seed, because no hash
+  round runs. Keep it only as a compatibility/test fixture unless production
+  policy explicitly authorizes it.
 
 ## Initial dependency set
 
-Expected dependencies:
+Expected Rust dependencies:
 
 - `tokio` for async TCP and timeouts;
 - `bytes` for owned byte buffers;
@@ -382,23 +571,20 @@ Expected dependencies:
 - `zeroize` for local secret cleanup;
 - `sha2` for SHA-256;
 - `aes` or `openssl` bindings only if they reproduce EMP AES behavior exactly;
-- `p256` or `openssl` bindings for base OT point arithmetic, subject to
-  wire-format compatibility tests.
+- OpenSSL bindings are likely needed for EMP-compatible base OT point behavior.
 
-Avoid dependencies that implement complete MPC protocols. The MPC protocol code
-must live in this workspace.
+Avoid complete MPC protocol dependencies. The MPC protocol code must live in
+this workspace.
 
 ## Open decisions
 
-1. Should Rust strict mode preserve the current `connected` stdout line?
-2. Should the default binary preserve `I == 0` for compatibility, or reject it
-   for safer Lightning semantics? If rejection is desired, mixed-mode tests for
-   `I == 0` should be moved to an explicit compatibility fixture instead of the
-   default CLI.
-3. Should the Rust source vendor translated EMP code comments/references in a
-   dedicated crate, or keep a cleaner reimplementation with line-by-line tests
-   against EMP probes?
-4. Should a future Rust-native protocol version implement streaming SHA links
-   and checkpointed shared state? That is a separate design from EMP wire
-   compatibility and should get a version byte/new handshake.
+1. Exact format of the v1 compatibility spec and probe outputs.
+2. Whether Rust v1 should hard-reject `I == 0` in normal CLI mode or preserve it
+   exactly for full C++ compatibility. If rejected, keep an explicit compatibility
+   test path.
+3. Exact benchmark tolerance around the 1.2s C++ baseline.
+4. Which OpenSSL/Rust crypto primitives reproduce EMP-visible behavior with the
+   least risk.
+5. Whether a proxy is needed later for migration tooling. It is not part of the
+   default v1 plan.
 

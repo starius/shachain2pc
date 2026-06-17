@@ -66,6 +66,25 @@ Track both:
 - wall-clock latency;
 - peak RSS.
 
+Benchmark method:
+
+- run release builds only;
+- use fixed shares and `I = ffffffffffff`;
+- run at least 5 warmup iterations per pairing;
+- run at least 30 measured iterations per pairing;
+- interleave pairings to reduce drift from thermal/load changes;
+- measure elapsed wall-clock time from party launch until both parties exit;
+- record peak RSS for both processes and report both per-process and combined
+  peak;
+- use C++/C++ as the baseline distribution;
+- use Rust/Rust as the release-gate distribution;
+- use mixed C++/Rust in both directions as compatibility/performance signal.
+
+Pass criterion for v1 latency: Rust/Rust passes if the bootstrap 95% upper
+confidence bound for `median(Rust/Rust) / median(C++/C++)` is at most `1.05`.
+If Rust/Rust's measured median is above C++/C++ at all, investigate and either
+optimize or document the cause before accepting the result.
+
 If Rust/Rust is slower, investigate and address the cause without breaking the
 v1 transition invariants: same algorithm, same relation, same wire behavior, and
 same mixed-mode compatibility.
@@ -178,6 +197,31 @@ Order:
    - expected output format;
    - how Rust tests consume it.
 3. Implement the probes.
+
+Compatibility spec format:
+
+- `compat/v1/spec.toml`;
+- stable TOML keys for constants, roles, stream schedule, wire encodings,
+  circuit layout, abort behavior, benchmark parameters, and accepted caveats;
+- no prose-only normative requirements: anything required for v1 compatibility
+  must be represented by a machine-readable key or by a named probe.
+
+Probe output format:
+
+- JSON Lines (`*.jsonl`);
+- one JSON object per case;
+- all byte strings are lowercase hex without `0x`;
+- integers are decimal JSON numbers when safe, otherwise decimal strings;
+- arrays are ordered and semantically significant;
+- each object includes at least:
+  - `schema`;
+  - `probe`;
+  - `case`;
+  - `inputs`;
+  - `outputs`;
+  - `compat_spec`;
+- probe output must be deterministic unless the probe is explicitly marked as an
+  interop/randomized probe.
 
 So the very first artifact is a spec small enough to guide the probes. The first
 code artifact is the C++ probe suite.
@@ -613,10 +657,14 @@ Therefore the lowest-risk v1 choices are:
 1. Use Rust OpenSSL bindings for the base OT group and point operations. This is
    the closest match to EMP because EMP itself calls OpenSSL for those objects
    and encodings.
-2. Use RustCrypto `aes` for raw AES-128 block encryption only if C++ probes
-   confirm exact block-byte behavior and performance is good. If it fails either
-   test, use OpenSSL AES or a small audited compatibility wrapper as a fallback.
-3. Use `sha2` for ordinary SHA-256 digest operations, with C++ probe vectors to
+2. Implement the AES dependency behind a tiny internal `Aes128Block` wrapper so
+   the backend can be switched without touching MPC logic.
+3. Try RustCrypto `aes` first for raw AES-128 block encryption. Use it only if
+   C++ probes confirm exact block-byte behavior and benchmarks meet the speed
+   gate.
+4. If RustCrypto `aes` fails either compatibility or performance, switch the
+   wrapper to OpenSSL AES or a small audited compatibility wrapper.
+5. Use `sha2` for ordinary SHA-256 digest operations, with C++ probe vectors to
    confirm every call site hashes the same bytes.
 
 Do not use a pure-Rust P-256 crate for v1 unless probes prove exact compatibility
@@ -626,18 +674,18 @@ v2 after the wire/protocol is no longer EMP-compatible.
 ## Resolved decisions
 
 1. The v1 spec freezes the whole algorithm and wire encoding. Exact probe output
-   formats can be chosen during implementation, but must be canonical and
-   machine-checkable.
+   formats are TOML for the spec and JSON Lines for probe outputs.
 2. Rust v1 accepts `I == 0` for C++ compatibility.
 3. Benchmark C++/C++, Rust/Rust, and mixed C++/Rust. Rust/Rust must not be
-   statistically slower than C++/C++.
+   statistically slower than C++/C++ under the benchmark method above.
 4. Prefer OpenSSL bindings for EMP-compatible base OT point behavior; prefer
-   vetted Rust crates for standard SHA/AES only after probe confirmation.
+   vetted Rust crates for standard SHA/AES only after probe confirmation. AES
+   backend selection is an empirical implementation gate, not a protocol
+   decision.
 5. Proxy is not needed for v1.
 
-## Remaining open decisions
+## Implementation details deferred to Phase 0/3
 
-1. Exact machine-readable format for the compatibility spec and probe outputs.
-2. Exact statistical benchmark method and tolerance.
-3. Whether RustCrypto `aes` or OpenSSL AES gives the best combination of exact
-   EMP compatibility and speed.
+1. Exact TOML keys and JSONL field lists for the compatibility spec and probes.
+2. Exact benchmark harness implementation.
+3. Final AES backend, selected by C++ probe compatibility and benchmark results.

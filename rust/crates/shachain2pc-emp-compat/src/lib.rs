@@ -33,6 +33,8 @@ pub enum CompatError {
         mac: usize,
         key: usize,
     },
+    CoinTossMismatch,
+    FeqMismatch,
     LengthOverflow(&'static str),
     MissingDelta(&'static str),
     BadIknpSetupLength {
@@ -67,6 +69,8 @@ impl fmt::Display for CompatError {
                 f,
                 "Fpre generated data length mismatch: expected={expected}, mac={mac}, key={key}"
             ),
+            Self::CoinTossMismatch => write!(f, "Fpre coin-toss commitment mismatch"),
+            Self::FeqMismatch => write!(f, "Fpre equality check mismatch"),
             Self::LengthOverflow(name) => write!(f, "{name} length overflow"),
             Self::MissingDelta(name) => write!(f, "{name} setup did not produce Delta"),
             Self::BadIknpSetupLength { name, len } => {
@@ -150,6 +154,10 @@ impl Prg {
             prp: Prp::new(Block::from_bytes(key)),
             counter: 0,
         }
+    }
+
+    pub fn random() -> Result<Self> {
+        Ok(Self::new(random_block()?, 0))
     }
 
     pub fn random_block(&mut self, nblocks: usize) -> Vec<Block> {
@@ -622,6 +630,7 @@ pub struct Fpre {
     z_delta: Block,
     params: FpreParams,
     eq: [Sha256; 2],
+    coin_prg_seed: Block,
 }
 
 pub struct FpreGenerated {
@@ -678,6 +687,7 @@ impl Fpre {
             z_delta: delta.and(leaky_delta_mask()),
             params: FpreParams::for_size(size),
             eq: [Sha256::new(), Sha256::new()],
+            coin_prg_seed: random_block()?,
         })
     }
 
@@ -746,7 +756,34 @@ impl Fpre {
                 key: generated.key.len(),
             });
         }
+        self.check_slices(
+            streams,
+            &mut generated.mac,
+            &mut generated.key,
+            length,
+            index,
+        )
+        .await
+    }
 
+    async fn check_slices(
+        &mut self,
+        streams: &mut EmpStreams,
+        mac: &mut [Block],
+        key: &mut [Block],
+        length: usize,
+        index: usize,
+    ) -> Result<()> {
+        let expected = length
+            .checked_mul(3)
+            .ok_or(CompatError::LengthOverflow("Fpre check"))?;
+        if mac.len() != expected || key.len() != expected {
+            return Err(CompatError::BadFpreGeneratedLength {
+                expected,
+                mac: mac.len(),
+                key: key.len(),
+            });
+        }
         let stream = match index {
             0 => &mut streams.fpre_io0,
             1 => &mut streams.fpre_io2_0,
@@ -760,7 +797,7 @@ impl Fpre {
             stream,
             index,
         };
-        fpre_check_on_stream(ctx, generated, length).await
+        fpre_check_on_stream(ctx, mac, key, length).await
     }
 
     pub fn check_digest(&self, index: usize) -> Result<[u8; HASH_DIGEST_BYTES]> {
@@ -771,6 +808,111 @@ impl Fpre {
             .clone()
             .finalize();
         Ok(digest.into())
+    }
+
+    pub async fn refill(&mut self, streams: &mut EmpStreams) -> Result<FpreGenerated> {
+        self.refill_inner(streams, false).await
+    }
+
+    async fn refill_inner(
+        &mut self,
+        streams: &mut EmpStreams,
+        tamper_eq_for_test: bool,
+    ) -> Result<FpreGenerated> {
+        let raw_length = self
+            .params
+            .batch_size
+            .checked_mul(self.params.bucket_size)
+            .ok_or(CompatError::LengthOverflow("Fpre refill raw length"))?;
+        let mut raw = self.generate(streams, raw_length).await?;
+
+        let half_batch = self.params.batch_size / 2;
+        let check_length = half_batch
+            .checked_mul(self.params.bucket_size)
+            .ok_or(CompatError::LengthOverflow("Fpre refill check length"))?;
+        let check_blocks = check_length
+            .checked_mul(3)
+            .ok_or(CompatError::LengthOverflow("Fpre refill check blocks"))?;
+
+        let (mac0, mac1) = raw.mac.split_at_mut(check_blocks);
+        let (key0, key1) = raw.key.split_at_mut(check_blocks);
+        let (eq0, eq1) = self.eq.split_at_mut(1);
+        let ctx0 = FpreCheckContext {
+            party: self.party,
+            delta: self.delta,
+            z_delta: self.z_delta,
+            eq: &mut eq0[0],
+            stream: &mut streams.fpre_io0,
+            index: 0,
+        };
+        let ctx1 = FpreCheckContext {
+            party: self.party,
+            delta: self.delta,
+            z_delta: self.z_delta,
+            eq: &mut eq1[0],
+            stream: &mut streams.fpre_io2_0,
+            index: 1,
+        };
+        tokio::try_join!(
+            fpre_check_on_stream(ctx0, mac0, key0, check_length),
+            fpre_check_on_stream(ctx1, mac1, key1, check_length)
+        )?;
+
+        let seed = coin_tossing(self.coin_prg_seed, &mut streams.fpre_io0, self.party).await?;
+        let combined = self.combine(seed, streams, &raw).await?;
+        self.fold_eq_digests();
+        if tamper_eq_for_test {
+            self.eq[0].update(b"shachain2pc test tamper");
+        }
+        self.feq_compare(&mut streams.fpre_io0).await?;
+        Ok(combined)
+    }
+
+    async fn combine(
+        &self,
+        seed: Block,
+        streams: &mut EmpStreams,
+        raw: &FpreGenerated,
+    ) -> Result<FpreGenerated> {
+        let length = if self.params.bucket_size > 4 {
+            self.params.batch_size
+        } else {
+            self.params.batch_size.min(
+                self.params
+                    .permute_batch_size
+                    .unwrap_or(self.params.batch_size),
+            )
+        };
+        fpre_combine(
+            FpreCombineContext {
+                seed,
+                index: 0,
+                party: self.party,
+                stream: &mut streams.fpre_io0,
+            },
+            &raw.mac,
+            &raw.key,
+            length,
+            self.params.bucket_size,
+        )
+        .await
+    }
+
+    fn fold_eq_digests(&mut self) {
+        for i in 1..self.eq.len() {
+            let digest = digest_and_reset(&mut self.eq[i]);
+            self.eq[0].update(digest);
+        }
+    }
+
+    async fn feq_compare(&mut self, stream: &mut EmpStream) -> Result<()> {
+        let local_digest = digest_and_reset(&mut self.eq[0]);
+        let ok = feq_compare(stream, self.party, local_digest).await?;
+        if ok {
+            Ok(())
+        } else {
+            Err(CompatError::FeqMismatch)
+        }
     }
 }
 
@@ -783,20 +925,28 @@ struct FpreCheckContext<'a> {
     index: usize,
 }
 
+struct FpreCombineContext<'a> {
+    seed: Block,
+    index: u64,
+    party: Role,
+    stream: &'a mut EmpStream,
+}
+
 async fn fpre_check_on_stream(
     ctx: FpreCheckContext<'_>,
-    generated: &mut FpreGenerated,
+    mac: &mut [Block],
+    key: &mut [Block],
     length: usize,
 ) -> Result<()> {
     let mut g = Vec::with_capacity(length);
     let mut c = Vec::with_capacity(length);
     for i in 0..length {
-        let mut c_i = generated.key[3 * i + 1].xor(generated.mac[3 * i + 1]);
-        if generated.mac[3 * i + 1].get_lsb() {
+        let mut c_i = key[3 * i + 1].xor(mac[3 * i + 1]);
+        if mac[3 * i + 1].get_lsb() {
             c_i = c_i.xor(ctx.delta);
         }
         c.push(c_i);
-        g.push(h2d(generated.key[3 * i], ctx.delta, ctx.index).xor(c_i));
+        g.push(h2d(key[3 * i], ctx.delta, ctx.index).xor(c_i));
     }
 
     let gr = match ctx.party {
@@ -814,14 +964,14 @@ async fn fpre_check_on_stream(
 
     let mut d = Vec::with_capacity(length);
     for i in 0..length {
-        let mut s = h2(generated.mac[3 * i], generated.key[3 * i], ctx.index)
-            .xor(generated.mac[3 * i + 2])
-            .xor(generated.key[3 * i + 2]);
-        if generated.mac[3 * i].get_lsb() {
+        let mut s = h2(mac[3 * i], key[3 * i], ctx.index)
+            .xor(mac[3 * i + 2])
+            .xor(key[3 * i + 2]);
+        if mac[3 * i].get_lsb() {
             s = s.xor(gr[i].xor(c[i]));
         }
         g[i] = s;
-        if generated.mac[3 * i + 2].get_lsb() {
+        if mac[3 * i + 2].get_lsb() {
             g[i] = g[i].xor(ctx.delta);
         }
         d.push(u8::from(get_l2sb(g[i])));
@@ -844,10 +994,10 @@ async fn fpre_check_on_stream(
         if (d[i] != 0) != (dr[i] != 0) {
             match ctx.party {
                 Role::Alice => {
-                    generated.mac[3 * i + 2] = generated.mac[3 * i + 2].xor(Block::make(0, 1));
+                    mac[3 * i + 2] = mac[3 * i + 2].xor(Block::make(0, 1));
                 }
                 Role::Bob => {
-                    generated.key[3 * i + 2] = generated.key[3 * i + 2].xor(ctx.z_delta);
+                    key[3 * i + 2] = key[3 * i + 2].xor(ctx.z_delta);
                 }
             }
             g[i] = g[i].xor(ctx.delta);
@@ -871,6 +1021,168 @@ fn h2(a: Block, b: Block, _index: usize) -> Block {
 
 fn get_l2sb(block: Block) -> bool {
     ((block.as_bytes()[0] >> 1) & 1) == 1
+}
+
+async fn coin_tossing(seed: Block, stream: &mut EmpStream, party: Role) -> Result<Block> {
+    let mut prg = Prg::new(seed, 0);
+    let local = prg.random_block(1)[0];
+    let remote = match party {
+        Role::Alice => {
+            let commitment = hash_once(local.as_bytes());
+            stream.send_data(&commitment).await?;
+            let remote = stream.recv_block(1).await?[0];
+            stream.send_block(&[local]).await?;
+            remote
+        }
+        Role::Bob => {
+            let peer_commitment = stream.recv_data(HASH_DIGEST_BYTES).await?;
+            stream.send_block(&[local]).await?;
+            let remote = stream.recv_block(1).await?[0];
+            let commitment = hash_once(remote.as_bytes());
+            if peer_commitment != commitment {
+                return Err(CompatError::CoinTossMismatch);
+            }
+            remote
+        }
+    };
+    stream.flush().await?;
+    Ok(local.xor(remote))
+}
+
+async fn fpre_combine(
+    ctx: FpreCombineContext<'_>,
+    mac: &[Block],
+    key: &[Block],
+    length: usize,
+    bucket_size: usize,
+) -> Result<FpreGenerated> {
+    let raw_len = length
+        .checked_mul(bucket_size)
+        .ok_or(CompatError::LengthOverflow("Fpre combine raw length"))?;
+    let expected = raw_len
+        .checked_mul(3)
+        .ok_or(CompatError::LengthOverflow("Fpre combine blocks"))?;
+    if mac.len() < expected || key.len() < expected {
+        return Err(CompatError::BadFpreGeneratedLength {
+            expected,
+            mac: mac.len(),
+            key: key.len(),
+        });
+    }
+
+    let location = fpre_permutation(ctx.seed, ctx.index, raw_len);
+    let mut data = vec![0u8; raw_len];
+    for i in 0..length {
+        for j in 1..bucket_size {
+            let first = location[i * bucket_size] * 3 + 1;
+            let next = location[i * bucket_size + j] * 3 + 1;
+            data[i * bucket_size + j] = u8::from(mac[first].xor(mac[next]).get_lsb());
+        }
+    }
+
+    let data2 = match ctx.party {
+        Role::Alice => {
+            ctx.stream.send_bool_bytes(&data, 0).await?;
+            ctx.stream.recv_bool_bytes(raw_len, 0).await?
+        }
+        Role::Bob => {
+            let data2 = ctx.stream.recv_bool_bytes(raw_len, 0).await?;
+            ctx.stream.send_bool_bytes(&data, 0).await?;
+            data2
+        }
+    };
+    ctx.stream.flush().await?;
+
+    for i in 0..length {
+        for j in 1..bucket_size {
+            let offset = i * bucket_size + j;
+            data[offset] = u8::from((data[offset] != 0) != (data2[offset] != 0));
+        }
+    }
+
+    let mut mac_res = vec![Block::zero(); length * 3];
+    let mut key_res = vec![Block::zero(); length * 3];
+    for i in 0..length {
+        let first = location[i * bucket_size] * 3;
+        for j in 0..3 {
+            mac_res[i * 3 + j] = mac[first + j];
+            key_res[i * 3 + j] = key[first + j];
+        }
+        for j in 1..bucket_size {
+            let loc = location[i * bucket_size + j] * 3;
+            mac_res[i * 3] = mac_res[i * 3].xor(mac[loc]);
+            key_res[i * 3] = key_res[i * 3].xor(key[loc]);
+            mac_res[i * 3 + 2] = mac_res[i * 3 + 2].xor(mac[loc + 2]);
+            key_res[i * 3 + 2] = key_res[i * 3 + 2].xor(key[loc + 2]);
+
+            if data[i * bucket_size + j] != 0 {
+                key_res[i * 3 + 2] = key_res[i * 3 + 2].xor(key[loc]);
+                mac_res[i * 3 + 2] = mac_res[i * 3 + 2].xor(mac[loc]);
+            }
+        }
+    }
+
+    Ok(FpreGenerated {
+        mac: mac_res,
+        key: key_res,
+    })
+}
+
+fn fpre_permutation(seed: Block, index: u64, len: usize) -> Vec<usize> {
+    let mut location: Vec<usize> = (0..len).collect();
+    let mut prg = Prg::new(seed, index);
+    let ind = prg.random_data(len * 4);
+    for i in (0..len).rev() {
+        let start = i * 4;
+        let raw = i32::from_ne_bytes(ind[start..start + 4].try_into().expect("int length"));
+        let modulo = raw % (i as i32 + 1);
+        let chosen = if modulo > 0 { modulo } else { -modulo } as usize;
+        location.swap(i, chosen);
+    }
+    location
+}
+
+async fn feq_compare(
+    stream: &mut EmpStream,
+    party: Role,
+    local_digest: [u8; HASH_DIGEST_BYTES],
+) -> Result<bool> {
+    match party {
+        Role::Alice => {
+            let mut nonce = [0u8; BLOCK_BYTES];
+            rand_bytes(&mut nonce)?;
+            let commitment = feq_commitment(&local_digest, &nonce);
+            stream.send_data(&commitment).await?;
+            let remote_digest = stream.recv_data(HASH_DIGEST_BYTES).await?;
+            stream.send_data(&nonce).await?;
+            stream.flush().await?;
+            Ok(remote_digest == local_digest)
+        }
+        Role::Bob => {
+            let peer_commitment = stream.recv_data(HASH_DIGEST_BYTES).await?;
+            stream.send_data(&local_digest).await?;
+            let nonce: [u8; BLOCK_BYTES] = stream
+                .recv_data(BLOCK_BYTES)
+                .await?
+                .try_into()
+                .expect("nonce length");
+            stream.flush().await?;
+            Ok(peer_commitment == feq_commitment(&local_digest, &nonce))
+        }
+    }
+}
+
+fn feq_commitment(digest: &[u8; HASH_DIGEST_BYTES], nonce: &[u8; BLOCK_BYTES]) -> [u8; 32] {
+    let mut data = [0u8; HASH_DIGEST_BYTES + BLOCK_BYTES];
+    data[..HASH_DIGEST_BYTES].copy_from_slice(digest);
+    data[HASH_DIGEST_BYTES..].copy_from_slice(nonce);
+    hash_once(&data)
+}
+
+fn digest_and_reset(hasher: &mut Sha256) -> [u8; HASH_DIGEST_BYTES] {
+    let digest = hasher.clone().finalize();
+    *hasher = Sha256::new();
+    digest.into()
 }
 
 async fn send_pre(
@@ -989,11 +1301,15 @@ fn validate_iknp_len(name: &'static str, len: usize) -> Result<()> {
 fn random_blocks(length: usize) -> Result<Vec<Block>> {
     let mut out = Vec::with_capacity(length);
     for _ in 0..length {
-        let mut bytes = [0u8; BLOCK_BYTES];
-        rand_bytes(&mut bytes)?;
-        out.push(Block::from_bytes(bytes));
+        out.push(random_block()?);
     }
     Ok(out)
+}
+
+fn random_block() -> Result<Block> {
+    let mut bytes = [0u8; BLOCK_BYTES];
+    rand_bytes(&mut bytes)?;
+    Ok(Block::from_bytes(bytes))
 }
 
 fn random_bools(length: usize) -> Result<Vec<bool>> {
@@ -1141,6 +1457,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
 
     const LIVE_INTEROP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1149,6 +1466,7 @@ mod tests {
     const LIVE_FPRE_REQUESTED_SIZE: usize = 321;
     const LIVE_FPRE_GENERATE_LENGTH: usize = 683;
     const LIVE_FPRE_CHECK_LENGTH: usize = 683;
+    static LIVE_CPP_INTEROP_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[derive(Clone, Copy, Debug)]
     enum TestTransport {
@@ -1517,6 +1835,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_otco_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
         let bin = cpp_otco_probe();
         for transport in [TestTransport::Listen, TestTransport::Connect] {
             run_live_otco_case(&bin, transport, TestOtRole::Send).await;
@@ -1526,6 +1845,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_fpre_setup_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
         let bin = cpp_fpre_setup_probe();
         run_live_fpre_setup_case(&bin, Role::Alice).await;
         run_live_fpre_setup_case(&bin, Role::Bob).await;
@@ -1533,6 +1853,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_fpre_generate_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
         let bin = cpp_fpre_generate_probe();
         run_live_fpre_generate_case(&bin, Role::Alice).await;
         run_live_fpre_generate_case(&bin, Role::Bob).await;
@@ -1540,6 +1861,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_fpre_check_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
         let bin = cpp_fpre_check_probe();
         for check_index in [0, 1] {
             run_live_fpre_check_case(&bin, Role::Alice, check_index).await;
@@ -1548,7 +1870,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_fpre_refill_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_fpre_refill_probe();
+        run_live_fpre_refill_case(&bin, Role::Alice, false).await;
+        run_live_fpre_refill_case(&bin, Role::Bob, false).await;
+        run_live_fpre_refill_case(&bin, Role::Alice, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_iknp_and_leaky_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
         let bin = cpp_iknp_probe();
         for kind in [TestExtendedOt::Iknp, TestExtendedOt::Leaky] {
             for transport in [TestTransport::Listen, TestTransport::Connect] {
@@ -1987,6 +2319,125 @@ mod tests {
         );
     }
 
+    async fn run_live_fpre_refill_case(bin: &Path, rust_role: Role, tamper_eq: bool) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let cpp_transport = match rust_role {
+            Role::Alice => "connect",
+            Role::Bob => "listen",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role.party_id().to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre refill stream open failed ({rust_role:?}, tamper={tamper_eq}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre refill stream open timed out ({rust_role:?}, tamper={tamper_eq})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let refill_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_fpre_refill(&mut streams, rust_role, tamper_eq),
+        )
+        .await;
+        match (tamper_eq, refill_result) {
+            (false, Ok(Ok(()))) => {}
+            (false, Ok(Err(e))) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre refill failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            (false, Err(_)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre refill timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            (true, Ok(Err(CompatError::FeqMismatch))) => {}
+            (true, Ok(Ok(()))) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "tampered Rust Fpre refill unexpectedly succeeded ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            (true, Ok(Err(e))) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "tampered Rust Fpre refill failed with wrong error ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            (true, Err(_)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "tampered Rust Fpre refill timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(streams);
+        let output = child.wait_with_output().unwrap();
+        if tamper_eq {
+            assert!(
+                !output.status.success(),
+                "C++ Fpre refill probe unexpectedly accepted tamper ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            assert!(
+                output.status.success(),
+                "C++ Fpre refill probe failed ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -2149,6 +2600,50 @@ mod tests {
         Ok(())
     }
 
+    async fn run_rust_fpre_refill(
+        streams: &mut EmpStreams,
+        role: Role,
+        tamper_eq: bool,
+    ) -> Result<()> {
+        let mut fpre = Fpre::setup(streams, role, LIVE_FPRE_REQUESTED_SIZE).await?;
+        let generated = fpre.refill_inner(streams, tamper_eq).await?;
+        if tamper_eq {
+            return Ok(());
+        }
+
+        let params = fpre.params();
+        assert_eq!(generated.mac.len(), params.batch_size * 3);
+        assert_eq!(generated.key.len(), params.batch_size * 3);
+        let local_bits = fpre_mac_bits(&generated.mac);
+        let (remote_delta, remote_key, remote_bits) = match role {
+            Role::Alice => {
+                send_fpre_refill_verification(
+                    &mut streams.main,
+                    fpre.delta(),
+                    &generated.key,
+                    &local_bits,
+                )
+                .await?;
+                recv_fpre_refill_verification(&mut streams.main, params.batch_size * 3).await?
+            }
+            Role::Bob => {
+                let remote =
+                    recv_fpre_refill_verification(&mut streams.main, params.batch_size * 3).await?;
+                send_fpre_refill_verification(
+                    &mut streams.main,
+                    fpre.delta(),
+                    &generated.key,
+                    &local_bits,
+                )
+                .await?;
+                remote
+            }
+        };
+        assert_fpre_generate_relation(&generated.mac, remote_delta, &remote_key);
+        assert_fpre_triple_relation(&local_bits, &remote_bits);
+        Ok(())
+    }
+
     fn fpre_verification(fpre: &Fpre) -> FpreVerification {
         let params = fpre.params();
         FpreVerification {
@@ -2242,6 +2737,29 @@ mod tests {
         Ok((delta, key, digest))
     }
 
+    async fn send_fpre_refill_verification(
+        stream: &mut EmpStream,
+        delta: Block,
+        key: &[Block],
+        mac_bits: &[u8],
+    ) -> Result<()> {
+        stream.send_block(&[delta]).await?;
+        stream.send_block(key).await?;
+        stream.send_data(mac_bits).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_fpre_refill_verification(
+        stream: &mut EmpStream,
+        length: usize,
+    ) -> Result<(Block, Vec<Block>, Vec<u8>)> {
+        let delta = stream.recv_block(1).await?[0];
+        let key = stream.recv_block(length).await?;
+        let mac_bits = stream.recv_data(length).await?;
+        Ok((delta, key, mac_bits))
+    }
+
     fn assert_fpre_delta_bits(delta: Block, role: Role) {
         assert!(delta.get_lsb());
         assert_eq!((delta.as_bytes()[0] & 0b10) != 0, role == Role::Alice);
@@ -2266,6 +2784,21 @@ mod tests {
                 remote_key[i]
             };
             assert_eq!(mac[i], expected);
+        }
+    }
+
+    fn fpre_mac_bits(mac: &[Block]) -> Vec<u8> {
+        mac.iter().map(|block| u8::from(block.get_lsb())).collect()
+    }
+
+    fn assert_fpre_triple_relation(local_bits: &[u8], remote_bits: &[u8]) {
+        assert_eq!(local_bits.len(), remote_bits.len());
+        assert_eq!(local_bits.len() % 3, 0);
+        for i in 0..local_bits.len() / 3 {
+            let a = (local_bits[3 * i] != 0) != (remote_bits[3 * i] != 0);
+            let b = (local_bits[3 * i + 1] != 0) != (remote_bits[3 * i + 1] != 0);
+            let c = (local_bits[3 * i + 2] != 0) != (remote_bits[3 * i + 2] != 0);
+            assert_eq!(a & b, c, "Fpre triple relation mismatch at {i}");
         }
     }
 
@@ -2408,6 +2941,24 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/fpre_check_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_fpre_refill_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/fpre_refill_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/fpre_refill_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/fpre_refill_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/fpre_refill_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

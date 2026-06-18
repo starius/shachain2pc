@@ -1,11 +1,11 @@
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use aes::Aes128;
-use openssl::bn::{BigNum, BigNumContext};
+use openssl::bn::{BigNum, BigNumContext, BigNumRef};
 use openssl::ec::{EcGroup, EcPoint, EcPointRef, PointConversionForm};
 use openssl::error::ErrorStack;
 use openssl::nid::Nid;
 use sha2::{Digest, Sha256};
-use shachain2pc_emp_wire::Block;
+use shachain2pc_emp_wire::{Block, EmpStream, WireError};
 use std::fmt;
 
 pub const HASH_DIGEST_BYTES: usize = 32;
@@ -14,7 +14,13 @@ pub const POINT_BYTES: usize = 65;
 #[derive(Debug)]
 pub enum CompatError {
     OpenSsl(ErrorStack),
+    Wire(WireError),
     BadPointLength(usize),
+    BadPointWireLength(u32),
+    BadOtLength {
+        data0: usize,
+        data1: usize,
+    },
     LengthMismatch {
         receiver_scalars: usize,
         choices: usize,
@@ -27,7 +33,14 @@ impl fmt::Display for CompatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OpenSsl(e) => write!(f, "{e}"),
+            Self::Wire(e) => write!(f, "{e}"),
             Self::BadPointLength(len) => write!(f, "expected {POINT_BYTES} point bytes, got {len}"),
+            Self::BadPointWireLength(len) => {
+                write!(f, "expected EMP point wire length {POINT_BYTES}, got {len}")
+            }
+            Self::BadOtLength { data0, data1 } => {
+                write!(f, "OTCO data length mismatch: data0={data0}, data1={data1}")
+            }
             Self::LengthMismatch {
                 receiver_scalars,
                 choices,
@@ -46,6 +59,12 @@ impl std::error::Error for CompatError {}
 impl From<ErrorStack> for CompatError {
     fn from(value: ErrorStack) -> Self {
         Self::OpenSsl(value)
+    }
+}
+
+impl From<WireError> for CompatError {
+    fn from(value: WireError) -> Self {
+        Self::Wire(value)
     }
 }
 
@@ -189,9 +208,22 @@ impl P256 {
     pub fn mul_gen(&self, scalar: u64) -> Result<Vec<u8>> {
         let mut ctx = BigNumContext::new()?;
         let scalar = BigNum::from_dec_str(&scalar.to_string())?;
+        self.mul_gen_bn(&scalar, &mut ctx)
+    }
+
+    fn random_scalar(&self) -> Result<BigNum> {
+        let mut ctx = BigNumContext::new()?;
+        let mut order = BigNum::new()?;
+        self.group.order(&mut order, &mut ctx)?;
+        let mut out = BigNum::new()?;
+        order.rand_range(&mut out)?;
+        Ok(out)
+    }
+
+    fn mul_gen_bn(&self, scalar: &BigNumRef, ctx: &mut BigNumContext) -> Result<Vec<u8>> {
         let mut point = EcPoint::new(&self.group)?;
-        point.mul_generator2(&self.group, &scalar, &mut ctx)?;
-        point_bytes(&self.group, &point, &mut ctx)
+        point.mul_generator2(&self.group, scalar, ctx)?;
+        point_bytes(&self.group, &point, ctx)
     }
 
     pub fn point_add(&self, lhs: &[u8], rhs: &[u8]) -> Result<Vec<u8>> {
@@ -207,9 +239,24 @@ impl P256 {
         let mut ctx = BigNumContext::new()?;
         let point = point_from_bytes(&self.group, point, &mut ctx)?;
         let scalar = BigNum::from_dec_str(&scalar.to_string())?;
+        self.point_mul_bn_ref(&point, &scalar, &mut ctx)
+    }
+
+    fn point_mul_bn(&self, point: &[u8], scalar: &BigNumRef) -> Result<Vec<u8>> {
+        let mut ctx = BigNumContext::new()?;
+        let point = point_from_bytes(&self.group, point, &mut ctx)?;
+        self.point_mul_bn_ref(&point, scalar, &mut ctx)
+    }
+
+    fn point_mul_bn_ref(
+        &self,
+        point: &EcPointRef,
+        scalar: &BigNumRef,
+        ctx: &mut BigNumContext,
+    ) -> Result<Vec<u8>> {
         let mut out = EcPoint::new(&self.group)?;
-        out.mul2(&self.group, &point, &scalar, &mut ctx)?;
-        point_bytes(&self.group, &out, &mut ctx)
+        out.mul2(&self.group, point, scalar, ctx)?;
+        point_bytes(&self.group, &out, ctx)
     }
 
     pub fn point_inv(&self, point: &[u8]) -> Result<Vec<u8>> {
@@ -241,6 +288,96 @@ impl P256 {
         block.copy_from_slice(&digest[..16]);
         Ok(Block::from_bytes(block))
     }
+}
+
+pub async fn otco_send(stream: &mut EmpStream, data0: &[Block], data1: &[Block]) -> Result<()> {
+    if data0.len() != data1.len() {
+        return Err(CompatError::BadOtLength {
+            data0: data0.len(),
+            data1: data1.len(),
+        });
+    }
+
+    let group = P256::new()?;
+    let a = group.random_scalar()?;
+    let a_point = {
+        let mut ctx = BigNumContext::new()?;
+        group.mul_gen_bn(&a, &mut ctx)?
+    };
+    send_point(stream, &a_point).await?;
+    stream.flush().await?;
+
+    let aa = group.point_mul_bn(&a_point, &a)?;
+    let aa_inv = group.point_inv(&aa)?;
+    let mut masks = Vec::with_capacity(data0.len());
+    for i in 0..data0.len() {
+        let b_point = recv_point(stream).await?;
+        let mask0_point = group.point_mul_bn(&b_point, &a)?;
+        let mask1_point = group.point_add(&mask0_point, &aa_inv)?;
+        masks.push((
+            group.kdf(&mask0_point, i as u64)?,
+            group.kdf(&mask1_point, i as u64)?,
+        ));
+    }
+    stream.flush().await?;
+
+    for i in 0..data0.len() {
+        let pair = [masks[i].0.xor(data0[i]), masks[i].1.xor(data1[i])];
+        stream.send_block(&pair).await?;
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+pub async fn otco_recv(stream: &mut EmpStream, choices: &[bool]) -> Result<Vec<Block>> {
+    let group = P256::new()?;
+    let a_point = recv_point(stream).await?;
+    let mut receiver_mask_points = Vec::with_capacity(choices.len());
+    for choice in choices {
+        let scalar = group.random_scalar()?;
+        let mut b_point = {
+            let mut ctx = BigNumContext::new()?;
+            group.mul_gen_bn(&scalar, &mut ctx)?
+        };
+        if *choice {
+            b_point = group.point_add(&b_point, &a_point)?;
+        }
+        send_point(stream, &b_point).await?;
+        receiver_mask_points.push(group.point_mul_bn(&a_point, &scalar)?);
+    }
+    stream.flush().await?;
+
+    let mut out = Vec::with_capacity(choices.len());
+    for i in 0..choices.len() {
+        let ciphertexts = stream.recv_block(2).await?;
+        let mask = group.kdf(&receiver_mask_points[i], i as u64)?;
+        out.push(mask.xor(if choices[i] {
+            ciphertexts[1]
+        } else {
+            ciphertexts[0]
+        }));
+    }
+    Ok(out)
+}
+
+async fn send_point(stream: &mut EmpStream, point: &[u8]) -> Result<()> {
+    if point.len() != POINT_BYTES {
+        return Err(CompatError::BadPointLength(point.len()));
+    }
+    stream
+        .send_data(&(point.len() as u32).to_le_bytes())
+        .await?;
+    stream.send_data(point).await?;
+    Ok(())
+}
+
+async fn recv_point(stream: &mut EmpStream) -> Result<Vec<u8>> {
+    let len_bytes = stream.recv_data(4).await?;
+    let len = u32::from_le_bytes(len_bytes.try_into().expect("length prefix"));
+    if len != POINT_BYTES as u32 {
+        return Err(CompatError::BadPointWireLength(len));
+    }
+    Ok(stream.recv_data(POINT_BYTES).await?)
 }
 
 pub struct OtcoItem {
@@ -331,7 +468,24 @@ fn point_bytes(group: &EcGroup, point: &EcPointRef, ctx: &mut BigNumContext) -> 
 mod tests {
     use super::*;
     use serde_json::Value;
-    use std::path::PathBuf;
+    use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use tokio::time::{timeout, Duration};
+
+    const LIVE_INTEROP_TIMEOUT: Duration = Duration::from_secs(60);
+
+    #[derive(Clone, Copy, Debug)]
+    enum TestTransport {
+        Listen,
+        Connect,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TestOtRole {
+        Send,
+        Recv,
+    }
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
@@ -384,6 +538,35 @@ mod tests {
 
     fn block_json(block: Block) -> String {
         hex_encode(block.as_bytes())
+    }
+
+    fn otco_data() -> ([Block; 8], [Block; 8]) {
+        let data0 = std::array::from_fn(|i| {
+            Block::make(
+                0x1000_0000_0000_0000 | i as u64,
+                0x0000_0000_0000_0100 | i as u64,
+            )
+        });
+        let data1 = std::array::from_fn(|i| {
+            Block::make(
+                0x2000_0000_0000_0000 | i as u64,
+                0x0000_0000_0000_0200 | i as u64,
+            )
+        });
+        (data0, data1)
+    }
+
+    fn otco_choices() -> [bool; 8] {
+        [false, true, true, false, true, false, false, true]
+    }
+
+    fn otco_expected() -> Vec<Block> {
+        let (data0, data1) = otco_data();
+        otco_choices()
+            .into_iter()
+            .enumerate()
+            .map(|(i, choice)| if choice { data1[i] } else { data0[i] })
+            .collect()
     }
 
     #[test]
@@ -600,5 +783,157 @@ mod tests {
                 expected["recovered"].as_str().unwrap()
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_otco_interop() {
+        let bin = cpp_otco_probe();
+        for transport in [TestTransport::Listen, TestTransport::Connect] {
+            run_live_otco_case(&bin, transport, TestOtRole::Send).await;
+            run_live_otco_case(&bin, transport, TestOtRole::Recv).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_otco_accepts_zero_length_batch() {
+        let port = free_port();
+        let receiver = tokio::spawn(async move {
+            let mut stream = EmpStream::listen(port).await.unwrap();
+            otco_recv(&mut stream, &[]).await.unwrap()
+        });
+
+        let mut sender = EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            .await
+            .unwrap();
+        otco_send(&mut sender, &[], &[]).await.unwrap();
+
+        let out = receiver.await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    async fn run_live_otco_case(bin: &Path, rust_transport: TestTransport, rust_role: TestOtRole) {
+        let port = free_port();
+        let cpp_transport = match rust_transport {
+            TestTransport::Listen => "connect",
+            TestTransport::Connect => "listen",
+        };
+        let cpp_role = match rust_role {
+            TestOtRole::Send => "recv",
+            TestOtRole::Recv => "send",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role)
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(LIVE_INTEROP_TIMEOUT, open_stream(rust_transport, port)).await;
+        let mut stream = match stream_result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust OTCO stream open failed ({rust_transport:?}, {rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust OTCO stream open timed out ({rust_transport:?}, {rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let ot_result = timeout(LIVE_INTEROP_TIMEOUT, run_rust_otco(&mut stream, rust_role)).await;
+        match ot_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust OTCO failed ({rust_transport:?}, {rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust OTCO timed out ({rust_transport:?}, {rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(stream);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ OTCO probe failed ({rust_transport:?}, {rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
+        match transport {
+            TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
+            TestTransport::Connect => EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn run_rust_otco(stream: &mut EmpStream, role: TestOtRole) -> Result<()> {
+        match role {
+            TestOtRole::Send => {
+                let (data0, data1) = otco_data();
+                otco_send(stream, &data0, &data1).await
+            }
+            TestOtRole::Recv => {
+                let out = otco_recv(stream, &otco_choices()).await?;
+                assert_eq!(out, otco_expected());
+                Ok(())
+            }
+        }
+    }
+
+    fn cpp_otco_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/otco_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/otco_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/otco_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/otco_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn free_port() -> u16 {
+        StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 }

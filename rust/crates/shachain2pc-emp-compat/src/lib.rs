@@ -10,6 +10,7 @@ use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
 use shachain2pc_types::Role;
 use std::fmt;
+use std::sync::OnceLock;
 use zeroize::Zeroize;
 
 pub const HASH_DIGEST_BYTES: usize = 32;
@@ -174,6 +175,11 @@ impl Prp {
     }
 }
 
+fn zero_key_prp() -> &'static Prp {
+    static ZERO_KEY_PRP: OnceLock<Prp> = OnceLock::new();
+    ZERO_KEY_PRP.get_or_init(Prp::zero_key)
+}
+
 pub struct Prg {
     prp: Prp,
     counter: u64,
@@ -258,7 +264,7 @@ pub fn garble_hash_preprocess(
         rows[0][0], rows[0][1], rows[1][0], rows[1][1], rows[2][0], rows[2][1], rows[3][0],
         rows[3][1],
     ];
-    Prp::zero_key().permute_block(&mut flat);
+    zero_key_prp().permute_block(&mut flat);
     [
         [flat[0], flat[1]],
         [flat[2], flat[3]],
@@ -273,7 +279,7 @@ pub fn garble_hash_online(a: Block, b: Block, gate_index: u64, row: u64) -> [Blo
         base.xor(Block::make(4 * gate_index + row, 0)),
         base.xor(Block::make(4 * gate_index + row, 1)),
     ];
-    Prp::zero_key().permute_block(&mut blocks);
+    zero_key_prp().permute_block(&mut blocks);
     blocks
 }
 
@@ -1267,32 +1273,54 @@ impl C2pc {
             }
         }
 
-        and_index = 0;
-        for (gate_index, gate) in self.circuit.gates.iter().enumerate() {
-            if gate.typ == C2pcGateType::And {
-                let (m, k) = self.and_row_masks(gate, and_index);
-                match self.party {
-                    Role::Alice => {
+        let table_len = num_ands
+            .checked_mul(4)
+            .and_then(|n| n.checked_mul(C2PC_SSP_BYTES + BLOCK_BYTES))
+            .ok_or(CompatError::LengthOverflow("C2PC garbled table wire"))?;
+        match self.party {
+            Role::Alice => {
+                let mut wire = Vec::with_capacity(table_len);
+                and_index = 0;
+                for (gate_index, gate) in self.circuit.gates.iter().enumerate() {
+                    if gate.typ == C2pcGateType::And {
+                        let (m, k) = self.and_row_masks(gate, and_index);
                         let rows = self.alice_garbled_rows(gate, gate_index, and_index, &m, &k);
                         for row in rows {
-                            streams
-                                .main
-                                .send_partial_blocks(&[row[0]], C2PC_SSP_BYTES)
-                                .await?;
-                            streams.main.send_block(&[row[1]]).await?;
+                            wire.extend_from_slice(&row[0].as_bytes()[..C2PC_SSP_BYTES]);
+                            wire.extend_from_slice(row[1].as_bytes());
                         }
+                        and_index += 1;
                     }
-                    Role::Bob => {
+                }
+                streams.main.send_data(&wire).await?;
+                wire.zeroize();
+            }
+            Role::Bob => {
+                let mut wire = streams.main.recv_data(table_len).await?;
+                let mut pos = 0;
+                and_index = 0;
+                for gate in &self.circuit.gates {
+                    if gate.typ == C2pcGateType::And {
+                        let (m, k) = self.and_row_masks(gate, and_index);
                         self.gtm[and_index] = m;
                         self.gtk[and_index] = k;
                         for row in 0..4 {
-                            self.gt[and_index][row][0] =
-                                streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
-                            self.gt[and_index][row][1] = streams.main.recv_block(1).await?[0];
+                            let mut row0 = [0u8; BLOCK_BYTES];
+                            row0[..C2PC_SSP_BYTES]
+                                .copy_from_slice(&wire[pos..pos + C2PC_SSP_BYTES]);
+                            pos += C2PC_SSP_BYTES;
+                            let row1 = wire[pos..pos + BLOCK_BYTES]
+                                .try_into()
+                                .expect("garbled row block length");
+                            pos += BLOCK_BYTES;
+                            self.gt[and_index][row][0] = Block::from_bytes(row0);
+                            self.gt[and_index][row][1] = Block::from_bytes(row1);
                         }
+                        and_index += 1;
                     }
                 }
-                and_index += 1;
+                debug_assert_eq!(pos, wire.len());
+                wire.zeroize();
             }
         }
 
@@ -1806,13 +1834,13 @@ async fn fpre_check_on_stream(
 
 fn h2d(a: Block, b: Block, _index: usize) -> Block {
     let mut d = [a, a.xor(b)];
-    Prp::zero_key().permute_block(&mut d);
+    zero_key_prp().permute_block(&mut d);
     d[0].xor(d[1]).xor(b)
 }
 
 fn h2(a: Block, b: Block, _index: usize) -> Block {
     let mut d = [a, b];
-    Prp::zero_key().permute_block(&mut d);
+    zero_key_prp().permute_block(&mut d);
     d[0].xor(d[1]).xor(a).xor(b)
 }
 
@@ -2009,11 +2037,12 @@ async fn send_pre_block(
     let local_block_size = round_up_128(len);
     let row_bytes = local_block_size / 8;
     let mut rows = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
+    let received_rows = stream.recv_data(IKNP_SECURITY_BITS * row_bytes).await?;
     for i in 0..IKNP_SECURITY_BITS {
         let mut row = state.g0[i].random_data(row_bytes);
-        let received = stream.recv_data(row_bytes).await?;
+        let received = &received_rows[i * row_bytes..(i + 1) * row_bytes];
         if state.s[i] {
-            xor_bytes_in_place(&mut row, &received);
+            xor_bytes_in_place(&mut row, received);
         }
         rows.extend_from_slice(&row);
     }
@@ -2070,6 +2099,7 @@ async fn recv_pre_block(
     let blocks_per_row = local_block_size / IKNP_SECURITY_BITS;
     let row_bytes = local_block_size / 8;
     let mut rows = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
+    let mut messages = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
     for i in 0..IKNP_SECURITY_BITS {
         let row0 = state.g0[i].random_data(row_bytes);
         let row1 = state.g1[i].random_data(row_bytes);
@@ -2081,9 +2111,11 @@ async fn recv_pre_block(
                 message[start + k] = row0[start + k] ^ row1[start + k] ^ r_bytes[k];
             }
         }
-        stream.send_data(&message).await?;
+        messages.extend_from_slice(&message);
         rows.extend_from_slice(&row0);
     }
+    stream.send_data(&messages).await?;
+    messages.zeroize();
     Ok(transpose_128_rows(&rows, row_bytes, local_block_size))
 }
 
@@ -2144,19 +2176,38 @@ fn xor_bytes_in_place(dst: &mut [u8], rhs: &[u8]) {
 }
 
 fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
-    let mut out = vec![Block::zero(); output_len];
-    for (col, out_block) in out.iter_mut().enumerate() {
-        let mut bytes = [0u8; BLOCK_BYTES];
-        let source_byte = col / 8;
-        let source_mask = 1 << (col % 8);
-        for row in 0..IKNP_SECURITY_BITS {
-            if (rows[row * row_bytes + source_byte] & source_mask) != 0 {
-                bytes[row / 8] |= 1 << (row % 8);
+    debug_assert_eq!(output_len, row_bytes * 8);
+    let mut out = vec![[0u8; BLOCK_BYTES]; output_len];
+    for source_byte in 0..row_bytes {
+        for (group, _) in [0u8; BLOCK_BYTES].iter().enumerate() {
+            let row = group * 8;
+            let x = u64::from_le_bytes([
+                rows[(row) * row_bytes + source_byte],
+                rows[(row + 1) * row_bytes + source_byte],
+                rows[(row + 2) * row_bytes + source_byte],
+                rows[(row + 3) * row_bytes + source_byte],
+                rows[(row + 4) * row_bytes + source_byte],
+                rows[(row + 5) * row_bytes + source_byte],
+                rows[(row + 6) * row_bytes + source_byte],
+                rows[(row + 7) * row_bytes + source_byte],
+            ]);
+            let transposed = transpose_8x8(x).to_le_bytes();
+            for bit in 0..8 {
+                out[source_byte * 8 + bit][group] = transposed[bit];
             }
         }
-        *out_block = Block::from_bytes(bytes);
     }
-    out
+    out.into_iter().map(Block::from_bytes).collect()
+}
+
+fn transpose_8x8(mut x: u64) -> u64 {
+    let mut t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+    x ^= t ^ (t << 7);
+    t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+    x ^= t ^ (t << 14);
+    t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+    x ^= t ^ (t << 28);
+    x
 }
 
 fn leaky_delta_mask() -> Block {
@@ -2271,6 +2322,41 @@ mod tests {
     const LIVE_FPRE_GENERATE_LENGTH: usize = 683;
     const LIVE_FPRE_CHECK_LENGTH: usize = 683;
     static LIVE_CPP_INTEROP_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[test]
+    fn iknp_transpose_matches_bit_reference() {
+        for row_bytes in [1usize, 16, 32, 256] {
+            let output_len = row_bytes * 8;
+            let mut rows = vec![0u8; IKNP_SECURITY_BITS * row_bytes];
+            for (i, byte) in rows.iter_mut().enumerate() {
+                *byte = ((i * 37 + i / 7 + 0x5a) & 0xff) as u8;
+            }
+            assert_eq!(
+                transpose_128_rows(&rows, row_bytes, output_len),
+                transpose_128_rows_bit_reference(&rows, row_bytes, output_len)
+            );
+        }
+    }
+
+    fn transpose_128_rows_bit_reference(
+        rows: &[u8],
+        row_bytes: usize,
+        output_len: usize,
+    ) -> Vec<Block> {
+        let mut out = vec![Block::zero(); output_len];
+        for (col, out_block) in out.iter_mut().enumerate() {
+            let mut bytes = [0u8; BLOCK_BYTES];
+            let source_byte = col / 8;
+            let source_mask = 1 << (col % 8);
+            for row in 0..IKNP_SECURITY_BITS {
+                if (rows[row * row_bytes + source_byte] & source_mask) != 0 {
+                    bytes[row / 8] |= 1 << (row % 8);
+                }
+            }
+            *out_block = Block::from_bytes(bytes);
+        }
+        out
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum TestTransport {

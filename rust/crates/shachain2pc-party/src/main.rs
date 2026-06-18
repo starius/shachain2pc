@@ -9,6 +9,7 @@ use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 use zeroize::Zeroize;
@@ -103,6 +104,7 @@ async fn main() {
 async fn run_derivation(args: Args) -> Result<Value32, PartyError> {
     ensure_index_allowed(args.index, args.allow_seed_reveal)?;
 
+    let mut timing = PhaseTiming::new(args.role, args.index);
     let sha = load_bristol(default_sha256_compress_path())?;
     let circuit = build_circuit_for_index(args.index, &sha)?;
     let gate_arr = to_emp_gate_array(&circuit);
@@ -110,14 +112,19 @@ async fn run_derivation(args: Args) -> Result<Value32, PartyError> {
     let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
     drop(gate_arr);
     drop(circuit);
+    timing.mark("build_circuit");
 
     let mut streams = open_streams_after_digest(args.role, args.port, args.peer_ip, digest).await?;
+    timing.mark("open_streams");
     let mut c2pc = C2pc::new(&mut streams, args.role, c2pc_circuit).await?;
     streams.main.flush().await?;
+    timing.mark("c2pc_setup");
     c2pc.function_independent(&mut streams).await?;
     streams.main.flush().await?;
+    timing.mark("function_independent");
     c2pc.function_dependent(&mut streams).await?;
     streams.main.flush().await?;
+    timing.mark("function_dependent");
 
     let mut input = vec![0u8; 2 * VALUE_BITS];
     let mut share_bits = args.share.to_bits_msb();
@@ -129,7 +136,50 @@ async fn run_derivation(args: Args) -> Result<Value32, PartyError> {
     let output = c2pc.online(&mut streams, &input, true).await?;
     input.zeroize();
     streams.main.flush().await?;
+    timing.mark("online");
     Value32::from_bits_msb(&output).map_err(|e| PartyError::Parse(e.to_string()))
+}
+
+struct PhaseTiming {
+    enabled: bool,
+    role: Role,
+    index: Index48,
+    start: Instant,
+    last: Instant,
+}
+
+impl PhaseTiming {
+    fn new(role: Role, index: Index48) -> Self {
+        let enabled = env::var("SHACHAIN2PC_PHASE_TIMING")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        let now = Instant::now();
+        Self {
+            enabled,
+            role,
+            index,
+            start: now,
+            last: now,
+        }
+    }
+
+    fn mark(&mut self, phase: &str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let phase_ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
+        let total_ms = now.duration_since(self.start).as_secs_f64() * 1000.0;
+        eprintln!(
+            "TIMING role={} index={} phase={} phase_ms={:.3} total_ms={:.3}",
+            self.role.party_id(),
+            self.index.to_hex12(),
+            phase,
+            phase_ms,
+            total_ms
+        );
+        self.last = now;
+    }
 }
 
 fn ensure_index_allowed(index: Index48, allow_seed_reveal: bool) -> Result<(), PartyError> {

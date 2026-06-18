@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use shachain2pc_emp_wire::{Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
 use shachain2pc_types::Role;
 use std::fmt;
+use zeroize::Zeroize;
 
 pub const HASH_DIGEST_BYTES: usize = 32;
 pub const POINT_BYTES: usize = 65;
@@ -26,6 +27,7 @@ pub enum CompatError {
         data0: usize,
         data1: usize,
     },
+    LengthOverflow(&'static str),
     MissingDelta(&'static str),
     BadIknpSetupLength {
         name: &'static str,
@@ -52,6 +54,7 @@ impl fmt::Display for CompatError {
             Self::BadOtLength { data0, data1 } => {
                 write!(f, "OTCO data length mismatch: data0={data0}, data1={data1}")
             }
+            Self::LengthOverflow(name) => write!(f, "{name} length overflow"),
             Self::MissingDelta(name) => write!(f, "{name} setup did not produce Delta"),
             Self::BadIknpSetupLength { name, len } => {
                 write!(
@@ -607,6 +610,18 @@ pub struct Fpre {
     params: FpreParams,
 }
 
+pub struct FpreGenerated {
+    pub mac: Vec<Block>,
+    pub key: Vec<Block>,
+}
+
+impl Drop for FpreGenerated {
+    fn drop(&mut self) {
+        self.mac.zeroize();
+        self.key.zeroize();
+    }
+}
+
 impl Fpre {
     pub async fn setup(streams: &mut EmpStreams, party: Role, size: usize) -> Result<Self> {
         let mut abit1 = LeakyDeltaOt::new();
@@ -670,6 +685,33 @@ impl Fpre {
     pub fn leaky_instances_ready(&self) -> bool {
         (self.abit1.iknp.send.is_some() || self.abit1.iknp.recv.is_some())
             && (self.abit2.iknp.send.is_some() || self.abit2.iknp.recv.is_some())
+    }
+
+    pub async fn generate(
+        &mut self,
+        streams: &mut EmpStreams,
+        length: usize,
+    ) -> Result<FpreGenerated> {
+        let dot_length = length
+            .checked_mul(3)
+            .ok_or(CompatError::LengthOverflow("Fpre generate"))?;
+        let (key, mac) = match self.party {
+            Role::Alice => {
+                let (key, mac) = tokio::try_join!(
+                    self.abit1.send_dot(&mut streams.fpre_io0, dot_length),
+                    self.abit2.recv_dot(&mut streams.fpre_io2_0, dot_length)
+                )?;
+                (key, mac)
+            }
+            Role::Bob => {
+                let (key, mac) = tokio::try_join!(
+                    self.abit2.send_dot(&mut streams.fpre_io2_0, dot_length),
+                    self.abit1.recv_dot(&mut streams.fpre_io0, dot_length)
+                )?;
+                (key, mac)
+            }
+        };
+        Ok(FpreGenerated { mac, key })
     }
 }
 
@@ -947,6 +989,7 @@ mod tests {
     const LIVE_IKNP_LENGTH: usize = 2051;
     const LIVE_LEAKY_LENGTH: usize = 257;
     const LIVE_FPRE_REQUESTED_SIZE: usize = 321;
+    const LIVE_FPRE_GENERATE_LENGTH: usize = 683;
 
     #[derive(Clone, Copy, Debug)]
     enum TestTransport {
@@ -1330,6 +1373,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_fpre_generate_interop() {
+        let bin = cpp_fpre_generate_probe();
+        run_live_fpre_generate_case(&bin, Role::Alice).await;
+        run_live_fpre_generate_case(&bin, Role::Bob).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_iknp_and_leaky_interop() {
         let bin = cpp_iknp_probe();
         for kind in [TestExtendedOt::Iknp, TestExtendedOt::Leaky] {
@@ -1604,6 +1654,88 @@ mod tests {
         );
     }
 
+    async fn run_live_fpre_generate_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let cpp_transport = match rust_role {
+            Role::Alice => "connect",
+            Role::Bob => "listen",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role.party_id().to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre generate stream open failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre generate stream open timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let generate_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_fpre_generate(&mut streams, rust_role),
+        )
+        .await;
+        match generate_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre generate failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre generate timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(streams);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ Fpre generate probe failed ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -1697,6 +1829,34 @@ mod tests {
         Ok(())
     }
 
+    async fn run_rust_fpre_generate(streams: &mut EmpStreams, role: Role) -> Result<()> {
+        let mut fpre = Fpre::setup(streams, role, LIVE_FPRE_REQUESTED_SIZE).await?;
+        let generated = fpre.generate(streams, LIVE_FPRE_GENERATE_LENGTH).await?;
+        assert_eq!(generated.mac.len(), LIVE_FPRE_GENERATE_LENGTH * 3);
+        assert_eq!(generated.key.len(), LIVE_FPRE_GENERATE_LENGTH * 3);
+
+        let (remote_delta, remote_key) = match role {
+            Role::Alice => {
+                send_fpre_generate_verification(&mut streams.main, fpre.delta(), &generated.key)
+                    .await?;
+                recv_fpre_generate_verification(&mut streams.main, LIVE_FPRE_GENERATE_LENGTH * 3)
+                    .await?
+            }
+            Role::Bob => {
+                let remote = recv_fpre_generate_verification(
+                    &mut streams.main,
+                    LIVE_FPRE_GENERATE_LENGTH * 3,
+                )
+                .await?;
+                send_fpre_generate_verification(&mut streams.main, fpre.delta(), &generated.key)
+                    .await?;
+                remote
+            }
+        };
+        assert_fpre_generate_relation(&generated.mac, remote_delta, &remote_key);
+        Ok(())
+    }
+
     fn fpre_verification(fpre: &Fpre) -> FpreVerification {
         let params = fpre.params();
         FpreVerification {
@@ -1743,6 +1903,26 @@ mod tests {
         Ok(u32::from_le_bytes(bytes.try_into().expect("length")))
     }
 
+    async fn send_fpre_generate_verification(
+        stream: &mut EmpStream,
+        delta: Block,
+        key: &[Block],
+    ) -> Result<()> {
+        stream.send_block(&[delta]).await?;
+        stream.send_block(key).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_fpre_generate_verification(
+        stream: &mut EmpStream,
+        length: usize,
+    ) -> Result<(Block, Vec<Block>)> {
+        let delta = stream.recv_block(1).await?[0];
+        let key = stream.recv_block(length).await?;
+        Ok((delta, key))
+    }
+
     fn assert_fpre_delta_bits(delta: Block, role: Role) {
         assert!(delta.get_lsb());
         assert_eq!((delta.as_bytes()[0] & 0b10) != 0, role == Role::Alice);
@@ -1756,6 +1936,18 @@ mod tests {
             verification.permute_batch_size,
             params.permute_batch_size.unwrap_or(0) as u32
         );
+    }
+
+    fn assert_fpre_generate_relation(mac: &[Block], remote_delta: Block, remote_key: &[Block]) {
+        assert_eq!(mac.len(), remote_key.len());
+        for i in 0..mac.len() {
+            let expected = if mac[i].get_lsb() {
+                remote_key[i].xor(remote_delta)
+            } else {
+                remote_key[i]
+            };
+            assert_eq!(mac[i], expected);
+        }
     }
 
     async fn send_sender_verification(
@@ -1858,6 +2050,27 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/fpre_setup_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_fpre_generate_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/fpre_generate_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/fpre_generate_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "failed to build .build/fpre_generate_probe"
+            );
+        }
+        assert!(
+            bin.exists(),
+            ".build/fpre_generate_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
+use zeroize::Zeroize;
 
 pub const BLOCK_BYTES: usize = 16;
 pub const EMP_PARTIAL_BLOCK_BYTES: usize = 5;
@@ -80,6 +81,12 @@ impl Block {
 impl fmt::Debug for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Block").field(&self.to_hex()).finish()
+    }
+}
+
+impl Zeroize for Block {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
     }
 }
 

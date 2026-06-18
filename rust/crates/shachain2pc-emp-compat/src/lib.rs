@@ -2252,9 +2252,14 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use shachain2pc_circuit::Gate;
+    use shachain2pc_emp_wire::EMP_STREAM_COUNT;
     use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::net::TcpListener as TokioTcpListener;
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
 
@@ -2283,6 +2288,46 @@ mod tests {
     enum TestExtendedOt {
         Iknp,
         Leaky,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum C2pcTamperCase {
+        GarbledTable,
+        OutputMac,
+        OutputLabel,
+    }
+
+    impl C2pcTamperCase {
+        fn rust_role(self) -> Role {
+            match self {
+                Self::GarbledTable | Self::OutputMac => Role::Bob,
+                Self::OutputLabel => Role::Alice,
+            }
+        }
+
+        fn cpp_role(self) -> Role {
+            opposite_role(self.rust_role())
+        }
+
+        fn sync_args(self) -> &'static [&'static str] {
+            match self {
+                Self::GarbledTable => &["sync-before-dependent"],
+                Self::OutputMac | Self::OutputLabel => &["sync-before-online"],
+            }
+        }
+
+        fn tamper_offsets(self, circuit: &C2pcCircuit) -> Vec<usize> {
+            match self {
+                Self::GarbledTable => {
+                    let selector_bytes = 2 * circuit.num_ands();
+                    (0..4)
+                        .map(|row| selector_bytes + row * (C2PC_SSP_BYTES + BLOCK_BYTES))
+                        .collect()
+                }
+                Self::OutputMac => vec![circuit.n2 + circuit.input_len() * BLOCK_BYTES],
+                Self::OutputLabel => vec![circuit.n1 + C2PC_SSP_BYTES],
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2737,6 +2782,19 @@ mod tests {
         let bin = cpp_c2pc_online_probe();
         run_live_c2pc_online_case(&bin, Role::Alice).await;
         run_live_c2pc_online_case(&bin, Role::Bob).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_c2pc_online_tamper_rejects() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_c2pc_online_probe();
+        for case in [
+            C2pcTamperCase::GarbledTable,
+            C2pcTamperCase::OutputMac,
+            C2pcTamperCase::OutputLabel,
+        ] {
+            run_live_c2pc_online_tamper_case(&bin, case).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3545,6 +3603,209 @@ mod tests {
         );
     }
 
+    async fn run_live_c2pc_online_tamper_case(bin: &Path, case: C2pcTamperCase) {
+        let rust_listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let rust_port = rust_listener.local_addr().unwrap().port();
+        let cpp_listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let cpp_port = cpp_listener.local_addr().unwrap().port();
+        let arm_tamper = Arc::new(AtomicBool::new(false));
+        let tampered = Arc::new(AtomicBool::new(false));
+        let test_circuit = C2pcCircuit::from_circuit(&c2pc_test_circuit()).unwrap();
+        let tamper_offsets = case.tamper_offsets(&test_circuit);
+
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg("connect")
+            .arg(cpp_port.to_string())
+            .arg(case.cpp_role().party_id().to_string())
+            .arg("127.0.0.1")
+            .args(case.sync_args())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let proxy = tokio::spawn(run_three_stream_tamper_proxy(
+            rust_listener,
+            cpp_listener,
+            arm_tamper.clone(),
+            tampered.clone(),
+            tamper_offsets,
+        ));
+
+        let stream_result = timeout(
+            LIVE_C2PC_TIMEOUT,
+            EmpStreams::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), rust_port),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                proxy.abort();
+                panic!(
+                    "Rust C2PC tamper stream open failed ({case:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                proxy.abort();
+                panic!(
+                    "Rust C2PC tamper stream open timed out ({case:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let tamper_result = timeout(
+            LIVE_C2PC_TIMEOUT,
+            run_rust_c2pc_online_tamper(&mut streams, case, arm_tamper),
+        )
+        .await;
+        match tamper_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                proxy.abort();
+                panic!(
+                    "Rust C2PC online tamper failed with wrong error ({case:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                proxy.abort();
+                panic!(
+                    "Rust C2PC online tamper timed out ({case:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        assert!(
+            tampered.load(Ordering::SeqCst),
+            "tamper proxy did not flip a C++->Rust byte ({case:?})"
+        );
+
+        drop(streams);
+        let _ = child.kill();
+        let _ = child.wait_with_output();
+        proxy.abort();
+    }
+
+    async fn run_three_stream_tamper_proxy(
+        rust_listener: TokioTcpListener,
+        cpp_listener: TokioTcpListener,
+        arm_tamper: Arc<AtomicBool>,
+        tampered: Arc<AtomicBool>,
+        tamper_offsets: Vec<usize>,
+    ) -> std::io::Result<()> {
+        let mut relay_handles = Vec::new();
+        let tamper_offsets = Arc::new(tamper_offsets);
+        for stream_index in 0..EMP_STREAM_COUNT {
+            let (rust_stream, _) = rust_listener.accept().await?;
+            rust_stream.set_nodelay(true)?;
+            let (cpp_stream, _) = cpp_listener.accept().await?;
+            cpp_stream.set_nodelay(true)?;
+            let (rust_read, rust_write) = rust_stream.into_split();
+            let (cpp_read, cpp_write) = cpp_stream.into_split();
+            relay_handles.push(tokio::spawn(relay_tcp(rust_read, cpp_write, None)));
+
+            let tamper = (stream_index == 0).then(|| TamperPlan {
+                arm: arm_tamper.clone(),
+                tampered: tampered.clone(),
+                offsets: tamper_offsets.clone(),
+                bytes_seen: Arc::new(AtomicUsize::new(0)),
+                next_offset: Arc::new(AtomicUsize::new(0)),
+            });
+            relay_handles.push(tokio::spawn(relay_tcp(cpp_read, rust_write, tamper)));
+        }
+
+        for handle in relay_handles {
+            let _ = handle.await;
+        }
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct TamperPlan {
+        arm: Arc<AtomicBool>,
+        tampered: Arc<AtomicBool>,
+        offsets: Arc<Vec<usize>>,
+        bytes_seen: Arc<AtomicUsize>,
+        next_offset: Arc<AtomicUsize>,
+    }
+
+    async fn relay_tcp<R, W>(
+        mut reader: R,
+        mut writer: W,
+        tamper: Option<TamperPlan>,
+    ) -> std::io::Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            if let Some(plan) = &tamper {
+                maybe_tamper_chunk(&mut buf[..n], plan);
+            }
+            writer.write_all(&buf[..n]).await?;
+        }
+        let _ = writer.shutdown().await;
+        Ok(())
+    }
+
+    fn maybe_tamper_chunk(buf: &mut [u8], plan: &TamperPlan) {
+        if !plan.arm.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let start = plan.bytes_seen.fetch_add(buf.len(), Ordering::SeqCst);
+        let end = start + buf.len();
+        loop {
+            let idx = plan.next_offset.load(Ordering::SeqCst);
+            let Some(offset) = plan.offsets.get(idx).copied() else {
+                return;
+            };
+            if offset >= end {
+                return;
+            }
+            if offset >= start
+                && plan
+                    .next_offset
+                    .compare_exchange(idx, idx + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                buf[offset - start] ^= 0x01;
+                plan.tampered.store(true, Ordering::SeqCst);
+            } else if offset < start {
+                let _ = plan.next_offset.compare_exchange(
+                    idx,
+                    idx + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+        }
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -3890,6 +4151,53 @@ mod tests {
             }
         }
         streams.main.flush().await?;
+        Ok(())
+    }
+
+    async fn run_rust_c2pc_online_tamper(
+        streams: &mut EmpStreams,
+        case: C2pcTamperCase,
+        arm_tamper: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let circuit = C2pcCircuit::from_circuit(&c2pc_test_circuit())?;
+        let mut c2pc = C2pc::new(streams, case.rust_role(), circuit).await?;
+        c2pc.function_independent(streams).await?;
+        if matches!(case, C2pcTamperCase::GarbledTable) {
+            arm_tamper.store(true, Ordering::SeqCst);
+            send_phase_sync(&mut streams.main).await?;
+        }
+        c2pc.function_dependent(streams).await?;
+
+        if !matches!(case, C2pcTamperCase::GarbledTable) {
+            arm_tamper.store(true, Ordering::SeqCst);
+            send_phase_sync(&mut streams.main).await?;
+        }
+        match c2pc.online(streams, &c2pc_test_input(), true).await {
+            Err(CompatError::C2pcGarbledTableMismatch(0))
+                if matches!(case, C2pcTamperCase::GarbledTable) =>
+            {
+                Ok(())
+            }
+            Err(CompatError::C2pcOutputMacMismatch(0))
+                if matches!(case, C2pcTamperCase::OutputMac) =>
+            {
+                Ok(())
+            }
+            Err(CompatError::C2pcOutputLabelMismatch(0))
+                if matches!(case, C2pcTamperCase::OutputLabel) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+            Ok(output) => {
+                panic!("tampered C2PC online unexpectedly produced output {output:?} ({case:?})")
+            }
+        }
+    }
+
+    async fn send_phase_sync(stream: &mut EmpStream) -> Result<()> {
+        stream.send_data(&[0xA5]).await?;
+        stream.flush().await?;
         Ok(())
     }
 

@@ -32,7 +32,7 @@ EMP_BINS := $(BUILD)/party $(BUILD)/measure_io $(BUILD)/compat_probe \
             $(BUILD)/emp_wire_probe $(BUILD)/otco_probe $(BUILD)/iknp_probe \
             $(BUILD)/fpre_setup_probe $(BUILD)/fpre_generate_probe \
             $(BUILD)/fpre_check_probe $(BUILD)/fpre_refill_probe \
-            $(BUILD)/c2pc_independent_probe
+            $(BUILD)/c2pc_independent_probe $(BUILD)/c2pc_dependent_probe
 
 .PHONY: all plain mpc clean test demo cheat compat-probe
 all: plain mpc
@@ -101,10 +101,15 @@ $(BUILD)/c2pc_independent_probe: tools/c2pc_independent_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/c2pc_independent_probe.cpp \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
+$(BUILD)/c2pc_dependent_probe: tools/c2pc_dependent_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/c2pc_dependent_probe.cpp \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
 test: $(BUILD)/ref_kat $(BUILD)/verify_circuit $(BUILD)/emp_wire_probe \
       $(BUILD)/otco_probe $(BUILD)/iknp_probe $(BUILD)/fpre_setup_probe \
       $(BUILD)/fpre_generate_probe $(BUILD)/fpre_check_probe \
-      $(BUILD)/fpre_refill_probe $(BUILD)/c2pc_independent_probe
+      $(BUILD)/fpre_refill_probe $(BUILD)/c2pc_independent_probe \
+      $(BUILD)/c2pc_dependent_probe
 	./$(BUILD)/ref_kat
 	./$(BUILD)/verify_circuit
 

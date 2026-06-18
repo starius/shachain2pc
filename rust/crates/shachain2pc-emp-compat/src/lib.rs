@@ -27,6 +27,12 @@ pub enum CompatError {
         data0: usize,
         data1: usize,
     },
+    BadFpreCheckIndex(usize),
+    BadFpreGeneratedLength {
+        expected: usize,
+        mac: usize,
+        key: usize,
+    },
     LengthOverflow(&'static str),
     MissingDelta(&'static str),
     BadIknpSetupLength {
@@ -54,6 +60,13 @@ impl fmt::Display for CompatError {
             Self::BadOtLength { data0, data1 } => {
                 write!(f, "OTCO data length mismatch: data0={data0}, data1={data1}")
             }
+            Self::BadFpreCheckIndex(index) => {
+                write!(f, "Fpre check index must be 0 or 1, got {index}")
+            }
+            Self::BadFpreGeneratedLength { expected, mac, key } => write!(
+                f,
+                "Fpre generated data length mismatch: expected={expected}, mac={mac}, key={key}"
+            ),
             Self::LengthOverflow(name) => write!(f, "{name} length overflow"),
             Self::MissingDelta(name) => write!(f, "{name} setup did not produce Delta"),
             Self::BadIknpSetupLength { name, len } => {
@@ -608,6 +621,7 @@ pub struct Fpre {
     delta: Block,
     z_delta: Block,
     params: FpreParams,
+    eq: [Sha256; 2],
 }
 
 pub struct FpreGenerated {
@@ -663,6 +677,7 @@ impl Fpre {
             delta,
             z_delta: delta.and(leaky_delta_mask()),
             params: FpreParams::for_size(size),
+            eq: [Sha256::new(), Sha256::new()],
         })
     }
 
@@ -713,6 +728,149 @@ impl Fpre {
         };
         Ok(FpreGenerated { mac, key })
     }
+
+    pub async fn check(
+        &mut self,
+        streams: &mut EmpStreams,
+        generated: &mut FpreGenerated,
+        length: usize,
+        index: usize,
+    ) -> Result<()> {
+        let expected = length
+            .checked_mul(3)
+            .ok_or(CompatError::LengthOverflow("Fpre check"))?;
+        if generated.mac.len() != expected || generated.key.len() != expected {
+            return Err(CompatError::BadFpreGeneratedLength {
+                expected,
+                mac: generated.mac.len(),
+                key: generated.key.len(),
+            });
+        }
+
+        let stream = match index {
+            0 => &mut streams.fpre_io0,
+            1 => &mut streams.fpre_io2_0,
+            _ => return Err(CompatError::BadFpreCheckIndex(index)),
+        };
+        let ctx = FpreCheckContext {
+            party: self.party,
+            delta: self.delta,
+            z_delta: self.z_delta,
+            eq: &mut self.eq[index],
+            stream,
+            index,
+        };
+        fpre_check_on_stream(ctx, generated, length).await
+    }
+
+    pub fn check_digest(&self, index: usize) -> Result<[u8; HASH_DIGEST_BYTES]> {
+        let digest = self
+            .eq
+            .get(index)
+            .ok_or(CompatError::BadFpreCheckIndex(index))?
+            .clone()
+            .finalize();
+        Ok(digest.into())
+    }
+}
+
+struct FpreCheckContext<'a> {
+    party: Role,
+    delta: Block,
+    z_delta: Block,
+    eq: &'a mut Sha256,
+    stream: &'a mut EmpStream,
+    index: usize,
+}
+
+async fn fpre_check_on_stream(
+    ctx: FpreCheckContext<'_>,
+    generated: &mut FpreGenerated,
+    length: usize,
+) -> Result<()> {
+    let mut g = Vec::with_capacity(length);
+    let mut c = Vec::with_capacity(length);
+    for i in 0..length {
+        let mut c_i = generated.key[3 * i + 1].xor(generated.mac[3 * i + 1]);
+        if generated.mac[3 * i + 1].get_lsb() {
+            c_i = c_i.xor(ctx.delta);
+        }
+        c.push(c_i);
+        g.push(h2d(generated.key[3 * i], ctx.delta, ctx.index).xor(c_i));
+    }
+
+    let gr = match ctx.party {
+        Role::Alice => {
+            ctx.stream.send_block(&g).await?;
+            ctx.stream.recv_block(length).await?
+        }
+        Role::Bob => {
+            let gr = ctx.stream.recv_block(length).await?;
+            ctx.stream.send_block(&g).await?;
+            gr
+        }
+    };
+    ctx.stream.flush().await?;
+
+    let mut d = Vec::with_capacity(length);
+    for i in 0..length {
+        let mut s = h2(generated.mac[3 * i], generated.key[3 * i], ctx.index)
+            .xor(generated.mac[3 * i + 2])
+            .xor(generated.key[3 * i + 2]);
+        if generated.mac[3 * i].get_lsb() {
+            s = s.xor(gr[i].xor(c[i]));
+        }
+        g[i] = s;
+        if generated.mac[3 * i + 2].get_lsb() {
+            g[i] = g[i].xor(ctx.delta);
+        }
+        d.push(u8::from(get_l2sb(g[i])));
+    }
+
+    let dr = match ctx.party {
+        Role::Alice => {
+            ctx.stream.send_bool_bytes(&d, 0).await?;
+            ctx.stream.recv_bool_bytes(length, 0).await?
+        }
+        Role::Bob => {
+            let dr = ctx.stream.recv_bool_bytes(length, 0).await?;
+            ctx.stream.send_bool_bytes(&d, 0).await?;
+            dr
+        }
+    };
+    ctx.stream.flush().await?;
+
+    for i in 0..length {
+        if (d[i] != 0) != (dr[i] != 0) {
+            match ctx.party {
+                Role::Alice => {
+                    generated.mac[3 * i + 2] = generated.mac[3 * i + 2].xor(Block::make(0, 1));
+                }
+                Role::Bob => {
+                    generated.key[3 * i + 2] = generated.key[3 * i + 2].xor(ctx.z_delta);
+                }
+            }
+            g[i] = g[i].xor(ctx.delta);
+        }
+        ctx.eq.update(g[i].as_bytes());
+    }
+    Ok(())
+}
+
+fn h2d(a: Block, b: Block, _index: usize) -> Block {
+    let mut d = [a, a.xor(b)];
+    Prp::zero_key().permute_block(&mut d);
+    d[0].xor(d[1]).xor(b)
+}
+
+fn h2(a: Block, b: Block, _index: usize) -> Block {
+    let mut d = [a, b];
+    Prp::zero_key().permute_block(&mut d);
+    d[0].xor(d[1]).xor(a).xor(b)
+}
+
+fn get_l2sb(block: Block) -> bool {
+    ((block.as_bytes()[0] >> 1) & 1) == 1
 }
 
 async fn send_pre(
@@ -990,6 +1148,7 @@ mod tests {
     const LIVE_LEAKY_LENGTH: usize = 257;
     const LIVE_FPRE_REQUESTED_SIZE: usize = 321;
     const LIVE_FPRE_GENERATE_LENGTH: usize = 683;
+    const LIVE_FPRE_CHECK_LENGTH: usize = 683;
 
     #[derive(Clone, Copy, Debug)]
     enum TestTransport {
@@ -1380,6 +1539,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_fpre_check_interop() {
+        let bin = cpp_fpre_check_probe();
+        for check_index in [0, 1] {
+            run_live_fpre_check_case(&bin, Role::Alice, check_index).await;
+            run_live_fpre_check_case(&bin, Role::Bob, check_index).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_iknp_and_leaky_interop() {
         let bin = cpp_iknp_probe();
         for kind in [TestExtendedOt::Iknp, TestExtendedOt::Leaky] {
@@ -1736,6 +1904,89 @@ mod tests {
         );
     }
 
+    async fn run_live_fpre_check_case(bin: &Path, rust_role: Role, check_index: usize) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let cpp_transport = match rust_role {
+            Role::Alice => "connect",
+            Role::Bob => "listen",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role.party_id().to_string())
+            .arg(check_index.to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre check stream open failed ({rust_role:?}, {check_index}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre check stream open timed out ({rust_role:?}, {check_index})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let check_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_fpre_check(&mut streams, rust_role, check_index),
+        )
+        .await;
+        match check_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre check failed ({rust_role:?}, {check_index}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre check timed out ({rust_role:?}, {check_index})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(streams);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ Fpre check probe failed ({rust_role:?}, {check_index})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -1857,6 +2108,47 @@ mod tests {
         Ok(())
     }
 
+    async fn run_rust_fpre_check(
+        streams: &mut EmpStreams,
+        role: Role,
+        check_index: usize,
+    ) -> Result<()> {
+        let mut fpre = Fpre::setup(streams, role, LIVE_FPRE_REQUESTED_SIZE).await?;
+        let mut generated = fpre.generate(streams, LIVE_FPRE_CHECK_LENGTH).await?;
+        fpre.check(streams, &mut generated, LIVE_FPRE_CHECK_LENGTH, check_index)
+            .await?;
+        let local_digest = fpre.check_digest(check_index)?;
+
+        let (remote_delta, remote_key, remote_digest) = match role {
+            Role::Alice => {
+                send_fpre_check_verification(
+                    &mut streams.main,
+                    fpre.delta(),
+                    &generated.key,
+                    local_digest,
+                )
+                .await?;
+                recv_fpre_check_verification(&mut streams.main, LIVE_FPRE_CHECK_LENGTH * 3).await?
+            }
+            Role::Bob => {
+                let remote =
+                    recv_fpre_check_verification(&mut streams.main, LIVE_FPRE_CHECK_LENGTH * 3)
+                        .await?;
+                send_fpre_check_verification(
+                    &mut streams.main,
+                    fpre.delta(),
+                    &generated.key,
+                    local_digest,
+                )
+                .await?;
+                remote
+            }
+        };
+        assert_fpre_generate_relation(&generated.mac, remote_delta, &remote_key);
+        assert_eq!(local_digest, remote_digest);
+        Ok(())
+    }
+
     fn fpre_verification(fpre: &Fpre) -> FpreVerification {
         let params = fpre.params();
         FpreVerification {
@@ -1921,6 +2213,33 @@ mod tests {
         let delta = stream.recv_block(1).await?[0];
         let key = stream.recv_block(length).await?;
         Ok((delta, key))
+    }
+
+    async fn send_fpre_check_verification(
+        stream: &mut EmpStream,
+        delta: Block,
+        key: &[Block],
+        digest: [u8; HASH_DIGEST_BYTES],
+    ) -> Result<()> {
+        stream.send_block(&[delta]).await?;
+        stream.send_block(key).await?;
+        stream.send_data(&digest).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_fpre_check_verification(
+        stream: &mut EmpStream,
+        length: usize,
+    ) -> Result<(Block, Vec<Block>, [u8; HASH_DIGEST_BYTES])> {
+        let delta = stream.recv_block(1).await?[0];
+        let key = stream.recv_block(length).await?;
+        let digest = stream
+            .recv_data(HASH_DIGEST_BYTES)
+            .await?
+            .try_into()
+            .expect("digest length");
+        Ok((delta, key, digest))
     }
 
     fn assert_fpre_delta_bits(delta: Block, role: Role) {
@@ -2071,6 +2390,24 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/fpre_generate_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_fpre_check_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/fpre_check_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/fpre_check_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/fpre_check_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/fpre_check_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

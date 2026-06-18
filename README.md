@@ -96,7 +96,8 @@ layout.
 | `reference/` | single-party `generate_from_seed` oracle + KATs (no MPC), and `ref_cli` |
 | `protocol/` | the pure, deterministic part: build the Bristol circuit for index `I` (`bristol.*`, `circuit_gen.*`, `wire_layout.h`) — public flips + a SHA-256 chain over the XOR of the two seed shares — and the input/output wire layout |
 | `run/` | drive the two `emp-ag2pc` parties over a socket: generate the circuit for `I`, feed shares, evaluate, obtain `H(I)`, abort on any cheat (`derive.h`) |
-| `demo/` | two-party binary (`party`) and the honest / wrong-index demo scripts |
+| `demo/` | C++ two-party binary (`party`) and the honest / wrong-index demo scripts |
+| `rust/` | Rust v1 port: EMP-compatible wire/protocol crates and Rust `party` binary |
 | `tools/` | offline checks: bit-convention probe, circuit verifier, circuit tamperer, bandwidth meter |
 
 ## Build
@@ -106,7 +107,11 @@ Requires nix (for the toolchain and OpenSSL) on an x86-64 host.
 ```sh
 nix develop -c ./tools/bootstrap-emp.sh   # once: fetch + build emp into .deps/emp
 nix develop -c make                        # build everything
+nix develop -c cargo build --manifest-path rust/Cargo.toml --release
 ```
+
+The Rust release binary is `rust/target/release/party`. The C++ binary is
+`.build/party`.
 
 ## Run
 
@@ -130,14 +135,43 @@ party `2` (BOB) pointed at ALICE's IP:
 ./.build/party 2 12345 ffffffffffff <bobShareHex> <alice_ip>
 ```
 
+The Rust binary uses the same positional form:
+
+```sh
+rust/target/release/party 1 12345 ffffffffffff <aliceShareHex>
+rust/target/release/party 2 12345 ffffffffffff <bobShareHex> <alice_ip>
+```
+
 The two share hexes are each 64 hex chars (32 bytes); the seed is their XOR. On
 the same machine, BOB connects to `127.0.0.1` (the default if `<alice_ip>` is
 omitted).
+
+### Seed-reveal guard
+
+Index `I = 0` is not a normal per-commitment reveal: it returns the shachain
+seed itself. The Rust `party` refuses it by default before opening any socket:
+
+```sh
+rust/target/release/party 1 12345 0 <aliceShareHex>
+# ABORT: I=0 reveals the seed ...
+```
+
+For compatibility tests only, pass `--allow-seed-reveal` on each Rust side. The
+flag is position-independent:
+
+```sh
+rust/target/release/party --allow-seed-reveal 1 12345 0 <aliceShareHex>
+rust/target/release/party 2 12345 0 <bobShareHex> <alice_ip> --allow-seed-reveal
+```
+
+The C++ demo binary is unchanged and still accepts `I = 0` silently. This is a
+deliberate local hardening divergence in the Rust binary.
 
 ## Tests
 
 ```sh
 nix develop -c make test     # reference KATs + plaintext circuit verification
+nix develop -c cargo test --manifest-path rust/Cargo.toml
 ```
 
 `make test` runs, with no network:
@@ -146,12 +180,30 @@ nix develop -c make test     # reference KATs + plaintext circuit verification
   reference across those vectors, popcount 0 and 48, three share splits, and a
   serializer round-trip.
 
-The MPC layer itself is exercised by the demo scripts above.
+The Rust tests include live C++/Rust interop for the protocol layers and a
+Rust/Rust party E2E test for `I = 1` plus `I = 3` (multi-block chaining). Those
+real-circuit debug tests are intentionally expensive; on the current review
+machine the party crate's real-circuit test is roughly 8-10 minutes. For a
+faster optimized check, run the specific release test:
+
+```sh
+nix develop -c cargo test --release --manifest-path rust/Cargo.toml \
+  -p shachain2pc-party rust_party_real_circuits_match_reference
+```
+
+The full `I = ffffffffffff` 48-block Rust party test exists but is ignored by
+default; the plaintext circuit verifier covers that index, but the full Rust MPC
+run has not yet been demonstrated end-to-end.
 
 ## Scope and trade-offs
 
 - **2 parties, asymmetric roles** (party 1 = garbler/ALICE, party 2 =
   evaluator/BOB). Not threshold, not post-quantum.
+- **Rust v1 is a faithful compatibility port, not a performance port.** It
+  preserves the EMP-compatible protocol and wire behavior and is cross-checked
+  against the C++ implementation, but it is currently much slower than the C++
+  engine for real SHA circuits. The future streaming / low-memory protocol work
+  belongs to a later version.
 - **The cache optimization is dropped.** A semi-honest implementation can resume
   a derivation from a *secret-shared* intermediate checkpoint; doing that
   maliciously requires carrying **authenticated** shared state across circuits

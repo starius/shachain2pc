@@ -44,10 +44,12 @@ Rust v1 must not depend on an MPC crate. It may use general Rust crates for
 async networking, AES/SHA/EC arithmetic, errors, randomness, and zeroization,
 but the MPC protocol logic must live in this repository.
 
-## Performance requirement
+## Performance target and current status
 
-Rust-Rust v1 is not acceptable if it is materially slower than the current C++
-baseline. The current worst-case local run is about **1.2s** on the same machine.
+The original target was that Rust/Rust v1 should not be materially slower than
+the current C++ baseline. Current measurements do not meet that target: Rust v1
+is a faithful compatibility/correctness port, but real SHA-circuit performance
+is still future optimization work.
 
 Release-gate benchmark:
 
@@ -287,9 +289,12 @@ These prove that Rust and C++ are computing the same relation before MPC enters:
   - `555555555555`;
   - `ffffffffffff`.
 
-`I = 000000000000` is accepted in Rust v1 for full C++ compatibility. It reveals
-the full seed because no SHA-256 round runs, so the caveat must be documented
-and handled by deployment policy rather than silently changing v1 behavior.
+The deterministic probes still include `I = 000000000000` because it is an
+important circuit/reference fixture. The Rust `party` binary does not accept it
+silently: index zero reveals the full seed because no SHA-256 round runs, so the
+CLI aborts before opening a socket unless `--allow-seed-reveal` is supplied.
+This is a deliberate local hardening divergence from the C++ demo binary, which
+still accepts `I = 0`.
 
 ### Subprotocol interop probes
 
@@ -552,7 +557,11 @@ Acceptance:
 - Rust/Rust derives the same values as C++ reference;
 - Rust ALICE + C++ BOB works;
 - C++ ALICE + Rust BOB works;
-- worst-case Rust/Rust performance is no worse than the C++ baseline;
+- Rust refuses `I = 0` unless `--allow-seed-reveal` is explicitly supplied;
+- real-circuit Rust/Rust tests cover `I = 1` and a multi-block `I = 3`;
+- worst-case Rust/Rust performance is measured and documented. The current v1
+  implementation is correct and compatible, but it is not yet performance
+  comparable with the C++ baseline;
 - test indices include:
   - `000000000000` compatibility fixture;
   - `000000000001`;
@@ -628,8 +637,8 @@ Rust v1 should remain available as a regression oracle while v2 is developed.
   parties evaluate the same requested `I`; it cannot prove that Lightning channel
   state allowed that `I`.
 - `I == 0` reveals `alice_share XOR bob_share`, i.e. the seed, because no hash
-  round runs. Rust v1 accepts it for C++ compatibility; production deployments
-  must decide at the policy layer whether this index is ever allowed.
+  round runs. Rust v1 refuses it by default and requires the explicit
+  `--allow-seed-reveal` test/compatibility override.
 
 ## Initial dependency set
 
@@ -691,9 +700,12 @@ v2 after the wire/protocol is no longer EMP-compatible.
 
 1. The v1 spec freezes the whole algorithm and wire encoding. Exact probe output
    formats are TOML for the spec and JSON Lines for probe outputs.
-2. Rust v1 accepts `I == 0` for C++ compatibility.
-3. Benchmark C++/C++, Rust/Rust, and mixed C++/Rust. Rust/Rust must not be
-   statistically slower than C++/C++ under the benchmark method above.
+2. Rust v1 refuses `I == 0` by default because it reveals the shachain seed.
+   Compatibility tests may opt in with `--allow-seed-reveal`; the C++ demo is
+   unchanged and accepts `I == 0` silently.
+3. Benchmark C++/C++, Rust/Rust, and mixed C++/Rust. The current Rust v1 result
+   is correct and compatible but slower than the C++ baseline; performance work
+   remains future debt.
 4. Prefer OpenSSL bindings for EMP-compatible base OT point behavior; prefer
    vetted Rust crates for standard SHA/AES only after probe confirmation. AES
    backend selection is an empirical implementation gate, not a protocol

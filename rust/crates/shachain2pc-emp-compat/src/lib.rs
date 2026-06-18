@@ -17,6 +17,7 @@ pub const POINT_BYTES: usize = 65;
 pub const IKNP_SECURITY_BITS: usize = 128;
 pub const IKNP_BLOCK_SIZE: usize = 2048;
 pub const FPRE_THREADS: usize = 1;
+const C2PC_SSP_BYTES: usize = 5;
 
 #[derive(Debug)]
 pub enum CompatError {
@@ -35,6 +36,7 @@ pub enum CompatError {
         key: usize,
     },
     BadC2pcCircuit(String),
+    C2pcMaskMismatch(usize),
     CoinTossMismatch,
     FeqMismatch,
     LengthOverflow(&'static str),
@@ -72,6 +74,9 @@ impl fmt::Display for CompatError {
                 "Fpre generated data length mismatch: expected={expected}, mac={mac}, key={key}"
             ),
             Self::BadC2pcCircuit(msg) => write!(f, "bad C2PC circuit: {msg}"),
+            Self::C2pcMaskMismatch(index) => {
+                write!(f, "C2PC input mask commitment mismatch at wire {index}")
+            }
             Self::CoinTossMismatch => write!(f, "Fpre coin-toss commitment mismatch"),
             Self::FeqMismatch => write!(f, "Fpre equality check mismatch"),
             Self::LengthOverflow(name) => write!(f, "{name} length overflow"),
@@ -1020,6 +1025,10 @@ impl C2pcCircuit {
         self.n1 + self.n2
     }
 
+    pub fn num_wire(&self) -> usize {
+        self.num_wire
+    }
+
     pub fn output_len(&self) -> usize {
         self.n3
     }
@@ -1048,6 +1057,9 @@ pub struct C2pc {
     ands_key: Vec<Block>,
     sigma_mac: Vec<Block>,
     sigma_key: Vec<Block>,
+    gt: Vec<[[Block; 2]; 4]>,
+    gtk: Vec<[Block; 4]>,
+    gtm: Vec<[Block; 4]>,
     labels: Vec<Block>,
     mask: Vec<u8>,
 }
@@ -1067,6 +1079,9 @@ impl C2pc {
             ands_key: vec![Block::zero(); num_ands * 3],
             sigma_mac: vec![Block::zero(); num_ands],
             sigma_key: vec![Block::zero(); num_ands],
+            gt: vec![[[Block::zero(); 2]; 4]; num_ands],
+            gtk: vec![[Block::zero(); 4]; num_ands],
+            gtm: vec![[Block::zero(); 4]; num_ands],
             labels: vec![Block::zero(); circuit.num_wire],
             mask: vec![0; circuit.input_len()],
             circuit,
@@ -1131,6 +1146,155 @@ impl C2pc {
         Ok(())
     }
 
+    pub async fn function_dependent(&mut self, streams: &mut EmpStreams) -> Result<()> {
+        let input_len = self.circuit.input_len();
+        let mut pre_index = input_len;
+        for gate in &self.circuit.gates {
+            if gate.typ == C2pcGateType::And {
+                self.key[gate.out] = self.preprocess_key[pre_index];
+                self.mac[gate.out] = self.preprocess_mac[pre_index];
+                pre_index += 1;
+            }
+        }
+
+        for gate in &self.circuit.gates {
+            match gate.typ {
+                C2pcGateType::Xor => {
+                    self.key[gate.out] = self.key[gate.in0].xor(self.key[gate.in1]);
+                    self.mac[gate.out] = self.mac[gate.in0].xor(self.mac[gate.in1]);
+                    if self.party == Role::Alice {
+                        self.labels[gate.out] = self.labels[gate.in0].xor(self.labels[gate.in1]);
+                    }
+                }
+                C2pcGateType::Inv => {
+                    self.key[gate.out] = self.key[gate.in0];
+                    self.mac[gate.out] = self.mac[gate.in0];
+                    if self.party == Role::Alice {
+                        self.labels[gate.out] = self.labels[gate.in0].xor(self.fpre.delta);
+                    }
+                }
+                C2pcGateType::And => {}
+            }
+        }
+
+        let num_ands = self.circuit.num_ands();
+        let mut x = Vec::with_capacity(num_ands);
+        let mut y = Vec::with_capacity(num_ands);
+        let mut and_index = 0;
+        for gate in &self.circuit.gates {
+            if gate.typ == C2pcGateType::And {
+                x.push(u8::from(
+                    self.mac[gate.in0]
+                        .xor(self.ands_mac[3 * and_index])
+                        .get_lsb(),
+                ));
+                y.push(u8::from(
+                    self.mac[gate.in1]
+                        .xor(self.ands_mac[3 * and_index + 1])
+                        .get_lsb(),
+                ));
+                and_index += 1;
+            }
+        }
+
+        let (xr, yr) = match self.party {
+            Role::Alice => {
+                streams.main.send_bool_bytes(&x, 0).await?;
+                streams.main.send_bool_bytes(&y, 0).await?;
+                let xr = streams.main.recv_bool_bytes(num_ands, 0).await?;
+                let yr = streams.main.recv_bool_bytes(num_ands, 0).await?;
+                (xr, yr)
+            }
+            Role::Bob => {
+                let xr = streams.main.recv_bool_bytes(num_ands, 0).await?;
+                let yr = streams.main.recv_bool_bytes(num_ands, 0).await?;
+                streams.main.send_bool_bytes(&x, 0).await?;
+                streams.main.send_bool_bytes(&y, 0).await?;
+                (xr, yr)
+            }
+        };
+        streams.main.flush().await?;
+
+        for i in 0..num_ands {
+            let x_i = (x[i] != 0) != (xr[i] != 0);
+            let y_i = (y[i] != 0) != (yr[i] != 0);
+            self.sigma_mac[i] = self.ands_mac[3 * i + 2];
+            self.sigma_key[i] = self.ands_key[3 * i + 2];
+            if x_i {
+                self.sigma_mac[i] = self.sigma_mac[i].xor(self.ands_mac[3 * i + 1]);
+                self.sigma_key[i] = self.sigma_key[i].xor(self.ands_key[3 * i + 1]);
+            }
+            if y_i {
+                self.sigma_mac[i] = self.sigma_mac[i].xor(self.ands_mac[3 * i]);
+                self.sigma_key[i] = self.sigma_key[i].xor(self.ands_key[3 * i]);
+            }
+            if x_i && y_i {
+                match self.party {
+                    Role::Alice => {
+                        self.sigma_key[i] = self.sigma_key[i].xor(self.fpre.z_delta);
+                    }
+                    Role::Bob => {
+                        self.sigma_mac[i] = self.sigma_mac[i].xor(Block::make(0, 1));
+                    }
+                }
+            }
+        }
+
+        and_index = 0;
+        for (gate_index, gate) in self.circuit.gates.iter().enumerate() {
+            if gate.typ == C2pcGateType::And {
+                let (m, k) = self.and_row_masks(gate, and_index);
+                match self.party {
+                    Role::Alice => {
+                        let rows = self.alice_garbled_rows(gate, gate_index, and_index, &m, &k);
+                        for row in rows {
+                            streams
+                                .main
+                                .send_partial_blocks(&[row[0]], C2PC_SSP_BYTES)
+                                .await?;
+                            streams.main.send_block(&[row[1]]).await?;
+                        }
+                    }
+                    Role::Bob => {
+                        self.gtm[and_index] = m;
+                        self.gtk[and_index] = k;
+                        for row in 0..4 {
+                            self.gt[and_index][row][0] =
+                                streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
+                            self.gt[and_index][row][1] = streams.main.recv_block(1).await?[0];
+                        }
+                    }
+                }
+                and_index += 1;
+            }
+        }
+
+        match self.party {
+            Role::Alice => {
+                streams
+                    .main
+                    .send_partial_blocks(&self.mac[..self.circuit.n1], C2PC_SSP_BYTES)
+                    .await?;
+                for i in self.circuit.n1..input_len {
+                    let received = streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
+                    self.mask[i] = self.resolve_mask(i, received)?;
+                }
+            }
+            Role::Bob => {
+                for i in 0..self.circuit.n1 {
+                    let received = streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
+                    self.mask[i] = self.resolve_mask(i, received)?;
+                }
+                streams
+                    .main
+                    .send_partial_blocks(&self.mac[self.circuit.n1..input_len], C2PC_SSP_BYTES)
+                    .await?;
+            }
+        }
+        streams.main.flush().await?;
+        Ok(())
+    }
+
     pub fn party(&self) -> Role {
         self.party
     }
@@ -1151,6 +1315,14 @@ impl C2pc {
         &self.key[..self.circuit.input_len()]
     }
 
+    pub fn wire_mac(&self) -> &[Block] {
+        &self.mac
+    }
+
+    pub fn wire_key(&self) -> &[Block] {
+        &self.key
+    }
+
     pub fn preprocess_mac(&self) -> &[Block] {
         &self.preprocess_mac
     }
@@ -1167,8 +1339,97 @@ impl C2pc {
         &self.ands_key[..self.ands_block_len()]
     }
 
+    pub fn sigma_mac(&self) -> &[Block] {
+        &self.sigma_mac
+    }
+
+    pub fn sigma_key(&self) -> &[Block] {
+        &self.sigma_key
+    }
+
+    pub fn garbled_table_wire(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.circuit.num_ands() * 4 * (C2PC_SSP_BYTES + 16));
+        let mut and_index = 0;
+        for (gate_index, gate) in self.circuit.gates.iter().enumerate() {
+            if gate.typ == C2pcGateType::And {
+                let rows = match self.party {
+                    Role::Alice => {
+                        let (m, k) = self.and_row_masks(gate, and_index);
+                        self.alice_garbled_rows(gate, gate_index, and_index, &m, &k)
+                    }
+                    Role::Bob => self.gt[and_index],
+                };
+                for row in rows {
+                    out.extend_from_slice(&row[0].as_bytes()[..C2PC_SSP_BYTES]);
+                    out.extend_from_slice(row[1].as_bytes());
+                }
+                and_index += 1;
+            }
+        }
+        out
+    }
+
     fn ands_block_len(&self) -> usize {
         self.circuit.num_ands() * 3
+    }
+
+    fn and_row_masks(&self, gate: &C2pcGate, and_index: usize) -> ([Block; 4], [Block; 4]) {
+        let mut m = [Block::zero(); 4];
+        m[0] = self.sigma_mac[and_index].xor(self.mac[gate.out]);
+        m[1] = m[0].xor(self.mac[gate.in0]);
+        m[2] = m[0].xor(self.mac[gate.in1]);
+        m[3] = m[1].xor(self.mac[gate.in1]);
+        if self.party == Role::Bob {
+            m[3] = m[3].xor(Block::make(0, 1));
+        }
+
+        let mut k = [Block::zero(); 4];
+        k[0] = self.sigma_key[and_index].xor(self.key[gate.out]);
+        k[1] = k[0].xor(self.key[gate.in0]);
+        k[2] = k[0].xor(self.key[gate.in1]);
+        k[3] = k[1].xor(self.key[gate.in1]);
+        if self.party == Role::Alice {
+            k[3] = k[3].xor(self.fpre.z_delta);
+        }
+        (m, k)
+    }
+
+    fn alice_garbled_rows(
+        &self,
+        gate: &C2pcGate,
+        gate_index: usize,
+        and_index: usize,
+        m: &[Block; 4],
+        k: &[Block; 4],
+    ) -> [[Block; 2]; 4] {
+        let mut rows = garble_hash_preprocess(
+            self.labels[gate.in0],
+            self.labels[gate.in1],
+            self.fpre.delta,
+            gate_index as u64,
+        );
+        for row in 0..4 {
+            rows[row][0] = rows[row][0].xor(m[row]);
+            rows[row][1] = rows[row][1].xor(k[row]).xor(self.labels[gate.out]);
+            if m[row].get_lsb() {
+                rows[row][1] = rows[row][1].xor(self.fpre.delta);
+            }
+        }
+        debug_assert!(and_index < self.circuit.num_ands());
+        rows
+    }
+
+    fn resolve_mask(&self, index: usize, received: Block) -> Result<u8> {
+        let received = received.and(c2pc_mask());
+        let key = self.key[index].and(c2pc_mask());
+        let key_delta = self.key[index].xor(self.fpre.delta).and(c2pc_mask());
+        if received == key {
+            Ok(0)
+        } else if received == key_delta {
+            Ok(1)
+        } else {
+            Err(CompatError::C2pcMaskMismatch(index))
+        }
     }
 }
 
@@ -1182,6 +1443,18 @@ impl Drop for C2pc {
         self.ands_key.zeroize();
         self.sigma_mac.zeroize();
         self.sigma_key.zeroize();
+        for gate in &mut self.gt {
+            for row in gate {
+                row[0].zeroize();
+                row[1].zeroize();
+            }
+        }
+        for gate in &mut self.gtk {
+            gate.zeroize();
+        }
+        for gate in &mut self.gtm {
+            gate.zeroize();
+        }
         self.labels.zeroize();
         self.mask.zeroize();
     }
@@ -1205,6 +1478,10 @@ fn checked_wire(name: &'static str, wire: i32, num_wire: usize) -> Result<usize>
     } else {
         Ok(wire as usize)
     }
+}
+
+fn c2pc_mask() -> Block {
+    Block::make(0, 0xFFFFF)
 }
 
 struct FpreCheckContext<'a> {
@@ -2210,6 +2487,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_c2pc_function_dependent_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_c2pc_dependent_probe();
+        run_live_c2pc_dependent_case(&bin, Role::Alice).await;
+        run_live_c2pc_dependent_case(&bin, Role::Bob).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_iknp_and_leaky_interop() {
         let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
         let bin = cpp_iknp_probe();
@@ -2851,6 +3136,88 @@ mod tests {
         );
     }
 
+    async fn run_live_c2pc_dependent_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let cpp_transport = match rust_role {
+            Role::Alice => "connect",
+            Role::Bob => "listen",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role.party_id().to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(
+            LIVE_C2PC_TIMEOUT,
+            EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC dependent stream open failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC dependent stream open timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let dependent_result = timeout(
+            LIVE_C2PC_TIMEOUT,
+            run_rust_c2pc_dependent(&mut streams, rust_role),
+        )
+        .await;
+        match dependent_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC dependent failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC dependent timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(streams);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ C2PC dependent probe failed ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -3123,6 +3490,59 @@ mod tests {
         Ok(())
     }
 
+    async fn run_rust_c2pc_dependent(streams: &mut EmpStreams, role: Role) -> Result<()> {
+        let circuit = C2pcCircuit::from_circuit(&c2pc_test_circuit())?;
+        let mut c2pc = C2pc::new(streams, role, circuit).await?;
+        c2pc.function_independent(streams).await?;
+        c2pc.function_dependent(streams).await?;
+
+        let local_table = c2pc.garbled_table_wire();
+        let table_len = c2pc.circuit().num_ands() * 4 * (C2PC_SSP_BYTES + 16);
+        assert_eq!(local_table.len(), table_len);
+        let (remote_delta, remote_key, remote_sigma_key, remote_table) = match role {
+            Role::Alice => {
+                send_c2pc_dependent_verification(
+                    &mut streams.main,
+                    c2pc.delta(),
+                    c2pc.wire_key(),
+                    c2pc.sigma_key(),
+                    &local_table,
+                )
+                .await?;
+                recv_c2pc_dependent_verification(
+                    &mut streams.main,
+                    c2pc.circuit().num_wire(),
+                    c2pc.circuit().num_ands(),
+                    table_len,
+                )
+                .await?
+            }
+            Role::Bob => {
+                let remote = recv_c2pc_dependent_verification(
+                    &mut streams.main,
+                    c2pc.circuit().num_wire(),
+                    c2pc.circuit().num_ands(),
+                    table_len,
+                )
+                .await?;
+                send_c2pc_dependent_verification(
+                    &mut streams.main,
+                    c2pc.delta(),
+                    c2pc.wire_key(),
+                    c2pc.sigma_key(),
+                    &local_table,
+                )
+                .await?;
+                remote
+            }
+        };
+
+        assert_fpre_generate_relation(c2pc.wire_mac(), remote_delta, &remote_key);
+        assert_fpre_generate_relation(c2pc.sigma_mac(), remote_delta, &remote_sigma_key);
+        assert_eq!(local_table, remote_table);
+        Ok(())
+    }
+
     fn fpre_verification(fpre: &Fpre) -> FpreVerification {
         let params = fpre.params();
         FpreVerification {
@@ -3268,6 +3688,34 @@ mod tests {
         let ands_key = stream.recv_block(ands_len).await?;
         let ands_bits = stream.recv_data(ands_len).await?;
         Ok((delta, input_key, preprocess_key, ands_key, ands_bits))
+    }
+
+    async fn send_c2pc_dependent_verification(
+        stream: &mut EmpStream,
+        delta: Block,
+        key: &[Block],
+        sigma_key: &[Block],
+        garbled_table: &[u8],
+    ) -> Result<()> {
+        stream.send_block(&[delta]).await?;
+        stream.send_block(key).await?;
+        stream.send_block(sigma_key).await?;
+        stream.send_data(garbled_table).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_c2pc_dependent_verification(
+        stream: &mut EmpStream,
+        wire_len: usize,
+        sigma_len: usize,
+        table_len: usize,
+    ) -> Result<(Block, Vec<Block>, Vec<Block>, Vec<u8>)> {
+        let delta = stream.recv_block(1).await?[0];
+        let key = stream.recv_block(wire_len).await?;
+        let sigma_key = stream.recv_block(sigma_len).await?;
+        let garbled_table = stream.recv_data(table_len).await?;
+        Ok((delta, key, sigma_key, garbled_table))
     }
 
     fn assert_fpre_delta_bits(delta: Block, role: Role) {
@@ -3490,6 +3938,27 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/c2pc_independent_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_c2pc_dependent_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/c2pc_dependent_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/c2pc_dependent_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "failed to build .build/c2pc_dependent_probe"
+            );
+        }
+        assert!(
+            bin.exists(),
+            ".build/c2pc_dependent_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

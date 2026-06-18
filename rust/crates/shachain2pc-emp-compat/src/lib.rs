@@ -4,12 +4,15 @@ use openssl::bn::{BigNum, BigNumContext, BigNumRef};
 use openssl::ec::{EcGroup, EcPoint, EcPointRef, PointConversionForm};
 use openssl::error::ErrorStack;
 use openssl::nid::Nid;
+use openssl::rand::rand_bytes;
 use sha2::{Digest, Sha256};
-use shachain2pc_emp_wire::{Block, EmpStream, WireError};
+use shachain2pc_emp_wire::{Block, EmpStream, WireError, BLOCK_BYTES};
 use std::fmt;
 
 pub const HASH_DIGEST_BYTES: usize = 32;
 pub const POINT_BYTES: usize = 65;
+pub const IKNP_SECURITY_BITS: usize = 128;
+pub const IKNP_BLOCK_SIZE: usize = 2048;
 
 #[derive(Debug)]
 pub enum CompatError {
@@ -21,6 +24,11 @@ pub enum CompatError {
         data0: usize,
         data1: usize,
     },
+    BadIknpSetupLength {
+        name: &'static str,
+        len: usize,
+    },
+    IknpWrongRole(&'static str),
     LengthMismatch {
         receiver_scalars: usize,
         choices: usize,
@@ -41,6 +49,13 @@ impl fmt::Display for CompatError {
             Self::BadOtLength { data0, data1 } => {
                 write!(f, "OTCO data length mismatch: data0={data0}, data1={data1}")
             }
+            Self::BadIknpSetupLength { name, len } => {
+                write!(
+                    f,
+                    "IKNP setup field {name} must have length {IKNP_SECURITY_BITS}, got {len}"
+                )
+            }
+            Self::IknpWrongRole(role) => write!(f, "IKNP state is not initialized for {role}"),
             Self::LengthMismatch {
                 receiver_scalars,
                 choices,
@@ -380,6 +395,349 @@ async fn recv_point(stream: &mut EmpStream) -> Result<Vec<u8>> {
     Ok(stream.recv_data(POINT_BYTES).await?)
 }
 
+struct IknpSendState {
+    s: [bool; IKNP_SECURITY_BITS],
+    delta: Block,
+    g0: Vec<Prg>,
+}
+
+struct IknpRecvState {
+    g0: Vec<Prg>,
+    g1: Vec<Prg>,
+}
+
+pub struct Iknp {
+    send: Option<IknpSendState>,
+    recv: Option<IknpRecvState>,
+}
+
+impl Iknp {
+    pub fn new() -> Self {
+        Self {
+            send: None,
+            recv: None,
+        }
+    }
+
+    pub fn delta(&self) -> Option<Block> {
+        self.send.as_ref().map(|state| state.delta)
+    }
+
+    pub async fn setup_send(&mut self, stream: &mut EmpStream) -> Result<()> {
+        let s = random_bools_array()?;
+        self.setup_send_with_choices(stream, &s).await
+    }
+
+    pub async fn setup_send_with_choices(
+        &mut self,
+        stream: &mut EmpStream,
+        s: &[bool],
+    ) -> Result<()> {
+        validate_iknp_len("s", s.len())?;
+        let mut choices = [false; IKNP_SECURITY_BITS];
+        choices.copy_from_slice(s);
+        let k0 = otco_recv(stream, &choices).await?;
+        self.set_send_state(&choices, &k0)
+    }
+
+    pub fn setup_send_from_base_ot(&mut self, s: &[bool], k0: &[Block]) -> Result<()> {
+        validate_iknp_len("s", s.len())?;
+        validate_iknp_len("k0", k0.len())?;
+        let mut choices = [false; IKNP_SECURITY_BITS];
+        choices.copy_from_slice(s);
+        self.set_send_state(&choices, k0)
+    }
+
+    pub async fn setup_recv(&mut self, stream: &mut EmpStream) -> Result<()> {
+        let k0 = random_blocks(IKNP_SECURITY_BITS)?;
+        let k1 = random_blocks(IKNP_SECURITY_BITS)?;
+        otco_send(stream, &k0, &k1).await?;
+        self.setup_recv_from_base_ot(&k0, &k1)
+    }
+
+    pub fn setup_recv_from_base_ot(&mut self, k0: &[Block], k1: &[Block]) -> Result<()> {
+        validate_iknp_len("k0", k0.len())?;
+        validate_iknp_len("k1", k1.len())?;
+        let g0 = k0.iter().copied().map(|seed| Prg::new(seed, 0)).collect();
+        let g1 = k1.iter().copied().map(|seed| Prg::new(seed, 0)).collect();
+        self.recv = Some(IknpRecvState { g0, g1 });
+        Ok(())
+    }
+
+    pub async fn send_cot(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+        if self.send.is_none() {
+            self.setup_send(stream).await?;
+        }
+        let state = self
+            .send
+            .as_mut()
+            .ok_or(CompatError::IknpWrongRole("send_cot"))?;
+        send_pre(state, stream, length).await
+    }
+
+    pub async fn recv_cot(
+        &mut self,
+        stream: &mut EmpStream,
+        choices: &[bool],
+    ) -> Result<Vec<Block>> {
+        if self.recv.is_none() {
+            self.setup_recv(stream).await?;
+        }
+        let state = self
+            .recv
+            .as_mut()
+            .ok_or(CompatError::IknpWrongRole("recv_cot"))?;
+        recv_pre(state, stream, choices).await
+    }
+
+    fn set_send_state(&mut self, s: &[bool; IKNP_SECURITY_BITS], k0: &[Block]) -> Result<()> {
+        validate_iknp_len("k0", k0.len())?;
+        let delta = bool_to_block(s);
+        let g0 = k0.iter().copied().map(|seed| Prg::new(seed, 0)).collect();
+        self.send = Some(IknpSendState { s: *s, delta, g0 });
+        Ok(())
+    }
+}
+
+impl Default for Iknp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct LeakyDeltaOt {
+    iknp: Iknp,
+}
+
+impl LeakyDeltaOt {
+    pub fn new() -> Self {
+        Self { iknp: Iknp::new() }
+    }
+
+    pub fn delta(&self) -> Option<Block> {
+        self.iknp.delta()
+    }
+
+    pub async fn setup_send_with_choices(
+        &mut self,
+        stream: &mut EmpStream,
+        s: &[bool],
+    ) -> Result<()> {
+        self.iknp.setup_send_with_choices(stream, s).await
+    }
+
+    pub async fn setup_recv(&mut self, stream: &mut EmpStream) -> Result<()> {
+        self.iknp.setup_recv(stream).await
+    }
+
+    pub async fn send_dot(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+        let mut data = self.iknp.send_cot(stream, length).await?;
+        stream.flush().await?;
+        let one = leaky_delta_mask();
+        for block in &mut data {
+            *block = block.and(one);
+        }
+        Ok(data)
+    }
+
+    pub async fn recv_dot(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+        let choices = random_bools(length)?;
+        let mut data = self.iknp.recv_cot(stream, &choices).await?;
+        stream.flush().await?;
+        let one = leaky_delta_mask();
+        for (block, choice) in data.iter_mut().zip(choices) {
+            *block = block.and(one);
+            if choice {
+                *block = block.xor(Block::make(0, 1));
+            }
+        }
+        Ok(data)
+    }
+}
+
+impl Default for LeakyDeltaOt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn send_pre(
+    state: &mut IknpSendState,
+    stream: &mut EmpStream,
+    length: usize,
+) -> Result<Vec<Block>> {
+    let mut out = Vec::with_capacity(length);
+    let mut done = 0;
+    while done + IKNP_BLOCK_SIZE <= length {
+        out.extend(send_pre_block(state, stream, IKNP_BLOCK_SIZE).await?);
+        done += IKNP_BLOCK_SIZE;
+    }
+    let remain = length - done;
+    if remain != 0 {
+        let block = send_pre_block(state, stream, remain).await?;
+        out.extend_from_slice(&block[..remain]);
+    }
+    Ok(out)
+}
+
+async fn send_pre_block(
+    state: &mut IknpSendState,
+    stream: &mut EmpStream,
+    len: usize,
+) -> Result<Vec<Block>> {
+    let local_block_size = round_up_128(len);
+    let row_bytes = local_block_size / 8;
+    let mut rows = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
+    for i in 0..IKNP_SECURITY_BITS {
+        let mut row = state.g0[i].random_data(row_bytes);
+        let received = stream.recv_data(row_bytes).await?;
+        if state.s[i] {
+            xor_bytes_in_place(&mut row, &received);
+        }
+        rows.extend_from_slice(&row);
+    }
+    Ok(transpose_128_rows(&rows, row_bytes, local_block_size))
+}
+
+async fn recv_pre(
+    state: &mut IknpRecvState,
+    stream: &mut EmpStream,
+    choices: &[bool],
+) -> Result<Vec<Block>> {
+    let mut choice_blocks = Vec::with_capacity(round_up_128(choices.len()) / IKNP_SECURITY_BITS);
+    for chunk in choices.chunks(IKNP_SECURITY_BITS) {
+        let mut padded = [false; IKNP_SECURITY_BITS];
+        padded[..chunk.len()].copy_from_slice(chunk);
+        choice_blocks.push(bool_to_block(&padded));
+    }
+
+    let mut out = Vec::with_capacity(choices.len());
+    let mut done = 0;
+    while done + IKNP_BLOCK_SIZE <= choices.len() {
+        out.extend(
+            recv_pre_block(
+                state,
+                stream,
+                &choice_blocks[done / IKNP_SECURITY_BITS..],
+                IKNP_BLOCK_SIZE,
+            )
+            .await?,
+        );
+        done += IKNP_BLOCK_SIZE;
+    }
+    let remain = choices.len() - done;
+    if remain != 0 {
+        let block = recv_pre_block(
+            state,
+            stream,
+            &choice_blocks[done / IKNP_SECURITY_BITS..],
+            remain,
+        )
+        .await?;
+        out.extend_from_slice(&block[..remain]);
+    }
+    Ok(out)
+}
+
+async fn recv_pre_block(
+    state: &mut IknpRecvState,
+    stream: &mut EmpStream,
+    r: &[Block],
+    len: usize,
+) -> Result<Vec<Block>> {
+    let local_block_size = round_up_128(len);
+    let blocks_per_row = local_block_size / IKNP_SECURITY_BITS;
+    let row_bytes = local_block_size / 8;
+    let mut rows = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
+    for i in 0..IKNP_SECURITY_BITS {
+        let row0 = state.g0[i].random_data(row_bytes);
+        let row1 = state.g1[i].random_data(row_bytes);
+        let mut message = vec![0u8; row_bytes];
+        for (j, r_block) in r.iter().enumerate().take(blocks_per_row) {
+            let start = j * BLOCK_BYTES;
+            let r_bytes = r_block.as_bytes();
+            for k in 0..BLOCK_BYTES {
+                message[start + k] = row0[start + k] ^ row1[start + k] ^ r_bytes[k];
+            }
+        }
+        stream.send_data(&message).await?;
+        rows.extend_from_slice(&row0);
+    }
+    Ok(transpose_128_rows(&rows, row_bytes, local_block_size))
+}
+
+fn validate_iknp_len(name: &'static str, len: usize) -> Result<()> {
+    if len == IKNP_SECURITY_BITS {
+        Ok(())
+    } else {
+        Err(CompatError::BadIknpSetupLength { name, len })
+    }
+}
+
+fn random_blocks(length: usize) -> Result<Vec<Block>> {
+    let mut out = Vec::with_capacity(length);
+    for _ in 0..length {
+        let mut bytes = [0u8; BLOCK_BYTES];
+        rand_bytes(&mut bytes)?;
+        out.push(Block::from_bytes(bytes));
+    }
+    Ok(out)
+}
+
+fn random_bools(length: usize) -> Result<Vec<bool>> {
+    let mut bytes = vec![0u8; length];
+    rand_bytes(&mut bytes)?;
+    Ok(bytes.into_iter().map(|byte| (byte & 1) != 0).collect())
+}
+
+fn random_bools_array() -> Result<[bool; IKNP_SECURITY_BITS]> {
+    let mut out = [false; IKNP_SECURITY_BITS];
+    for (dst, src) in out.iter_mut().zip(random_bools(IKNP_SECURITY_BITS)?) {
+        *dst = src;
+    }
+    Ok(out)
+}
+
+fn bool_to_block(bits: &[bool; IKNP_SECURITY_BITS]) -> Block {
+    let mut bytes = [0u8; BLOCK_BYTES];
+    for (i, bit) in bits.iter().enumerate() {
+        if *bit {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+    }
+    Block::from_bytes(bytes)
+}
+
+fn round_up_128(length: usize) -> usize {
+    length.div_ceil(IKNP_SECURITY_BITS) * IKNP_SECURITY_BITS
+}
+
+fn xor_bytes_in_place(dst: &mut [u8], rhs: &[u8]) {
+    for (dst, rhs) in dst.iter_mut().zip(rhs) {
+        *dst ^= rhs;
+    }
+}
+
+fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    let mut out = vec![Block::zero(); output_len];
+    for (col, out_block) in out.iter_mut().enumerate() {
+        let mut bytes = [0u8; BLOCK_BYTES];
+        let source_byte = col / 8;
+        let source_mask = 1 << (col % 8);
+        for row in 0..IKNP_SECURITY_BITS {
+            if (rows[row * row_bytes + source_byte] & source_mask) != 0 {
+                bytes[row / 8] |= 1 << (row % 8);
+            }
+        }
+        *out_block = Block::from_bytes(bytes);
+    }
+    out
+}
+
+fn leaky_delta_mask() -> Block {
+    Block::make(u64::MAX, u64::MAX - 1)
+}
+
 pub struct OtcoItem {
     pub i: usize,
     pub b_point: Vec<u8>,
@@ -474,6 +832,8 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     const LIVE_INTEROP_TIMEOUT: Duration = Duration::from_secs(60);
+    const LIVE_IKNP_LENGTH: usize = 2051;
+    const LIVE_LEAKY_LENGTH: usize = 257;
 
     #[derive(Clone, Copy, Debug)]
     enum TestTransport {
@@ -485,6 +845,12 @@ mod tests {
     enum TestOtRole {
         Send,
         Recv,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TestExtendedOt {
+        Iknp,
+        Leaky,
     }
 
     fn repo_root() -> PathBuf {
@@ -567,6 +933,20 @@ mod tests {
             .enumerate()
             .map(|(i, choice)| if choice { data1[i] } else { data0[i] })
             .collect()
+    }
+
+    fn iknp_choices(length: usize) -> Vec<bool> {
+        (0..length).map(|i| ((i * 7 + 3) % 11) < 5).collect()
+    }
+
+    fn leaky_send_choices() -> [bool; IKNP_SECURITY_BITS] {
+        // The recv-side choices intentionally differ across peers; the relation is choice-agnostic.
+        let mut out = [false; IKNP_SECURITY_BITS];
+        for (i, value) in out.iter_mut().enumerate() {
+            *value = ((i * 5 + 1) % 9) < 4;
+        }
+        out[0] = true;
+        out
     }
 
     #[test]
@@ -795,6 +1175,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_iknp_and_leaky_interop() {
+        let bin = cpp_iknp_probe();
+        for kind in [TestExtendedOt::Iknp, TestExtendedOt::Leaky] {
+            for transport in [TestTransport::Listen, TestTransport::Connect] {
+                run_live_extended_ot_case(&bin, kind, transport, TestOtRole::Send).await;
+                run_live_extended_ot_case(&bin, kind, transport, TestOtRole::Recv).await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rust_otco_accepts_zero_length_batch() {
         let port = free_port();
         let receiver = tokio::spawn(async move {
@@ -888,6 +1279,94 @@ mod tests {
         );
     }
 
+    async fn run_live_extended_ot_case(
+        bin: &Path,
+        kind: TestExtendedOt,
+        rust_transport: TestTransport,
+        rust_role: TestOtRole,
+    ) {
+        let port = free_port();
+        let cpp_transport = match rust_transport {
+            TestTransport::Listen => "connect",
+            TestTransport::Connect => "listen",
+        };
+        let cpp_role = match (kind, rust_role) {
+            (TestExtendedOt::Iknp, TestOtRole::Send) => "iknp-recv",
+            (TestExtendedOt::Iknp, TestOtRole::Recv) => "iknp-send",
+            (TestExtendedOt::Leaky, TestOtRole::Send) => "leaky-recv",
+            (TestExtendedOt::Leaky, TestOtRole::Recv) => "leaky-send",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role)
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(LIVE_INTEROP_TIMEOUT, open_stream(rust_transport, port)).await;
+        let mut stream = match stream_result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust extended OT stream open failed ({kind:?}, {rust_transport:?}, {rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust extended OT stream open timed out ({kind:?}, {rust_transport:?}, {rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let ot_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_extended_ot(&mut stream, kind, rust_role),
+        )
+        .await;
+        match ot_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust extended OT failed ({kind:?}, {rust_transport:?}, {rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust extended OT timed out ({kind:?}, {rust_transport:?}, {rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(stream);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ extended OT probe failed ({kind:?}, {rust_transport:?}, {rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -911,6 +1390,103 @@ mod tests {
         }
     }
 
+    async fn run_rust_extended_ot(
+        stream: &mut EmpStream,
+        kind: TestExtendedOt,
+        role: TestOtRole,
+    ) -> Result<()> {
+        match (kind, role) {
+            (TestExtendedOt::Iknp, TestOtRole::Send) => {
+                let mut iknp = Iknp::new();
+                let sender_data = iknp.send_cot(stream, LIVE_IKNP_LENGTH).await?;
+                let delta = iknp
+                    .delta()
+                    .ok_or(CompatError::IknpWrongRole("IKNP verification"))?;
+                send_sender_verification(stream, delta, &sender_data).await
+            }
+            (TestExtendedOt::Iknp, TestOtRole::Recv) => {
+                let choices = iknp_choices(LIVE_IKNP_LENGTH);
+                let mut iknp = Iknp::new();
+                let receiver_data = iknp.recv_cot(stream, &choices).await?;
+                let (delta, sender_data) =
+                    recv_sender_verification(stream, LIVE_IKNP_LENGTH).await?;
+                assert_iknp_relation(&receiver_data, &choices, delta, &sender_data);
+                Ok(())
+            }
+            (TestExtendedOt::Leaky, TestOtRole::Send) => {
+                let mut dot = LeakyDeltaOt::new();
+                dot.setup_send_with_choices(stream, &leaky_send_choices())
+                    .await?;
+                stream.flush().await?;
+                let sender_data = dot.send_dot(stream, LIVE_LEAKY_LENGTH).await?;
+                let delta = dot
+                    .delta()
+                    .ok_or(CompatError::IknpWrongRole("LeakyDeltaOT verification"))?;
+                send_sender_verification(stream, delta, &sender_data).await
+            }
+            (TestExtendedOt::Leaky, TestOtRole::Recv) => {
+                let mut dot = LeakyDeltaOt::new();
+                dot.setup_recv(stream).await?;
+                stream.flush().await?;
+                let receiver_data = dot.recv_dot(stream, LIVE_LEAKY_LENGTH).await?;
+                let (delta, sender_data) =
+                    recv_sender_verification(stream, LIVE_LEAKY_LENGTH).await?;
+                assert_leaky_relation(&receiver_data, delta, &sender_data);
+                Ok(())
+            }
+        }
+    }
+
+    async fn send_sender_verification(
+        stream: &mut EmpStream,
+        delta: Block,
+        sender_data: &[Block],
+    ) -> Result<()> {
+        stream.send_block(&[delta]).await?;
+        stream.send_block(sender_data).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_sender_verification(
+        stream: &mut EmpStream,
+        length: usize,
+    ) -> Result<(Block, Vec<Block>)> {
+        let delta = stream.recv_block(1).await?[0];
+        let sender_data = stream.recv_block(length).await?;
+        Ok((delta, sender_data))
+    }
+
+    fn assert_iknp_relation(
+        receiver_data: &[Block],
+        choices: &[bool],
+        delta: Block,
+        sender_data: &[Block],
+    ) {
+        assert_eq!(receiver_data.len(), choices.len());
+        assert_eq!(receiver_data.len(), sender_data.len());
+        for i in 0..receiver_data.len() {
+            let expected = if choices[i] {
+                sender_data[i].xor(delta)
+            } else {
+                sender_data[i]
+            };
+            assert_eq!(receiver_data[i], expected);
+        }
+    }
+
+    fn assert_leaky_relation(receiver_data: &[Block], delta: Block, sender_data: &[Block]) {
+        assert_eq!(receiver_data.len(), sender_data.len());
+        for i in 0..receiver_data.len() {
+            let expected = if receiver_data[i].get_lsb() {
+                sender_data[i].xor(delta)
+            } else {
+                sender_data[i]
+            };
+            assert_eq!(receiver_data[i], expected);
+        }
+    }
+
     fn cpp_otco_probe() -> PathBuf {
         let root = repo_root();
         let bin = root.join(".build/otco_probe");
@@ -925,6 +1501,24 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/otco_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_iknp_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/iknp_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/iknp_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/iknp_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/iknp_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

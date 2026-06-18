@@ -266,9 +266,14 @@ impl EmpStream {
     }
 
     pub async fn send_block(&mut self, blocks: &[Block]) -> Result<()> {
-        for block in blocks {
-            self.send_data(block.as_bytes()).await?;
+        if let [block] = blocks {
+            return self.send_data(block.as_bytes()).await;
         }
+        let mut bytes = Vec::with_capacity(blocks.len() * BLOCK_BYTES);
+        for block in blocks {
+            bytes.extend_from_slice(block.as_bytes());
+        }
+        self.send_data(&bytes).await?;
         Ok(())
     }
 

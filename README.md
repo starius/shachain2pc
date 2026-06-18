@@ -183,8 +183,8 @@ nix develop -c cargo test --manifest-path rust/Cargo.toml
 The Rust tests include live C++/Rust interop for the protocol layers and a
 Rust/Rust party E2E test for `I = 1` plus `I = 3` (multi-block chaining). Those
 real-circuit debug tests are intentionally expensive; on the current review
-machine the party crate's real-circuit test is roughly 8-10 minutes. For a
-faster optimized check, run the specific release test:
+machine the party crate's real-circuit test is roughly 5-6 minutes. For a faster
+optimized check, run the specific release test:
 
 ```sh
 nix develop -c cargo test --release --manifest-path rust/Cargo.toml \
@@ -195,15 +195,20 @@ The full `I = ffffffffffff` 48-block Rust party test exists but is ignored by
 default; the plaintext circuit verifier covers that index, but the full Rust MPC
 run has not yet been demonstrated end-to-end.
 
+Set `SHACHAIN2PC_PHASE_TIMING=1` on the Rust `party` processes to print phase
+timings to stderr without changing stdout's `RESULT <hex>` output.
+
 ## Scope and trade-offs
 
 - **2 parties, asymmetric roles** (party 1 = garbler/ALICE, party 2 =
   evaluator/BOB). Not threshold, not post-quantum.
 - **Rust v1 is a faithful compatibility port, not a performance port.** It
   preserves the EMP-compatible protocol and wire behavior and is cross-checked
-  against the C++ implementation, but it is currently much slower than the C++
-  engine for real SHA circuits. The future streaming / low-memory protocol work
-  belongs to a later version.
+  against the C++ implementation, but it is still slower than the C++ engine for
+  real SHA circuits. Current local release measurements: `I=1` Rust/Rust is
+  about 1.7s versus 0.43s for C++/C++; `I=3` Rust/Rust is about 4.6s versus
+  0.60s for C++/C++. The future streaming / low-memory protocol work belongs to
+  a later version.
 - **The cache optimization is dropped.** A semi-honest implementation can resume
   a derivation from a *secret-shared* intermediate checkpoint; doing that
   maliciously requires carrying **authenticated** shared state across circuits

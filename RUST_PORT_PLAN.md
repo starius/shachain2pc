@@ -49,7 +49,9 @@ but the MPC protocol logic must live in this repository.
 The original target was that Rust/Rust v1 should not be materially slower than
 the current C++ baseline. Current measurements do not meet that target: Rust v1
 is a faithful compatibility/correctness port, but real SHA-circuit performance
-is still future optimization work.
+is still future optimization work. After the first local optimization pass,
+release Rust/Rust measured about 1.7s for `I = 1` and 4.6s for `I = 3`, versus
+about 0.43s and 0.60s for C++/C++ on the same machine.
 
 Release-gate benchmark:
 

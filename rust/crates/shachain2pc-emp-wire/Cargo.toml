@@ -12,6 +12,7 @@ cpp-probes = []
 [dependencies]
 shachain2pc-types = { path = "../shachain2pc-types" }
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

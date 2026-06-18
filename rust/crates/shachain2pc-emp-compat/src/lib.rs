@@ -36,7 +36,18 @@ pub enum CompatError {
         key: usize,
     },
     BadC2pcCircuit(String),
+    BadC2pcInputLength {
+        expected: usize,
+        actual: usize,
+    },
+    C2pcInvalidMaskBit {
+        wire: usize,
+        value: u8,
+    },
     C2pcMaskMismatch(usize),
+    C2pcGarbledTableMismatch(usize),
+    C2pcOutputMacMismatch(usize),
+    C2pcOutputLabelMismatch(usize),
     CoinTossMismatch,
     FeqMismatch,
     LengthOverflow(&'static str),
@@ -74,8 +85,24 @@ impl fmt::Display for CompatError {
                 "Fpre generated data length mismatch: expected={expected}, mac={mac}, key={key}"
             ),
             Self::BadC2pcCircuit(msg) => write!(f, "bad C2PC circuit: {msg}"),
+            Self::BadC2pcInputLength { expected, actual } => write!(
+                f,
+                "C2PC online input length mismatch: expected={expected}, actual={actual}"
+            ),
+            Self::C2pcInvalidMaskBit { wire, value } => {
+                write!(f, "C2PC mask byte at wire {wire} is not a bit: {value}")
+            }
             Self::C2pcMaskMismatch(index) => {
                 write!(f, "C2PC input mask commitment mismatch at wire {index}")
+            }
+            Self::C2pcGarbledTableMismatch(index) => {
+                write!(f, "C2PC garbled-table row mismatch at AND gate {index}")
+            }
+            Self::C2pcOutputMacMismatch(index) => {
+                write!(f, "C2PC output MAC commitment mismatch at output {index}")
+            }
+            Self::C2pcOutputLabelMismatch(index) => {
+                write!(f, "C2PC output label commitment mismatch at output {index}")
             }
             Self::CoinTossMismatch => write!(f, "Fpre coin-toss commitment mismatch"),
             Self::FeqMismatch => write!(f, "Fpre equality check mismatch"),
@@ -1295,6 +1322,133 @@ impl C2pc {
         Ok(())
     }
 
+    pub async fn online(
+        &mut self,
+        streams: &mut EmpStreams,
+        input: &[u8],
+        alice_output: bool,
+    ) -> Result<Vec<u8>> {
+        let input_len = self.circuit.input_len();
+        if input.len() != input_len {
+            return Err(CompatError::BadC2pcInputLength {
+                expected: input_len,
+                actual: input.len(),
+            });
+        }
+
+        let mut mask_input = vec![0u8; self.circuit.num_wire];
+        match self.party {
+            Role::Alice => {
+                for i in self.circuit.n1..input_len {
+                    mask_input[i] = u8::from((input[i] != 0) != self.mac[i].get_lsb());
+                    mask_input[i] ^= self.mask[i];
+                }
+                let bob_mask = streams.main.recv_data(self.circuit.n1).await?;
+                mask_input[..self.circuit.n1].copy_from_slice(&bob_mask);
+                streams
+                    .main
+                    .send_data(&mask_input[self.circuit.n1..input_len])
+                    .await?;
+
+                for (i, bit) in mask_input.iter().copied().enumerate().take(input_len) {
+                    let mut label = self.labels[i];
+                    if Self::mask_bit(bit, i)? != 0 {
+                        label = label.xor(self.fpre.delta);
+                    }
+                    streams.main.send_block(&[label]).await?;
+                }
+
+                let out_start = self.output_start();
+                streams
+                    .main
+                    .send_partial_blocks(&self.mac[out_start..], C2PC_SSP_BYTES)
+                    .await?;
+            }
+            Role::Bob => {
+                for i in 0..self.circuit.n1 {
+                    mask_input[i] = u8::from((input[i] != 0) != self.mac[i].get_lsb());
+                    mask_input[i] ^= self.mask[i];
+                }
+                streams
+                    .main
+                    .send_data(&mask_input[..self.circuit.n1])
+                    .await?;
+                let alice_mask = streams.main.recv_data(self.circuit.n2).await?;
+                mask_input[self.circuit.n1..input_len].copy_from_slice(&alice_mask);
+                let input_labels = streams.main.recv_block(input_len).await?;
+                self.labels[..input_len].copy_from_slice(&input_labels);
+            }
+        }
+
+        if self.party == Role::Bob {
+            self.evaluate_garbled_circuit(&mut mask_input)?;
+        }
+
+        let mut output = vec![0u8; self.circuit.n3];
+        match self.party {
+            Role::Bob => {
+                let out_start = self.output_start();
+                let output_macs = streams
+                    .main
+                    .recv_partial_blocks(self.circuit.n3, C2PC_SSP_BYTES)
+                    .await?;
+                for (i, received) in output_macs.iter().copied().enumerate() {
+                    let wire = out_start + i;
+                    let bit = self.resolve_online_output_bit(i, wire, received)?;
+                    output[i] = bit
+                        ^ Self::mask_bit(mask_input[wire], wire)?
+                        ^ u8::from(self.mac[wire].get_lsb());
+                }
+                if alice_output {
+                    streams
+                        .main
+                        .send_partial_blocks(&self.mac[out_start..], C2PC_SSP_BYTES)
+                        .await?;
+                    streams
+                        .main
+                        .send_partial_blocks(&self.labels[out_start..], C2PC_SSP_BYTES)
+                        .await?;
+                    streams
+                        .main
+                        .send_data(&mask_input[out_start..out_start + self.circuit.n3])
+                        .await?;
+                    streams.main.flush().await?;
+                }
+            }
+            Role::Alice => {
+                if alice_output {
+                    let out_start = self.output_start();
+                    let output_macs = streams
+                        .main
+                        .recv_partial_blocks(self.circuit.n3, C2PC_SSP_BYTES)
+                        .await?;
+                    let output_labels = streams
+                        .main
+                        .recv_partial_blocks(self.circuit.n3, C2PC_SSP_BYTES)
+                        .await?;
+                    let output_masks = streams.main.recv_data(self.circuit.n3).await?;
+                    streams.main.flush().await?;
+                    for i in 0..self.circuit.n3 {
+                        let wire = out_start + i;
+                        let bit = self.resolve_online_output_bit(i, wire, output_macs[i])?;
+                        let mut label = output_labels[i];
+                        let output_mask = Self::mask_bit(output_masks[i], wire)?;
+                        if output_mask != 0 {
+                            label = label.xor(self.fpre.delta);
+                        }
+                        let label = label.and(c2pc_mask());
+                        let expected = self.labels[wire].and(c2pc_mask());
+                        if label != expected {
+                            return Err(CompatError::C2pcOutputLabelMismatch(i));
+                        }
+                        output[i] = bit ^ output_mask ^ u8::from(self.mac[wire].get_lsb());
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
     pub fn party(&self) -> Role {
         self.party
     }
@@ -1373,6 +1527,63 @@ impl C2pc {
         self.circuit.num_ands() * 3
     }
 
+    fn output_start(&self) -> usize {
+        self.circuit.num_wire - self.circuit.n3
+    }
+
+    fn mask_bit(value: u8, wire: usize) -> Result<u8> {
+        match value {
+            0 | 1 => Ok(value),
+            _ => Err(CompatError::C2pcInvalidMaskBit { wire, value }),
+        }
+    }
+
+    fn evaluate_garbled_circuit(&mut self, mask_input: &mut [u8]) -> Result<()> {
+        let mut and_index = 0;
+        for (gate_index, gate) in self.circuit.gates.iter().enumerate() {
+            match gate.typ {
+                C2pcGateType::Xor => {
+                    self.labels[gate.out] = self.labels[gate.in0].xor(self.labels[gate.in1]);
+                    mask_input[gate.out] = Self::mask_bit(mask_input[gate.in0], gate.in0)?
+                        ^ Self::mask_bit(mask_input[gate.in1], gate.in1)?;
+                }
+                C2pcGateType::Inv => {
+                    mask_input[gate.out] =
+                        u8::from(Self::mask_bit(mask_input[gate.in0], gate.in0)? == 0);
+                    self.labels[gate.out] = self.labels[gate.in0];
+                }
+                C2pcGateType::And => {
+                    let row = 2 * usize::from(Self::mask_bit(mask_input[gate.in0], gate.in0)?)
+                        + usize::from(Self::mask_bit(mask_input[gate.in1], gate.in1)?);
+                    let hash = garble_hash_online(
+                        self.labels[gate.in0],
+                        self.labels[gate.in1],
+                        gate_index as u64,
+                        row as u64,
+                    );
+                    let row0 = self.gt[and_index][row][0].xor(hash[0]).and(c2pc_mask());
+                    let row1 = self.gt[and_index][row][1].xor(hash[1]);
+                    let key = self.gtk[and_index][row].and(c2pc_mask());
+                    let key_delta = self.gtk[and_index][row]
+                        .xor(self.fpre.delta)
+                        .and(c2pc_mask());
+                    let mut bit = if row0 == key {
+                        0
+                    } else if row0 == key_delta {
+                        1
+                    } else {
+                        return Err(CompatError::C2pcGarbledTableMismatch(and_index));
+                    };
+                    bit ^= u8::from(self.gtm[and_index][row].get_lsb());
+                    mask_input[gate.out] = bit;
+                    self.labels[gate.out] = row1.xor(self.gtm[and_index][row]);
+                    and_index += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn and_row_masks(&self, gate: &C2pcGate, and_index: usize) -> ([Block; 4], [Block; 4]) {
         let mut m = [Block::zero(); 4];
         m[0] = self.sigma_mac[and_index].xor(self.mac[gate.out]);
@@ -1429,6 +1640,24 @@ impl C2pc {
             Ok(1)
         } else {
             Err(CompatError::C2pcMaskMismatch(index))
+        }
+    }
+
+    fn resolve_online_output_bit(
+        &self,
+        output_index: usize,
+        wire_index: usize,
+        received: Block,
+    ) -> Result<u8> {
+        let received = received.and(c2pc_mask());
+        let key = self.key[wire_index].and(c2pc_mask());
+        let key_delta = self.key[wire_index].xor(self.fpre.delta).and(c2pc_mask());
+        if received == key {
+            Ok(0)
+        } else if received == key_delta {
+            Ok(1)
+        } else {
+            Err(CompatError::C2pcOutputMacMismatch(output_index))
         }
     }
 }
@@ -2196,6 +2425,14 @@ mod tests {
         }
     }
 
+    fn c2pc_test_input() -> [u8; 5] {
+        [1, 0, 1, 1, 1]
+    }
+
+    fn c2pc_expected_output() -> [u8; 1] {
+        [1]
+    }
+
     #[test]
     fn emp_hash_fixture_matches_cpp() {
         for record in fixture_records()
@@ -2492,6 +2729,14 @@ mod tests {
         let bin = cpp_c2pc_dependent_probe();
         run_live_c2pc_dependent_case(&bin, Role::Alice).await;
         run_live_c2pc_dependent_case(&bin, Role::Bob).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_c2pc_online_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_c2pc_online_probe();
+        run_live_c2pc_online_case(&bin, Role::Alice).await;
+        run_live_c2pc_online_case(&bin, Role::Bob).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3218,6 +3463,88 @@ mod tests {
         );
     }
 
+    async fn run_live_c2pc_online_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let cpp_transport = match rust_role {
+            Role::Alice => "connect",
+            Role::Bob => "listen",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role.party_id().to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(
+            LIVE_C2PC_TIMEOUT,
+            EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC online stream open failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC online stream open timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let online_result = timeout(
+            LIVE_C2PC_TIMEOUT,
+            run_rust_c2pc_online(&mut streams, rust_role),
+        )
+        .await;
+        match online_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC online failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC online timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(streams);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ C2PC online probe failed ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -3540,6 +3867,29 @@ mod tests {
         assert_fpre_generate_relation(c2pc.wire_mac(), remote_delta, &remote_key);
         assert_fpre_generate_relation(c2pc.sigma_mac(), remote_delta, &remote_sigma_key);
         assert_eq!(local_table, remote_table);
+        Ok(())
+    }
+
+    async fn run_rust_c2pc_online(streams: &mut EmpStreams, role: Role) -> Result<()> {
+        let circuit = C2pcCircuit::from_circuit(&c2pc_test_circuit())?;
+        let mut c2pc = C2pc::new(streams, role, circuit).await?;
+        c2pc.function_independent(streams).await?;
+        c2pc.function_dependent(streams).await?;
+        let output = c2pc.online(streams, &c2pc_test_input(), true).await?;
+        assert_eq!(output, c2pc_expected_output());
+        match role {
+            Role::Alice => {
+                streams.main.send_data(&output).await?;
+                let remote = streams.main.recv_data(c2pc.circuit().output_len()).await?;
+                assert_eq!(remote, output);
+            }
+            Role::Bob => {
+                let remote = streams.main.recv_data(c2pc.circuit().output_len()).await?;
+                streams.main.send_data(&output).await?;
+                assert_eq!(remote, output);
+            }
+        }
+        streams.main.flush().await?;
         Ok(())
     }
 
@@ -3959,6 +4309,24 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/c2pc_dependent_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_c2pc_online_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/c2pc_online_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/c2pc_online_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/c2pc_online_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/c2pc_online_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

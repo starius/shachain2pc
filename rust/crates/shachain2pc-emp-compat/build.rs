@@ -10,6 +10,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../../tools/fpre_generate_probe.cpp");
     println!("cargo:rerun-if-changed=../../../tools/fpre_check_probe.cpp");
     println!("cargo:rerun-if-changed=../../../tools/fpre_refill_probe.cpp");
+    println!("cargo:rerun-if-changed=../../../tools/c2pc_independent_probe.cpp");
     println!("cargo:rerun-if-env-changed=SHACHAIN2PC_BUILD_CPP_PROBES");
 
     if env::var_os("CARGO_FEATURE_CPP_PROBES").is_none()
@@ -31,6 +32,7 @@ fn build_cpp_probe() {
         ".build/fpre_generate_probe",
         ".build/fpre_check_probe",
         ".build/fpre_refill_probe",
+        ".build/c2pc_independent_probe",
     ] {
         let status = Command::new("make")
             .arg(target)

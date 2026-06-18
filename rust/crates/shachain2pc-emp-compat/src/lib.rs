@@ -6,6 +6,7 @@ use openssl::error::ErrorStack;
 use openssl::nid::Nid;
 use openssl::rand::rand_bytes;
 use sha2::{Digest, Sha256};
+use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
 use shachain2pc_types::Role;
 use std::fmt;
@@ -33,6 +34,7 @@ pub enum CompatError {
         mac: usize,
         key: usize,
     },
+    BadC2pcCircuit(String),
     CoinTossMismatch,
     FeqMismatch,
     LengthOverflow(&'static str),
@@ -69,6 +71,7 @@ impl fmt::Display for CompatError {
                 f,
                 "Fpre generated data length mismatch: expected={expected}, mac={mac}, key={key}"
             ),
+            Self::BadC2pcCircuit(msg) => write!(f, "bad C2PC circuit: {msg}"),
             Self::CoinTossMismatch => write!(f, "Fpre coin-toss commitment mismatch"),
             Self::FeqMismatch => write!(f, "Fpre equality check mismatch"),
             Self::LengthOverflow(name) => write!(f, "{name} length overflow"),
@@ -150,10 +153,9 @@ impl Prg {
         for (dst, src) in key[..8].iter_mut().zip(id.to_le_bytes()) {
             *dst ^= src;
         }
-        Self {
-            prp: Prp::new(Block::from_bytes(key)),
-            counter: 0,
-        }
+        let prp = Prp::new(Block::from_bytes(key));
+        key.zeroize();
+        Self { prp, counter: 0 }
     }
 
     pub fn random() -> Result<Self> {
@@ -189,6 +191,12 @@ impl Prg {
             .into_iter()
             .map(|byte| (byte & 1) != 0)
             .collect()
+    }
+}
+
+impl Drop for Prg {
+    fn drop(&mut self) {
+        self.counter.zeroize();
     }
 }
 
@@ -434,6 +442,21 @@ struct IknpRecvState {
     g1: Vec<Prg>,
 }
 
+impl Drop for IknpSendState {
+    fn drop(&mut self) {
+        self.s.fill(false);
+        self.delta.zeroize();
+        self.g0.clear();
+    }
+}
+
+impl Drop for IknpRecvState {
+    fn drop(&mut self) {
+        self.g0.clear();
+        self.g1.clear();
+    }
+}
+
 pub struct Iknp {
     send: Option<IknpSendState>,
     recv: Option<IknpRecvState>,
@@ -638,10 +661,25 @@ pub struct FpreGenerated {
     pub key: Vec<Block>,
 }
 
+impl FpreGenerated {
+    pub fn into_parts(mut self) -> (Vec<Block>, Vec<Block>) {
+        (std::mem::take(&mut self.mac), std::mem::take(&mut self.key))
+    }
+}
+
 impl Drop for FpreGenerated {
     fn drop(&mut self) {
         self.mac.zeroize();
         self.key.zeroize();
+    }
+}
+
+impl Drop for Fpre {
+    fn drop(&mut self) {
+        self.delta.zeroize();
+        self.z_delta.zeroize();
+        self.coin_prg_seed.zeroize();
+        self.eq = [Sha256::new(), Sha256::new()];
     }
 }
 
@@ -913,6 +951,259 @@ impl Fpre {
         } else {
             Err(CompatError::FeqMismatch)
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct C2pcCircuit {
+    num_wire: usize,
+    n1: usize,
+    n2: usize,
+    n3: usize,
+    gates: Vec<C2pcGate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct C2pcGate {
+    typ: C2pcGateType,
+    in0: usize,
+    in1: usize,
+    out: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum C2pcGateType {
+    And,
+    Xor,
+    Inv,
+}
+
+impl C2pcCircuit {
+    pub fn from_circuit(circuit: &Circuit) -> Result<Self> {
+        let num_wire = checked_nonnegative("num_wire", circuit.num_wire)?;
+        let n1 = checked_nonnegative("n1", circuit.n1)?;
+        let n2 = checked_nonnegative("n2", circuit.n2)?;
+        let n3 = checked_nonnegative("n3", circuit.n3)?;
+        if num_wire == 0 || n1 + n2 > num_wire || n3 > num_wire {
+            return Err(CompatError::BadC2pcCircuit(
+                "inconsistent circuit header".to_owned(),
+            ));
+        }
+
+        let mut gates = Vec::with_capacity(circuit.gates.len());
+        for gate in &circuit.gates {
+            let typ = match gate.typ {
+                GateType::And => C2pcGateType::And,
+                GateType::Xor => C2pcGateType::Xor,
+                GateType::Inv => C2pcGateType::Inv,
+            };
+            let in0 = checked_wire("in0", gate.in0, num_wire)?;
+            let in1 = if typ == C2pcGateType::Inv {
+                0
+            } else {
+                checked_wire("in1", gate.in1, num_wire)?
+            };
+            let out = checked_wire("out", gate.out, num_wire)?;
+            gates.push(C2pcGate { typ, in0, in1, out });
+        }
+
+        Ok(Self {
+            num_wire,
+            n1,
+            n2,
+            n3,
+            gates,
+        })
+    }
+
+    pub fn input_len(&self) -> usize {
+        self.n1 + self.n2
+    }
+
+    pub fn output_len(&self) -> usize {
+        self.n3
+    }
+
+    pub fn num_ands(&self) -> usize {
+        self.gates
+            .iter()
+            .filter(|gate| gate.typ == C2pcGateType::And)
+            .count()
+    }
+
+    pub fn total_pre(&self) -> usize {
+        self.input_len() + self.num_ands()
+    }
+}
+
+pub struct C2pc {
+    party: Role,
+    circuit: C2pcCircuit,
+    fpre: Fpre,
+    mac: Vec<Block>,
+    key: Vec<Block>,
+    preprocess_mac: Vec<Block>,
+    preprocess_key: Vec<Block>,
+    ands_mac: Vec<Block>,
+    ands_key: Vec<Block>,
+    sigma_mac: Vec<Block>,
+    sigma_key: Vec<Block>,
+    labels: Vec<Block>,
+    mask: Vec<u8>,
+}
+
+impl C2pc {
+    pub async fn new(streams: &mut EmpStreams, party: Role, circuit: C2pcCircuit) -> Result<Self> {
+        let num_ands = circuit.num_ands();
+        let total_pre = circuit.total_pre();
+        let fpre = Fpre::setup(streams, party, num_ands).await?;
+        Ok(Self {
+            party,
+            mac: vec![Block::zero(); circuit.num_wire],
+            key: vec![Block::zero(); circuit.num_wire],
+            preprocess_mac: vec![Block::zero(); total_pre],
+            preprocess_key: vec![Block::zero(); total_pre],
+            ands_mac: vec![Block::zero(); num_ands * 3],
+            ands_key: vec![Block::zero(); num_ands * 3],
+            sigma_mac: vec![Block::zero(); num_ands],
+            sigma_key: vec![Block::zero(); num_ands],
+            labels: vec![Block::zero(); circuit.num_wire],
+            mask: vec![0; circuit.input_len()],
+            circuit,
+            fpre,
+        })
+    }
+
+    pub async fn function_independent(&mut self, streams: &mut EmpStreams) -> Result<()> {
+        if self.party == Role::Alice {
+            self.labels = random_blocks(self.circuit.num_wire)?;
+        }
+
+        self.ands_mac.clear();
+        self.ands_key.clear();
+        let ands_len = self.ands_block_len();
+        let mut first_refill = true;
+        while first_refill || self.ands_mac.len() < ands_len {
+            first_refill = false;
+            let (mut batch_mac, mut batch_key) = self.fpre.refill(streams).await?.into_parts();
+            let take = (ands_len - self.ands_mac.len()).min(batch_mac.len());
+            self.ands_mac.extend_from_slice(&batch_mac[..take]);
+            self.ands_key.extend_from_slice(&batch_key[..take]);
+            batch_mac.zeroize();
+            batch_key.zeroize();
+        }
+
+        let total_pre = self.circuit.total_pre();
+        let (preprocess_key, preprocess_mac) = match self.party {
+            Role::Alice => {
+                let key = self
+                    .fpre
+                    .abit1
+                    .send_dot(&mut streams.fpre_io0, total_pre)
+                    .await?;
+                let mac = self
+                    .fpre
+                    .abit2
+                    .recv_dot(&mut streams.fpre_io2_0, total_pre)
+                    .await?;
+                (key, mac)
+            }
+            Role::Bob => {
+                let mac = self
+                    .fpre
+                    .abit1
+                    .recv_dot(&mut streams.fpre_io0, total_pre)
+                    .await?;
+                let key = self
+                    .fpre
+                    .abit2
+                    .send_dot(&mut streams.fpre_io2_0, total_pre)
+                    .await?;
+                (key, mac)
+            }
+        };
+        self.preprocess_key = preprocess_key;
+        self.preprocess_mac = preprocess_mac;
+
+        let input_len = self.circuit.input_len();
+        self.key[..input_len].copy_from_slice(&self.preprocess_key[..input_len]);
+        self.mac[..input_len].copy_from_slice(&self.preprocess_mac[..input_len]);
+        Ok(())
+    }
+
+    pub fn party(&self) -> Role {
+        self.party
+    }
+
+    pub fn delta(&self) -> Block {
+        self.fpre.delta()
+    }
+
+    pub fn circuit(&self) -> &C2pcCircuit {
+        &self.circuit
+    }
+
+    pub fn input_mac(&self) -> &[Block] {
+        &self.mac[..self.circuit.input_len()]
+    }
+
+    pub fn input_key(&self) -> &[Block] {
+        &self.key[..self.circuit.input_len()]
+    }
+
+    pub fn preprocess_mac(&self) -> &[Block] {
+        &self.preprocess_mac
+    }
+
+    pub fn preprocess_key(&self) -> &[Block] {
+        &self.preprocess_key
+    }
+
+    pub fn ands_mac(&self) -> &[Block] {
+        &self.ands_mac[..self.ands_block_len()]
+    }
+
+    pub fn ands_key(&self) -> &[Block] {
+        &self.ands_key[..self.ands_block_len()]
+    }
+
+    fn ands_block_len(&self) -> usize {
+        self.circuit.num_ands() * 3
+    }
+}
+
+impl Drop for C2pc {
+    fn drop(&mut self) {
+        self.mac.zeroize();
+        self.key.zeroize();
+        self.preprocess_mac.zeroize();
+        self.preprocess_key.zeroize();
+        self.ands_mac.zeroize();
+        self.ands_key.zeroize();
+        self.sigma_mac.zeroize();
+        self.sigma_key.zeroize();
+        self.labels.zeroize();
+        self.mask.zeroize();
+    }
+}
+
+fn checked_nonnegative(name: &'static str, value: i32) -> Result<usize> {
+    if value < 0 {
+        Err(CompatError::BadC2pcCircuit(format!(
+            "{name} must be nonnegative"
+        )))
+    } else {
+        Ok(value as usize)
+    }
+}
+
+fn checked_wire(name: &'static str, wire: i32, num_wire: usize) -> Result<usize> {
+    if wire < 0 || wire as usize >= num_wire {
+        Err(CompatError::BadC2pcCircuit(format!(
+            "{name} wire {wire} out of range 0..{num_wire}"
+        )))
+    } else {
+        Ok(wire as usize)
     }
 }
 
@@ -1454,6 +1745,7 @@ fn point_bytes(group: &EcGroup, point: &EcPointRef, ctx: &mut BigNumContext) -> 
 mod tests {
     use super::*;
     use serde_json::Value;
+    use shachain2pc_circuit::Gate;
     use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -1461,6 +1753,7 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     const LIVE_INTEROP_TIMEOUT: Duration = Duration::from_secs(60);
+    const LIVE_C2PC_TIMEOUT: Duration = Duration::from_secs(120);
     const LIVE_IKNP_LENGTH: usize = 2051;
     const LIVE_LEAKY_LENGTH: usize = 257;
     const LIVE_FPRE_REQUESTED_SIZE: usize = 321;
@@ -1594,6 +1887,35 @@ mod tests {
         match role {
             Role::Alice => Role::Bob,
             Role::Bob => Role::Alice,
+        }
+    }
+
+    fn c2pc_test_circuit() -> Circuit {
+        Circuit {
+            num_wire: 8,
+            n1: 3,
+            n2: 2,
+            n3: 1,
+            gates: vec![
+                Gate {
+                    typ: GateType::And,
+                    in0: 0,
+                    in1: 3,
+                    out: 5,
+                },
+                Gate {
+                    typ: GateType::Xor,
+                    in0: 1,
+                    in1: 4,
+                    out: 6,
+                },
+                Gate {
+                    typ: GateType::And,
+                    in0: 5,
+                    in1: 6,
+                    out: 7,
+                },
+            ],
         }
     }
 
@@ -1876,6 +2198,15 @@ mod tests {
         run_live_fpre_refill_case(&bin, Role::Alice, false).await;
         run_live_fpre_refill_case(&bin, Role::Bob, false).await;
         run_live_fpre_refill_case(&bin, Role::Alice, true).await;
+        run_live_fpre_refill_case(&bin, Role::Bob, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_c2pc_function_independent_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_c2pc_independent_probe();
+        run_live_c2pc_independent_case(&bin, Role::Alice).await;
+        run_live_c2pc_independent_case(&bin, Role::Bob).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2091,7 +2422,7 @@ mod tests {
             .unwrap();
 
         let stream_result = timeout(
-            LIVE_INTEROP_TIMEOUT,
+            LIVE_C2PC_TIMEOUT,
             EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
         )
         .await;
@@ -2438,6 +2769,88 @@ mod tests {
         }
     }
 
+    async fn run_live_c2pc_independent_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let cpp_transport = match rust_role {
+            Role::Alice => "connect",
+            Role::Bob => "listen",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role.party_id().to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC independent stream open failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC independent stream open timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let independent_result = timeout(
+            LIVE_C2PC_TIMEOUT,
+            run_rust_c2pc_independent(&mut streams, rust_role),
+        )
+        .await;
+        match independent_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC independent failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust C2PC independent timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(streams);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ C2PC independent probe failed ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -2644,6 +3057,72 @@ mod tests {
         Ok(())
     }
 
+    async fn run_rust_c2pc_independent(streams: &mut EmpStreams, role: Role) -> Result<()> {
+        let circuit = C2pcCircuit::from_circuit(&c2pc_test_circuit())?;
+        assert_eq!(circuit.input_len(), 5);
+        assert_eq!(circuit.output_len(), 1);
+        assert_eq!(circuit.num_ands(), 2);
+        assert_eq!(circuit.total_pre(), 7);
+
+        let mut c2pc = C2pc::new(streams, role, circuit).await?;
+        c2pc.function_independent(streams).await?;
+        assert_eq!(c2pc.party(), role);
+        assert_eq!(c2pc.input_mac().len(), c2pc.circuit().input_len());
+        assert_eq!(c2pc.input_key().len(), c2pc.circuit().input_len());
+        assert_eq!(c2pc.preprocess_mac().len(), c2pc.circuit().total_pre());
+        assert_eq!(c2pc.preprocess_key().len(), c2pc.circuit().total_pre());
+        assert_eq!(c2pc.ands_mac().len(), c2pc.circuit().num_ands() * 3);
+        assert_eq!(c2pc.ands_key().len(), c2pc.circuit().num_ands() * 3);
+
+        let local_ands_bits = fpre_mac_bits(c2pc.ands_mac());
+        let (remote_delta, remote_input_key, remote_preprocess_key, remote_ands_key, remote_bits) =
+            match role {
+                Role::Alice => {
+                    send_c2pc_independent_verification(
+                        &mut streams.main,
+                        c2pc.delta(),
+                        c2pc.input_key(),
+                        c2pc.preprocess_key(),
+                        c2pc.ands_key(),
+                        &local_ands_bits,
+                    )
+                    .await?;
+                    recv_c2pc_independent_verification(
+                        &mut streams.main,
+                        c2pc.circuit().input_len(),
+                        c2pc.circuit().total_pre(),
+                        c2pc.circuit().num_ands() * 3,
+                    )
+                    .await?
+                }
+                Role::Bob => {
+                    let remote = recv_c2pc_independent_verification(
+                        &mut streams.main,
+                        c2pc.circuit().input_len(),
+                        c2pc.circuit().total_pre(),
+                        c2pc.circuit().num_ands() * 3,
+                    )
+                    .await?;
+                    send_c2pc_independent_verification(
+                        &mut streams.main,
+                        c2pc.delta(),
+                        c2pc.input_key(),
+                        c2pc.preprocess_key(),
+                        c2pc.ands_key(),
+                        &local_ands_bits,
+                    )
+                    .await?;
+                    remote
+                }
+            };
+
+        assert_fpre_generate_relation(c2pc.input_mac(), remote_delta, &remote_input_key);
+        assert_fpre_generate_relation(c2pc.preprocess_mac(), remote_delta, &remote_preprocess_key);
+        assert_fpre_generate_relation(c2pc.ands_mac(), remote_delta, &remote_ands_key);
+        assert_fpre_triple_relation(&local_ands_bits, &remote_bits);
+        Ok(())
+    }
+
     fn fpre_verification(fpre: &Fpre) -> FpreVerification {
         let params = fpre.params();
         FpreVerification {
@@ -2758,6 +3237,37 @@ mod tests {
         let key = stream.recv_block(length).await?;
         let mac_bits = stream.recv_data(length).await?;
         Ok((delta, key, mac_bits))
+    }
+
+    async fn send_c2pc_independent_verification(
+        stream: &mut EmpStream,
+        delta: Block,
+        input_key: &[Block],
+        preprocess_key: &[Block],
+        ands_key: &[Block],
+        ands_bits: &[u8],
+    ) -> Result<()> {
+        stream.send_block(&[delta]).await?;
+        stream.send_block(input_key).await?;
+        stream.send_block(preprocess_key).await?;
+        stream.send_block(ands_key).await?;
+        stream.send_data(ands_bits).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_c2pc_independent_verification(
+        stream: &mut EmpStream,
+        input_len: usize,
+        total_pre: usize,
+        ands_len: usize,
+    ) -> Result<(Block, Vec<Block>, Vec<Block>, Vec<Block>, Vec<u8>)> {
+        let delta = stream.recv_block(1).await?[0];
+        let input_key = stream.recv_block(input_len).await?;
+        let preprocess_key = stream.recv_block(total_pre).await?;
+        let ands_key = stream.recv_block(ands_len).await?;
+        let ands_bits = stream.recv_data(ands_len).await?;
+        Ok((delta, input_key, preprocess_key, ands_key, ands_bits))
     }
 
     fn assert_fpre_delta_bits(delta: Block, role: Role) {
@@ -2959,6 +3469,27 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/fpre_refill_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_c2pc_independent_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/c2pc_independent_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/c2pc_independent_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "failed to build .build/c2pc_independent_probe"
+            );
+        }
+        assert!(
+            bin.exists(),
+            ".build/c2pc_independent_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

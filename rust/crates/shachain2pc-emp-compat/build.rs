@@ -5,6 +5,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=../../../Makefile");
     println!("cargo:rerun-if-changed=../../../tools/otco_probe.cpp");
+    println!("cargo:rerun-if-changed=../../../tools/iknp_probe.cpp");
     println!("cargo:rerun-if-env-changed=SHACHAIN2PC_BUILD_CPP_PROBES");
 
     if env::var_os("CARGO_FEATURE_CPP_PROBES").is_none()
@@ -19,10 +20,12 @@ fn main() {
 fn build_cpp_probe() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest_dir.join("../../..");
-    let status = Command::new("make")
-        .arg(".build/otco_probe")
-        .current_dir(&repo_root)
-        .status()
-        .expect("failed to run make .build/otco_probe");
-    assert!(status.success(), "failed to build .build/otco_probe");
+    for target in [".build/otco_probe", ".build/iknp_probe"] {
+        let status = Command::new("make")
+            .arg(target)
+            .current_dir(&repo_root)
+            .status()
+            .unwrap_or_else(|_| panic!("failed to run make {target}"));
+        assert!(status.success(), "failed to build {target}");
+    }
 }

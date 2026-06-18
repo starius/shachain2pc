@@ -50,6 +50,14 @@ impl Block {
         Self(out)
     }
 
+    pub fn and(self, rhs: Self) -> Self {
+        let mut out = [0u8; BLOCK_BYTES];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = self.0[i] & rhs.0[i];
+        }
+        Self(out)
+    }
+
     pub fn sigma(self) -> Self {
         let low = self.low64();
         let high = self.high64();

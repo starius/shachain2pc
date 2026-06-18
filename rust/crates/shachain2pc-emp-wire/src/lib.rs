@@ -219,6 +219,16 @@ impl EmpStream {
         Ok(Self { stream, counter: 0 })
     }
 
+    pub async fn listen(port: u16) -> Result<Self> {
+        let listener =
+            TcpListener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)).await?;
+        accept_emp(&listener).await
+    }
+
+    pub async fn connect(peer_ip: IpAddr, port: u16) -> Result<Self> {
+        connect_emp(SocketAddr::new(peer_ip, port)).await
+    }
+
     pub fn counter(&self) -> u64 {
         self.counter
     }

@@ -29,7 +29,7 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
               $(BUILD)/probe_convention $(BUILD)/tamper_circuit
 # Targets that link the emp MPC engine.
 EMP_BINS := $(BUILD)/party $(BUILD)/measure_io $(BUILD)/compat_probe \
-            $(BUILD)/emp_wire_probe
+            $(BUILD)/emp_wire_probe $(BUILD)/otco_probe
 
 .PHONY: all plain mpc clean test demo cheat compat-probe
 all: plain mpc
@@ -70,7 +70,12 @@ $(BUILD)/emp_wire_probe: tools/emp_wire_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/emp_wire_probe.cpp \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
-test: $(BUILD)/ref_kat $(BUILD)/verify_circuit $(BUILD)/emp_wire_probe
+$(BUILD)/otco_probe: tools/otco_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/otco_probe.cpp \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
+test: $(BUILD)/ref_kat $(BUILD)/verify_circuit $(BUILD)/emp_wire_probe \
+      $(BUILD)/otco_probe
 	./$(BUILD)/ref_kat
 	./$(BUILD)/verify_circuit
 

@@ -314,6 +314,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shachain2pc-party"
+version = "0.1.0"
+dependencies = [
+ "shachain2pc-circuit",
+ "shachain2pc-emp-compat",
+ "shachain2pc-emp-wire",
+ "shachain2pc-types",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "shachain2pc-types"
 version = "0.1.0"
 

@@ -6,13 +6,15 @@ use openssl::error::ErrorStack;
 use openssl::nid::Nid;
 use openssl::rand::rand_bytes;
 use sha2::{Digest, Sha256};
-use shachain2pc_emp_wire::{Block, EmpStream, WireError, BLOCK_BYTES};
+use shachain2pc_emp_wire::{Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
+use shachain2pc_types::Role;
 use std::fmt;
 
 pub const HASH_DIGEST_BYTES: usize = 32;
 pub const POINT_BYTES: usize = 65;
 pub const IKNP_SECURITY_BITS: usize = 128;
 pub const IKNP_BLOCK_SIZE: usize = 2048;
+pub const FPRE_THREADS: usize = 1;
 
 #[derive(Debug)]
 pub enum CompatError {
@@ -24,6 +26,7 @@ pub enum CompatError {
         data0: usize,
         data1: usize,
     },
+    MissingDelta(&'static str),
     BadIknpSetupLength {
         name: &'static str,
         len: usize,
@@ -49,6 +52,7 @@ impl fmt::Display for CompatError {
             Self::BadOtLength { data0, data1 } => {
                 write!(f, "OTCO data length mismatch: data0={data0}, data1={data1}")
             }
+            Self::MissingDelta(name) => write!(f, "{name} setup did not produce Delta"),
             Self::BadIknpSetupLength { name, len } => {
                 write!(
                     f,
@@ -561,6 +565,114 @@ impl Default for LeakyDeltaOt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FpreParams {
+    pub batch_size: usize,
+    pub bucket_size: usize,
+    pub permute_batch_size: Option<usize>,
+}
+
+impl FpreParams {
+    pub fn for_size(size: usize) -> Self {
+        let size = size.max(320);
+        let batch_size = size.div_ceil(2 * FPRE_THREADS) * FPRE_THREADS * 2;
+        if batch_size >= 280_000 {
+            Self {
+                batch_size,
+                bucket_size: 3,
+                permute_batch_size: Some(280_000),
+            }
+        } else if batch_size >= 3_100 {
+            Self {
+                batch_size,
+                bucket_size: 4,
+                permute_batch_size: Some(3_100),
+            }
+        } else {
+            Self {
+                batch_size,
+                bucket_size: 5,
+                permute_batch_size: None,
+            }
+        }
+    }
+}
+
+pub struct Fpre {
+    party: Role,
+    abit1: LeakyDeltaOt,
+    abit2: LeakyDeltaOt,
+    delta: Block,
+    z_delta: Block,
+    params: FpreParams,
+}
+
+impl Fpre {
+    pub async fn setup(streams: &mut EmpStreams, party: Role, size: usize) -> Result<Self> {
+        let mut abit1 = LeakyDeltaOt::new();
+        let mut abit2 = LeakyDeltaOt::new();
+        let mut tmp_s = random_bools_array()?;
+        tmp_s[0] = true;
+
+        let delta = match party {
+            Role::Alice => {
+                tmp_s[1] = true;
+                abit1
+                    .setup_send_with_choices(&mut streams.fpre_io0, &tmp_s)
+                    .await?;
+                streams.fpre_io0.flush().await?;
+                abit2.setup_recv(&mut streams.fpre_io2_0).await?;
+                streams.fpre_io2_0.flush().await?;
+                abit1
+                    .delta()
+                    .ok_or(CompatError::MissingDelta("Fpre ALICE abit1"))?
+            }
+            Role::Bob => {
+                tmp_s[1] = false;
+                abit1.setup_recv(&mut streams.fpre_io0).await?;
+                streams.fpre_io0.flush().await?;
+                abit2
+                    .setup_send_with_choices(&mut streams.fpre_io2_0, &tmp_s)
+                    .await?;
+                streams.fpre_io2_0.flush().await?;
+                abit2
+                    .delta()
+                    .ok_or(CompatError::MissingDelta("Fpre BOB abit2"))?
+            }
+        };
+
+        Ok(Self {
+            party,
+            abit1,
+            abit2,
+            delta,
+            z_delta: delta.and(leaky_delta_mask()),
+            params: FpreParams::for_size(size),
+        })
+    }
+
+    pub fn party(&self) -> Role {
+        self.party
+    }
+
+    pub fn delta(&self) -> Block {
+        self.delta
+    }
+
+    pub fn z_delta(&self) -> Block {
+        self.z_delta
+    }
+
+    pub fn params(&self) -> FpreParams {
+        self.params
+    }
+
+    pub fn leaky_instances_ready(&self) -> bool {
+        (self.abit1.iknp.send.is_some() || self.abit1.iknp.recv.is_some())
+            && (self.abit2.iknp.send.is_some() || self.abit2.iknp.recv.is_some())
+    }
+}
+
 async fn send_pre(
     state: &mut IknpSendState,
     stream: &mut EmpStream,
@@ -834,6 +946,7 @@ mod tests {
     const LIVE_INTEROP_TIMEOUT: Duration = Duration::from_secs(60);
     const LIVE_IKNP_LENGTH: usize = 2051;
     const LIVE_LEAKY_LENGTH: usize = 257;
+    const LIVE_FPRE_REQUESTED_SIZE: usize = 321;
 
     #[derive(Clone, Copy, Debug)]
     enum TestTransport {
@@ -851,6 +964,14 @@ mod tests {
     enum TestExtendedOt {
         Iknp,
         Leaky,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FpreVerification {
+        delta: Block,
+        batch_size: u32,
+        bucket_size: u32,
+        permute_batch_size: u32,
     }
 
     fn repo_root() -> PathBuf {
@@ -947,6 +1068,13 @@ mod tests {
         }
         out[0] = true;
         out
+    }
+
+    fn opposite_role(role: Role) -> Role {
+        match role {
+            Role::Alice => Role::Bob,
+            Role::Bob => Role::Alice,
+        }
     }
 
     #[test]
@@ -1165,6 +1293,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fpre_params_fixture_matches_cpp() {
+        let record = fixture_records()
+            .into_iter()
+            .find(|r| r["probe"] == "fpre_params")
+            .unwrap();
+        for case in record["outputs"]["cases"].as_array().unwrap() {
+            let requested = case["requested"].as_u64().unwrap() as usize;
+            let params = FpreParams::for_size(requested);
+            assert_eq!(
+                params.batch_size,
+                case["batch_size"].as_u64().unwrap() as usize
+            );
+            assert_eq!(
+                params.bucket_size,
+                case["bucket_size"].as_u64().unwrap() as usize
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_otco_interop() {
         let bin = cpp_otco_probe();
@@ -1172,6 +1320,13 @@ mod tests {
             run_live_otco_case(&bin, transport, TestOtRole::Send).await;
             run_live_otco_case(&bin, transport, TestOtRole::Recv).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_fpre_setup_interop() {
+        let bin = cpp_fpre_setup_probe();
+        run_live_fpre_setup_case(&bin, Role::Alice).await;
+        run_live_fpre_setup_case(&bin, Role::Bob).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1367,6 +1522,88 @@ mod tests {
         );
     }
 
+    async fn run_live_fpre_setup_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let cpp_transport = match rust_role {
+            Role::Alice => "connect",
+            Role::Bob => "listen",
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role.party_id().to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            EmpStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre stream open failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre stream open timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        let setup_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_fpre_setup(&mut streams, rust_role),
+        )
+        .await;
+        match setup_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre setup failed ({rust_role:?}): {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust Fpre setup timed out ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        drop(streams);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ Fpre setup probe failed ({rust_role:?})\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -1435,6 +1672,90 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    async fn run_rust_fpre_setup(streams: &mut EmpStreams, role: Role) -> Result<()> {
+        let fpre = Fpre::setup(streams, role, LIVE_FPRE_REQUESTED_SIZE).await?;
+        assert_eq!(fpre.party(), role);
+        assert!(fpre.leaky_instances_ready());
+        assert_fpre_delta_bits(fpre.delta(), role);
+        assert_eq!(fpre.z_delta(), fpre.delta().and(leaky_delta_mask()));
+        let local = fpre_verification(&fpre);
+        let remote = match role {
+            Role::Alice => {
+                send_fpre_verification(&mut streams.main, local).await?;
+                recv_fpre_verification(&mut streams.main).await?
+            }
+            Role::Bob => {
+                let remote = recv_fpre_verification(&mut streams.main).await?;
+                send_fpre_verification(&mut streams.main, local).await?;
+                remote
+            }
+        };
+        assert_fpre_delta_bits(remote.delta, opposite_role(role));
+        assert_fpre_params(remote);
+        Ok(())
+    }
+
+    fn fpre_verification(fpre: &Fpre) -> FpreVerification {
+        let params = fpre.params();
+        FpreVerification {
+            delta: fpre.delta(),
+            batch_size: params.batch_size as u32,
+            bucket_size: params.bucket_size as u32,
+            permute_batch_size: params.permute_batch_size.unwrap_or(0) as u32,
+        }
+    }
+
+    async fn send_fpre_verification(
+        stream: &mut EmpStream,
+        verification: FpreVerification,
+    ) -> Result<()> {
+        stream.send_block(&[verification.delta]).await?;
+        stream
+            .send_data(&verification.batch_size.to_le_bytes())
+            .await?;
+        stream
+            .send_data(&verification.bucket_size.to_le_bytes())
+            .await?;
+        stream
+            .send_data(&verification.permute_batch_size.to_le_bytes())
+            .await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_fpre_verification(stream: &mut EmpStream) -> Result<FpreVerification> {
+        let delta = stream.recv_block(1).await?[0];
+        let batch_size = recv_u32(stream).await?;
+        let bucket_size = recv_u32(stream).await?;
+        let permute_batch_size = recv_u32(stream).await?;
+        Ok(FpreVerification {
+            delta,
+            batch_size,
+            bucket_size,
+            permute_batch_size,
+        })
+    }
+
+    async fn recv_u32(stream: &mut EmpStream) -> Result<u32> {
+        let bytes = stream.recv_data(4).await?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("length")))
+    }
+
+    fn assert_fpre_delta_bits(delta: Block, role: Role) {
+        assert!(delta.get_lsb());
+        assert_eq!((delta.as_bytes()[0] & 0b10) != 0, role == Role::Alice);
+    }
+
+    fn assert_fpre_params(verification: FpreVerification) {
+        let params = FpreParams::for_size(LIVE_FPRE_REQUESTED_SIZE);
+        assert_eq!(verification.batch_size, params.batch_size as u32);
+        assert_eq!(verification.bucket_size, params.bucket_size as u32);
+        assert_eq!(
+            verification.permute_batch_size,
+            params.permute_batch_size.unwrap_or(0) as u32
+        );
     }
 
     async fn send_sender_verification(
@@ -1519,6 +1840,24 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/iknp_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    fn cpp_fpre_setup_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/fpre_setup_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/fpre_setup_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/fpre_setup_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/fpre_setup_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

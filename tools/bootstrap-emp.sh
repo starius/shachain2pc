@@ -21,6 +21,10 @@
 # the set it was actually written against.
 set -euo pipefail
 
+# Allow -march=native through nix's cc-wrapper (it strips native arch by default
+# via NIX_ENFORCE_NO_NATIVE). We build emp tuned for the host CPU; see FLAGS below.
+export NIX_ENFORCE_NO_NATIVE=0
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 case "$(uname -m)" in
@@ -39,11 +43,13 @@ EMP_TOOL_LEGACY_CIRCUITS_COMMIT="11093a7d2160e7e7a4dcae3ffd9e6935bf2b8c1c"
 SRC="${ROOT_DIR}/.sources"
 PREFIX="${ROOT_DIR}/.deps/emp"
 BUILD="${ROOT_DIR}/.build/emp-bootstrap"
-# Portable SIMD baseline (AES-NI + PCLMUL + SSE4.2). We pass these explicitly and
-# turn emp-tool's -march=native off (EMP_TOOL_NATIVE_ARCH=OFF below) because nix's
-# NIX_ENFORCE_NO_NATIVE strips -march=native, which would otherwise leave SSE4.2
-# disabled and break emp-ot's svole intrinsics (_mm_cmpgt_epi64).
-FLAGS="-mssse3 -msse4.1 -msse4.2 -maes -mpclmul"
+# Tune for the host CPU. -march=native is a superset of the old portable baseline
+# (ssse3/sse4.1/sse4.2/aes/pclmul) plus AVX2/FMA/BMI2 where available, which the
+# COT (SoftSpoken) and GF/garbling hot loops vectorize on. Survives nix's wrapper
+# thanks to NIX_ENFORCE_NO_NATIVE=0 above. We pass it via CMAKE_CXX_FLAGS and keep
+# EMP_TOOL_NATIVE_ARCH=OFF so emp doesn't add a second (possibly different) arch
+# flag. Release already implies -O3 -DNDEBUG.
+FLAGS="-march=native"
 
 checkout() { # path url commit
   if [[ ! -d "$1/.git" ]]; then rm -rf "$1"; git clone "$2" "$1"; fi

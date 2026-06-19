@@ -145,6 +145,55 @@ int main(int argc, char** argv) {
   SetTransportTimeout(io);  // bound blocking recv/send so a stalled peer aborts
   ThreadPool pool(run::kThreads);  // session-local compute parallelism (global type)
   try {
+    // Adaptive-cache mode (range only): SHACHAIN2PC_CACHE=1 computes the shared
+    // trunk once (chunked by SHACHAIN2PC_CHUNK_BLOCKS, default 2), then derives the
+    // range in decreasing index order through a stack-cache of the low-bit subtree,
+    // reusing the shared prefix and revealing each. This is the in-session cache.
+    if (is_range) {
+      const char* cache_env = std::getenv("SHACHAIN2PC_CACHE");
+      if (cache_env != nullptr && std::atoi(cache_env) != 0) {
+        int tcb = 2;  // conservative default trunk chunk size
+        if (const char* ce = std::getenv("SHACHAIN2PC_CHUNK_BLOCKS")) {
+          tcb = std::atoi(ce);
+        }
+        long tamper_step = -1;
+        if (const char* te = std::getenv("SHACHAIN2PC_TAMPER")) {
+          tamper_step = std::atol(te);  // TEST ONLY
+        }
+        run::CacheTiming ct;
+        std::vector<protocol::Value> outs = run::RunDerivationCache(
+            io, &pool, party, indices.front(), indices.back(), share, tcb, ct,
+            tamper_step);
+        delete io;
+        for (std::size_t k = 0; k < indices.size(); ++k) {
+          std::printf("RESULT %012llx %s\n",
+                      static_cast<unsigned long long>(indices[k]),
+                      util::ToHex(outs[k]).c_str());
+        }
+        const double grand =
+            ct.setup_s + ct.trunk_s + ct.branch_total_s + ct.reveal_total_s;
+        std::fprintf(stderr, "CACHE setup            %9.4f s\n", ct.setup_s);
+        std::fprintf(stderr,
+                     "CACHE trunk            %9.4f s   (%d blocks, %d chunk(s), "
+                     "split=bit %d)\n",
+                     ct.trunk_s, ct.trunk_blocks, ct.trunk_chunks, ct.split_bit);
+        std::fprintf(stderr,
+                     "CACHE branches total   %9.4f s   (%ld new hashes for %d "
+                     "secrets = %.2f/secret)\n",
+                     ct.branch_total_s, ct.new_hashes, ct.num_indices,
+                     ct.num_indices ? (double)ct.new_hashes / ct.num_indices : 0.0);
+        std::fprintf(stderr, "CACHE reveal total     %9.4f s\n", ct.reveal_total_s);
+        std::fprintf(stderr,
+                     "CACHE grand-total      %9.4f s   (%.4f s/secret over %d)\n",
+                     grand, ct.num_indices ? grand / ct.num_indices : 0.0,
+                     ct.num_indices);
+        std::fprintf(stderr, "NET   rounds=%llu sent=%llu recv=%llu (bytes)\n",
+                     static_cast<unsigned long long>(ct.rounds),
+                     static_cast<unsigned long long>(ct.bytes_sent),
+                     static_cast<unsigned long long>(ct.bytes_recv));
+        return 0;
+      }
+    }
     // Shared-trunk mode (range only): SHACHAIN2PC_TREE=1 computes the shared
     // high-bit prefix once, then derives each index's low-bit branch from it;
     // SHACHAIN2PC_CHUNK_BLOCKS optionally chunks the trunk. Branches are all

@@ -70,18 +70,12 @@ Design:
   *(~600 KB is an order-of-magnitude estimate of the raw share material; the actual
   `AG2PCSession::carried_` RSS — map overhead, `AShareBundle` layout — is unmeasured
   until implemented.)*
-- **Derive on demand.** For `H(I)`, branch from the deepest cached ancestor (a few
-  hashes via `BuildChunkCircuit(first=false)` on the carried node), reveal, and
-  cache the new intermediates along `I`'s path for the next (lower-index) secret —
-  the BOLT-03 insertion logic on authenticated values. **Caching detail:** to cache
-  those intermediates in *one* bucketing instance, the branch circuit must be
-  **multi-output** — expose every node-to-cache as an output of a single
-  `run_artifact`, then `checkpoint` all of them. Today `BuildChunkCircuit` outputs
-  only the final value, so this needs a multi-output extension. The fallback —
-  splitting the branch into 1-SHA steps so each step's output is carried — also
-  caches them, but spends one bucketing instance *per step* (~2× the budget; §1
-  "Chunking in the cache"). So the budget-optimal cache is multi-output-single-run;
-  the min-RAM cache is 1-SHA-per-step.
+- **Derive on demand.** For `H(I)`, branch from the deepest cached ancestor. The
+  current implementation computes full aligned 16-leaf low-subtree tiles as one
+  multi-output `run_artifact` (15 SHA edges in one bucketing instance), while
+  partial tile edges fall back to one-SHA steps. Reveal uses the same
+  `AG2PCSession::reveal` path as before and is timed separately from pre-reveal
+  computation.
 - **No persistence.** The cache + COT mesh live in the in-memory session. On a new
   session (or reconnect) we **refill from the seed** (recompute the trunk once,
   ~one 48-block chain) and re-warm. Cross-restart persistence of authenticated
@@ -92,11 +86,11 @@ Design:
 
 This is a strict generalization of `RunDerivationTree`; it needs no emp changes.
 
-### Chunking in the cache: fixed update-cap trunk + 1-SHA cached branches
+### Chunking in the cache: fixed update-cap trunk + 16-leaf branch tiles
 
 The concrete design, given a committed **maximum of `2^n` updates** for the channel.
 (This update cap is a design choice; it relates to the budget `N` of §0/§4 — total
-`compute_inplace` instances — by `N ≈ (1–2) · 2^n`.)
+`compute_inplace` instances — by the concrete tiling shape below.)
 
 **Commit to `2^n` updates up front.** Near StartIndex the first `2^n` indices share
 their high `(48-n)` bits, so the chain splits cleanly and permanently:
@@ -107,13 +101,13 @@ their high `(48-n)` bits, so the chain splits cleanly and permanently:
   useless; the trunk chunks exist only for the one-time refill and are discarded
   once they produce the tip.
 - **Branches** = the n-bit subtree below the tip.
-- **The cap `n` is bounded by the budget.** Each leaf costs ~1–2 bucketing
-  instances (the §0 `N`), so `n ≲ ssp − κ − 1`. At `ssp = 40`, `κ = 20` →
-  **`n ≤ 19`, i.e. `2^n ≤ ~500k` updates, trunk = `48 − n ≥ 29` blocks.** Choosing
-  `n` is choosing the operating point on the budget curve (and fixes the trunk
-  length).
+- **The cap `n` is bounded by the budget.** With 16-leaf branch tiles, aligned
+  ranges spend about `2^(n-3)` branch instances plus trunk chunks, not one instance
+  per leaf. Choosing `n` is still choosing the operating point on the budget curve
+  (and fixes the trunk length), but the tile factor is materially better than the
+  earlier 1-SHA-per-step fallback.
 
-**Trunk → chunk at `trunk_chunk_size` (the one real toggle; default 1).**
+**Trunk → chunk at `trunk_chunk_size` (the main refill toggle; default 16).**
 The trunk is the single long chain; its chunk size trades the one-time refill cost
 (shape illustrated on a 48-block chain — the real trunk is `48 − n`):
 
@@ -121,35 +115,21 @@ The trunk is the single long chain; its chunk size trades the one-time refill co
 |---|---|---|---|---|
 | 1 (one SHA/step) | **26 MB** | 198 | ~32 s | 48 × 2^{-ssp} |
 | 8 | 116 MB | 30 | ~11 s | 6 × 2^{-ssp} |
+| 16 | ~hundreds MB | 18 | lower RTT cost | 3 × 2^{-ssp} |
 | whole | 468 MB | 10 | ~5 s | 1 × 2^{-ssp} |
 
-Default **1** is the simplest and lowest-memory mode: one SHA block per
-`compute_inplace`, no extra chunking choices hidden in the default. Raise to 4–8
-on a server for a faster/cheaper refill under non-trivial RTT (transient
-~tens–hundreds of MB); use the whole trunk only when the RSS spike is acceptable.
-The trunk is once per session, so this cost amortizes over the `2^n` leaves — it
-matters most under frequent restarts.
+Default **16** keeps refill round-trips low for remote peers while still bounding
+the circuit below the whole-trunk RSS spike. Drop to 1 only when RAM is the hard
+limit; use the whole trunk only when the RSS spike is acceptable. The trunk is
+once per session, so this cost amortizes over the `2^n` leaves — it matters most
+under frequent restarts.
 
-**Branches → cache the n-bit subtree.** Within the subtree, cache the intermediate
-nodes (the BOLT-03 cache truncated to depth `n`). Because secrets are revealed in
-decreasing index order, consecutive leaves share the subtree prefix, so each new
-leaf adds only ~2 new steps amortized. Caching is **required**: recomputing each
-leaf's full branch from the tip would be ~`(n/4)×` the compute and infeasible at our
-`n`. Two ways to realize it, a RAM↔budget choice:
-
-- **1-SHA-per-step (min RAM).** One `run_artifact` per step, each output carried
-  → cached. ~10 MB, but **~1 instance per step ≈ ~2 instances/leaf** → ~½ the
-  safe-update count (the ~500k above). Works with today's `BuildChunkCircuit`.
-- **Multi-output single-run (budget-optimal; finding 3).** Run the new steps in
-  *one* `run_artifact` whose circuit **exposes every node-to-cache as an output**,
-  then `checkpoint` them all → **~1 instance/leaf** (≈2× the safe-update count). RAM
-  = the branch's few blocks in one circuit (~tens of MB). Needs a multi-output
-  extension to `BuildChunkCircuit` (it currently emits only the final value).
-
-So caching intermediates is *not* free with the current circuit: either accept the
-1-SHA per-step budget, or add multi-output. (This supersedes the earlier "keep
-branches whole" idea — whole branches mean no cache, i.e. recompute per leaf, which
-is exactly what the cache avoids.) The trunk knob remains `trunk_chunk_size`.
+**Branches → fixed 16-leaf tiles.** Within the subtree, cache tile roots through
+the BOLT-03 decreasing-order stack. Every full aligned 16-leaf tile is one
+multi-output circuit: 15 internal SHA edges, 16 leaf outputs, one
+`compute_inplace` instance. A 256-leaf aligned range therefore spends 15 tile-root
+prefix instances plus 16 tile instances for all 256 leaves, instead of 255
+one-SHA instances. Partial edges at the boundaries fall back to one-SHA steps.
 
 ---
 
@@ -230,8 +210,9 @@ i.e.
 >   **N ≤ 2^{ssp − κ}**,  where N ≈ (number of leaves) × (compute_inplace per branch).
 
 For budget calculations, count instances first. With one unchunked branch per
-leaf, instances are approximately leaves; with the planned 1-SHA cached branch,
-instances are roughly 1-2× leaves. At emp's default **ssp = 40**:
+leaf, instances are approximately leaves; with the current 16-leaf tile cache,
+aligned ranges are roughly one branch instance per 8 leaves plus the one-time
+trunk chunks. At emp's default **ssp = 40**:
 
 | residual target | max instances (ssp=40) | max instances (ssp=50) | max instances (ssp=60) |
 |---|---|---|---|
@@ -241,8 +222,9 @@ instances are roughly 1-2× leaves. At emp's default **ssp = 40**:
 
 So at the default ssp=40, ~1 000 instances keep the residual at `2^{-30}`;
 ~1 M instances drop it to `2^{-20}`. For a realistic Lightning channel (say up to
-`2^20 ≈ 1 M` commitment updates, and therefore ~1-2 M instances in the planned
-cache), a comfortable residual (`2^{-40}`) needs **ssp ≈ 60-64**.
+`2^20 ≈ 1 M` commitment updates, and therefore far fewer branch instances under
+tiling), a comfortable residual (`2^{-40}`) still points to **ssp ≈ 60-64** as a
+production setting.
 
 ### Crucial: `N` is bucketing instances, NOT the 2^48 index space.
 
@@ -265,8 +247,9 @@ roughly 1-2× actual updates in the planned cache and still nowhere near 2^48. S
 `ssp` for *that*, not the tree. A "1/1 000 000" target (κ=20) over about 1 M
 instances is met by the **demo/research default ssp=40**; production funds should
 target a stronger residual, e.g. `ssp=64` gives `2^{-40}` over 2^24 (16 M)
-instances, which is about 8-16 M updates at 1-2 instances/update. (You *may* set
-`ssp=68` to nominally cover the full 2^48 at `2^{-20}`
+instances. The number of updates covered is a function of the cache shape; with
+aligned 16-leaf tiles it is higher than the old one-step-per-edge fallback. (You
+*may* set `ssp=68` to nominally cover the full 2^48 at `2^{-20}`
 — feasible, buckets B≈4→7, ~1.5–2× the triple-gen COTs — but it guards a workload
 that cannot physically occur.)
 
@@ -338,10 +321,9 @@ channel). The demo/research default 40 is too thin for funds (`2^{-20}` over
   so for the single most-sensitive value the cache is, if anything, better. Net:
   the cache is a throughput/memory win at no extra security cost (at equal ssp).
 - **Chunking spends budget** (the third axis, detailed in §1 "Chunking in the
-  cache"). Each chunk is its own `compute_inplace` → its own `< 2^{-ssp}`. The
-  design accepts this on the branch side (1-SHA cached branches ≈ 2 instances/leaf
-  — the price of min RAM + max sharing) and minimizes it on the trunk
-  (`trunk_chunk_size`, default 1, computed once per session). Raise `ssp` rather
+  cache"). Each chunk/tile is its own `compute_inplace` → its own `< 2^{-ssp}`.
+  The current design uses 16-leaf branch tiles to reduce branch instances, and a
+  trunk chunk size default of 16 to reduce refill round-trips. Raise `ssp` rather
   than coarsen the cache when the budget is tight.
 
 ---
@@ -372,20 +354,20 @@ channel). The demo/research default 40 is too thin for funds (`2^{-20}` over
 2. **For the current PoC, keep `ssp = 40`** (the documented constant
    `run::kSsp`) to preserve performance while measuring the cache. This is a
    demo/research setting: it gives residual `2^-20` over about 1 M
-   `compute_inplace` instances, i.e. roughly 500k-1M updates for the planned cache,
-   and is not a production target for funds. **For production, use `ssp ≈ 60-64`**
+   `compute_inplace` instances, and is not a production target for funds.
+   **For production, use `ssp ≈ 60-64`**
    and track the per-seed instance count. Sizing `ssp` for instances actually
    performed, never the 2^48 tree, is the right mental model:
    `ssp ≈ κ + log2(N_max)`. Resetting the *session* with the same seed does **not**
    reset the budget; rotating the *seed* (new channel) does. A cap near
    `2^{ssp-κ}` that triggers seed rotation is the clean backstop.
-3. **Chunking: commit a `2^n`-update cap, chunk the trunk at `trunk_chunk_size`
-   (the one toggle, default 1), and run branches 1-SHA + cached** (§1 "Chunking in
-   the cache"). The fixed-cap split gives a `(48-n)`-block trunk (chunked, computed
-   once, only its tip cached — nothing cached inside it) and an n-bit subtree of
-   cached 1-SHA branches (min RAM, max sharing). `n` is bounded by the budget
-   (`n ≤ ssp-κ-1`; ≤ 19 at ssp=40). Raise `trunk_chunk_size` to 4–8 on a server
-   for a faster/cheaper refill; drop to 1 only when RAM is the hard limit.
+3. **Chunking: commit a `2^n`-update cap, chunk the trunk at
+   `trunk_chunk_size` (default 16), and run branches as fixed 16-leaf tiles**
+   (§1 "Chunking in the cache"). The fixed-cap split gives a `(48-n)`-block trunk
+   (chunked, computed once, only its tip cached — nothing cached inside it) and an
+   n-bit subtree of cached tile roots. Full aligned tiles use one multi-output
+   instance for 16 leaves; partial boundary edges fall back to one-SHA steps. Drop
+   `trunk_chunk_size` only when RAM is the hard limit.
 4. Persistence across restarts (to skip the per-session refill) remains the
    separate, harder "stateful authenticated garbling with resume" project
    (serialize authenticated state + Δ/COT) — out of scope for now.

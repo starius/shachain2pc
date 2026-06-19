@@ -232,12 +232,13 @@ Set `SHACHAIN2PC_COMPAT_TIMING=1` as well to print Fpre/C2PC subphase timings.
   `~2^-ssp` error accumulates as `N · 2^-ssp`, where `N` is the total number of
   `compute_inplace` bucketing instances run against one seed: revealed outputs,
   precomputed-but-unrevealed outputs, aborted attempts, refills, and chunks. The
-  current `ssp = 40` (`run::kSsp`) is a demo/research default: with the planned
-  cache shape it gives roughly 500k-1M updates at residual `2^-20`, which is not
-  a production target for funds. For production, use `ssp ≈ 60-64`, track every
-  instance against the per-seed budget, and rotate the seed before crossing the
-  chosen risk threshold. The adaptive cache's default trunk chunk size is 1
-  (`SHACHAIN2PC_CHUNK_BLOCKS=1`), the simplest low-memory setting. Cross-restart
+  current `ssp = 40` (`run::kSsp`) is a demo/research default: it gives roughly
+  1M `compute_inplace` instances at residual `2^-20`, which is not a production
+  target for funds. For production, use `ssp ≈ 60-64`, track every instance
+  against the per-seed budget, and rotate the seed before crossing the chosen
+  risk threshold. The adaptive cache's default trunk chunk size is 16
+  (`SHACHAIN2PC_CHUNK_BLOCKS=16`), and the low subtree is computed in fixed
+  16-leaf tiles when a range contains full aligned tiles. Cross-restart
   persistence of the authenticated cache is still future work. Full analysis and
   the cost trade-off:
   [`docs/shared-trunk-cache.md`](docs/shared-trunk-cache.md).

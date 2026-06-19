@@ -65,6 +65,23 @@ static proto::Value RunChunked(const proto::Circuit& sha, const proto::Value& se
   return proto::BitsToValue(v);
 }
 
+static std::vector<proto::Value> RunTilePlain(const proto::Circuit& sha,
+                                              const proto::Value& root,
+                                              int height) {
+  std::vector<uint8_t> in = proto::ValueToBits(root);
+  std::vector<uint8_t> out =
+      proto::EvalBristol(proto::BuildTileCircuit(sha, height), in);
+  const int leaves = 1 << height;
+  std::vector<proto::Value> values;
+  values.reserve(leaves);
+  for (int s = 0; s < leaves; ++s) {
+    std::vector<uint8_t> bits(out.begin() + s * proto::kValueBits,
+                              out.begin() + (s + 1) * proto::kValueBits);
+    values.push_back(proto::BitsToValue(bits));
+  }
+  return values;
+}
+
 // Evaluate the shared-trunk decomposition for index I within a range [lo,hi]:
 // the trunk processes the high bits common to the range, the branch the low bits
 // of I (the same split the MPC RunDerivationTree uses). Must equal the reference.
@@ -216,6 +233,23 @@ int main() {
       }
     }
     std::printf("block-chunking (all I x N x splits): %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // Tile circuit: a 16-leaf low-bit subtree from an authenticated root must match
+  // independent reference derivations for every suffix, in ascending output order.
+  {
+    proto::Value root = ref::FillSeed(0x42);
+    std::vector<proto::Value> got = RunTilePlain(sha, root, 4);
+    bool ok = got.size() == 16;
+    for (int s = 0; s < 16 && ok; ++s) {
+      proto::Value want = ref::GenerateFromSeed(root, static_cast<uint64_t>(s));
+      if (got[s] != want) {
+        ok = false;
+        std::printf("  tile mismatch suffix=%x: got %s\n", s, Hex(got[s]).c_str());
+      }
+    }
+    std::printf("tile circuit (height=4, 16 leaves): %s\n", ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 

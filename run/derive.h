@@ -34,6 +34,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "emp-ag2pc/emp-ag2pc.h"
@@ -48,6 +49,10 @@ namespace shachain2pc::run {
 constexpr int kAlice = emp::ALICE;  // 1, garbler, listens
 constexpr int kBob = emp::BOB;      // 2, evaluator, connects
 constexpr int kThreads = 4;         // session ThreadPool size (local compute only)
+constexpr int kDefaultCacheTrunkChunkBlocks = 16;
+constexpr int kCacheTileHeight = 4;
+constexpr int kCacheTileLeaves = 1 << kCacheTileHeight;
+constexpr int kCacheTileBits = protocol::kValueBits * kCacheTileLeaves;
 
 // Statistical security parameter for the authenticated-AND bucketing (emp's
 // AG2PCSession `ssp`). 40 is emp's default, kept here for DEMO/RESEARCH
@@ -58,11 +63,10 @@ constexpr int kThreads = 4;         // session ThreadPool size (local compute on
 // < 2^-kSsp PER compute_inplace, accumulating as N * 2^-kSsp against ONE seed,
 // where N = the TOTAL compute_inplace bucketing instances run on that seed
 // (every revealed branch, precomputed-but-unrevealed output, ABORTED attempt,
-// trunk-refill chunk, and branch chunk -- not just revealed secrets), bounded by
-// derivations performed, never the 2^48 index space. With ~1-2 instances/update,
-// at kSsp = 40:
-//     ~2^20 instances (~500k-1M updates) -> residual <= 2^-20  (~1 in a million)
-//     ~2^10 instances (~500-1k updates)  -> residual <= 2^-30  (~1 in a billion)
+// trunk-refill chunk, and branch tile/chunk -- not just revealed secrets), bounded
+// by computations performed, never the 2^48 index space. At kSsp = 40:
+//     ~2^20 instances -> residual <= 2^-20  (~1 in a million)
+//     ~2^10 instances -> residual <= 2^-30  (~1 in a billion)
 // The residual is the prob of a single, undetected, ~1-bit leak (a real attempt
 // aborts w.p. ~1-2^-kSsp; theft needs far more than one bit) -- adequate for
 // demo/research, but 2^-20 is too thin for production funds.
@@ -407,6 +411,13 @@ inline void CheckChunkCircuit(const protocol::Circuit& c) {
   }
 }
 
+inline void CheckTileCircuit(const protocol::Circuit& c) {
+  if (c.n1 != protocol::kValueBits || c.n2 != 0 ||
+      c.n3 != kCacheTileBits) {
+    throw std::runtime_error("shachain2pc: tile circuit has wrong shape");
+  }
+}
+
 // ChunkSpecDigest pins index + chunk size + SHA gadget so both parties agree on
 // the chunking before any work (a size mismatch would otherwise desync mid-run).
 inline std::array<uint8_t, 32> ChunkSpecDigest(uint64_t index,
@@ -730,23 +741,24 @@ inline std::vector<protocol::Value> RunDerivationTree(
 // the trunk (computed once, chunked, only the tip carried), and the low n bits are
 // an n-bit subtree. Secrets are derived in DECREASING index order (the Lightning
 // per-commitment order), maintaining a stack of cached intermediate nodes keyed by
-// their set-bit prefix: each new index reuses the longest matching prefix and
-// pushes only the new flip+hash steps (one circuit per step, each cached). So
-// consecutive indices amortize to ~1-2 new hashes/leaf instead of recomputing the
-// whole branch. Every cached node is a hash output reused as an authenticated wire
-// (never re-input), and -- crucially for decreasing order -- a node is revealed
-// only AFTER all its children have used it as a prefix, so we never derive from a
-// revealed value.
+// their set-bit prefix. Full aligned 16-leaf tiles are computed as one multi-output
+// subtree circuit (15 SHA edges in one compute_inplace); partial edges fall back to
+// one-SHA steps. Every cached node is a hash output reused as an authenticated wire
+// (never re-input), and outputs are revealed only after precomputation, so the
+// pre-reveal and reveal costs can be measured separately.
 struct CacheTiming {
   double setup_s = 0.0;
   double trunk_s = 0.0;
-  double branch_total_s = 0.0;  // sum of the per-step (push) compute
+  double branch_total_s = 0.0;  // tile + fallback branch compute, no reveal
   double reveal_total_s = 0.0;
   int trunk_chunks = 0;
   int trunk_blocks = 0;
   int split_bit = -1;
+  int tile_leaves = kCacheTileLeaves;
+  int tile_count = 0;
   int num_indices = 0;   // leaves derived (hi-lo+1)
-  long new_hashes = 0;   // total subtree pushes = branch compute_inplace instances
+  long new_hashes = 0;   // total subtree SHA edges computed after trunk
+  long branch_instances = 0;  // branch compute_inplace instances after trunk
   uint64_t rounds = 0, bytes_sent = 0, bytes_recv = 0;
 };
 
@@ -757,6 +769,7 @@ inline std::array<uint8_t, 32> CacheDigest(uint64_t lo, uint64_t hi,
   std::array<uint8_t, 32> dg{};
   unsigned int len = 0;
   int tcb = trunk_chunk_blocks;
+  int tile_height = kCacheTileHeight;
   EVP_MD_CTX* ctx = EVP_MD_CTX_new();
   if (ctx == nullptr) throw std::runtime_error("CacheDigest: EVP_MD_CTX_new failed");
   auto cleanup = [&]() { EVP_MD_CTX_free(ctx); };
@@ -764,6 +777,7 @@ inline std::array<uint8_t, 32> CacheDigest(uint64_t lo, uint64_t hi,
       EVP_DigestUpdate(ctx, &lo, sizeof(lo)) != 1 ||
       EVP_DigestUpdate(ctx, &hi, sizeof(hi)) != 1 ||
       EVP_DigestUpdate(ctx, &tcb, sizeof(tcb)) != 1 ||
+      EVP_DigestUpdate(ctx, &tile_height, sizeof(tile_height)) != 1 ||
       EVP_DigestUpdate(ctx, sha_dg.data(), sha_dg.size()) != 1 ||
       EVP_DigestFinal_ex(ctx, dg.data(), &len) != 1 || len != dg.size()) {
     cleanup();
@@ -771,6 +785,49 @@ inline std::array<uint8_t, 32> CacheDigest(uint64_t lo, uint64_t hi,
   }
   cleanup();
   return dg;
+}
+
+inline protocol::Value DecodeRevealedValue(
+    const std::optional<std::array<bool, protocol::kValueBits>>& r) {
+  if (!r.has_value())
+    throw std::runtime_error("shachain2pc: reveal produced no value");
+  std::vector<uint8_t> ob(protocol::kValueBits);
+  for (int i = 0; i < protocol::kValueBits; ++i) ob[i] = (*r)[i] ? 1 : 0;
+  return protocol::BitsToValue(ob);
+}
+
+template <int Slot, typename Ctx>
+inline std::optional<std::array<bool, protocol::kValueBits>> RevealTileSlotRaw(
+    emp::AG2PCSession& sess, const emp::BitVec_T<Ctx, kCacheTileBits>& tile) {
+  static_assert(0 <= Slot && Slot < kCacheTileLeaves);
+  auto leaf = tile.template slice<Slot * protocol::kValueBits,
+                                  (Slot + 1) * protocol::kValueBits>();
+  return sess.reveal(leaf, emp::PUBLIC);
+}
+
+template <typename Ctx>
+inline std::optional<std::array<bool, protocol::kValueBits>> RevealTileSlotRaw(
+    emp::AG2PCSession& sess, const emp::BitVec_T<Ctx, kCacheTileBits>& tile,
+    int slot) {
+  switch (slot) {
+    case 0: return RevealTileSlotRaw<0>(sess, tile);
+    case 1: return RevealTileSlotRaw<1>(sess, tile);
+    case 2: return RevealTileSlotRaw<2>(sess, tile);
+    case 3: return RevealTileSlotRaw<3>(sess, tile);
+    case 4: return RevealTileSlotRaw<4>(sess, tile);
+    case 5: return RevealTileSlotRaw<5>(sess, tile);
+    case 6: return RevealTileSlotRaw<6>(sess, tile);
+    case 7: return RevealTileSlotRaw<7>(sess, tile);
+    case 8: return RevealTileSlotRaw<8>(sess, tile);
+    case 9: return RevealTileSlotRaw<9>(sess, tile);
+    case 10: return RevealTileSlotRaw<10>(sess, tile);
+    case 11: return RevealTileSlotRaw<11>(sess, tile);
+    case 12: return RevealTileSlotRaw<12>(sess, tile);
+    case 13: return RevealTileSlotRaw<13>(sess, tile);
+    case 14: return RevealTileSlotRaw<14>(sess, tile);
+    case 15: return RevealTileSlotRaw<15>(sess, tile);
+    default: throw std::runtime_error("shachain2pc: tile slot out of range");
+  }
 }
 
 // tamper_step >= 0 (TEST ONLY): garble a steered flip on that branch push to
@@ -781,16 +838,10 @@ inline std::vector<protocol::Value> RunDerivationCache(
     long tamper_step = -1) {
   using Ctx = emp::AG2PCSession::DirectCtx;
   using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;
+  using TileBV = emp::BitVec_T<Ctx, kCacheTileBits>;
   using Clock = std::chrono::steady_clock;
   auto secs = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double>(b - a).count();
-  };
-  auto decode = [](const std::optional<std::array<bool, protocol::kValueBits>>& r) {
-    if (!r.has_value())
-      throw std::runtime_error("shachain2pc: reveal produced no value");
-    std::vector<uint8_t> ob(protocol::kValueBits);
-    for (int i = 0; i < protocol::kValueBits; ++i) ob[i] = (*r)[i] ? 1 : 0;
-    return protocol::BitsToValue(ob);
   };
 
   if (lo > hi) throw std::runtime_error("shachain2pc: cache range lo > hi");
@@ -850,39 +901,121 @@ inline std::vector<protocol::Value> RunDerivationCache(
     timing.trunk_s = secs(ttrunk, Clock::now());
     sess.checkpoint(T);  // free inputs + trunk internals; keep only the tip
 
-    // ---- subtree stack-cache, DECREASING index order ----
-    std::vector<int> stack_bits;     // set-bit prefix currently on the stack
-    std::vector<BV> stack_vals;      // stack_vals[0]=T; [k]=value after bits[0..k-1]
-    stack_vals.push_back(T);
-    std::vector<protocol::Value> results((std::size_t)(hi - lo + 1));
-    long step = 0;
-    for (uint64_t I = hi;; --I) {
-      std::vector<int> low = SetBitsDesc(I & low_mask);  // high to low
-      std::size_t p = 0;
-      while (p < stack_bits.size() && p < low.size() && stack_bits[p] == low[p]) ++p;
-      stack_bits.resize(p);
-      stack_vals.resize(p + 1);  // drop the divergent tail (shrink only)
-      for (std::size_t j = p; j < low.size(); ++j) {
-        protocol::Circuit bc = protocol::BuildChunkCircuit(sha, {low[j]}, false);
-        if (step == tamper_step) TamperFirstFlip(bc);  // TEST ONLY
-        CheckChunkCircuit(bc);
-        emp::circuit::BooleanProgram prog = ToBooleanProgram(bc);
-        ReleaseVector(bc.gates);
-        auto tb = Clock::now();
-        stack_vals.push_back(sess.run_artifact<BV>(prog, stack_vals.back()));
-        timing.branch_total_s += secs(tb, Clock::now());
-        stack_bits.push_back(low[j]);
-        ++timing.new_hashes;
-        ++step;
-      }
-      auto trv = Clock::now();
-      std::optional<std::array<bool, protocol::kValueBits>> rev =
-          sess.reveal(stack_vals.back(), emp::PUBLIC);
-      timing.reveal_total_s += secs(trv, Clock::now());
-      results[(std::size_t)(I - lo)] = decode(rev);
-      if (I == lo) break;
-    }
-    io->flush();
+	    // ---- subtree stack-cache, DECREASING index order ----
+	    std::vector<int> stack_bits;     // set-bit prefix currently on the stack
+	    std::vector<BV> stack_vals;      // stack_vals[0]=T; [k]=value after bits[0..k-1]
+	    stack_vals.push_back(T);
+	    protocol::Circuit tile_circuit =
+	        protocol::BuildTileCircuit(sha, kCacheTileHeight);
+	    CheckTileCircuit(tile_circuit);
+	    emp::circuit::BooleanProgram tile_prog = ToBooleanProgram(tile_circuit);
+	    ReleaseVector(tile_circuit.gates);
+
+	    struct TileOut {
+	      uint64_t base;
+	      TileBV value;
+	    };
+	    struct SingleOut {
+	      uint64_t index;
+	      BV value;
+	    };
+	    std::vector<TileOut> tile_outs;
+	    std::vector<SingleOut> single_outs;
+	    std::unordered_map<uint64_t, std::size_t> tile_pos;
+	    std::unordered_map<uint64_t, std::size_t> single_pos;
+	    std::vector<protocol::Value> results((std::size_t)(hi - lo + 1));
+	    const uint64_t tile_mask = static_cast<uint64_t>(kCacheTileLeaves - 1);
+	    const bool can_tile = split >= kCacheTileHeight - 1;
+	    long step = 0;
+
+	    auto align_stack = [&](const std::vector<int>& target) {
+	      std::size_t p = 0;
+	      while (p < stack_bits.size() && p < target.size() &&
+	             stack_bits[p] == target[p]) ++p;
+	      stack_bits.resize(p);
+	      stack_vals.resize(p + 1);  // drop the divergent tail (shrink only)
+	      for (std::size_t j = p; j < target.size(); ++j) {
+	        protocol::Circuit bc = protocol::BuildChunkCircuit(sha, {target[j]}, false);
+	        if (step == tamper_step) TamperFirstFlip(bc);  // TEST ONLY
+	        CheckChunkCircuit(bc);
+	        emp::circuit::BooleanProgram prog = ToBooleanProgram(bc);
+	        ReleaseVector(bc.gates);
+	        auto tb = Clock::now();
+	        stack_vals.push_back(sess.run_artifact<BV>(prog, stack_vals.back()));
+	        timing.branch_total_s += secs(tb, Clock::now());
+	        stack_bits.push_back(target[j]);
+	        ++timing.new_hashes;
+	        ++timing.branch_instances;
+	        ++step;
+	      }
+	    };
+
+	    for (uint64_t I = hi;;) {
+	      const uint64_t tile_base = I & ~tile_mask;
+	      const bool full_tile =
+	          can_tile && ((I & tile_mask) == tile_mask) && tile_base >= lo &&
+	          tile_base + tile_mask <= hi;
+	      if (full_tile) {
+	        std::vector<int> prefix =
+	            SetBitsDesc((tile_base & low_mask) & ~tile_mask);
+	        align_stack(prefix);
+
+	        emp::circuit::BooleanProgram* prog = &tile_prog;
+	        emp::circuit::BooleanProgram tampered_prog;
+	        if (step == tamper_step) {
+	          protocol::Circuit tampered =
+	              protocol::BuildTileCircuit(sha, kCacheTileHeight);
+	          TamperFirstFlip(tampered);  // TEST ONLY
+	          CheckTileCircuit(tampered);
+	          tampered_prog = ToBooleanProgram(tampered);
+	          ReleaseVector(tampered.gates);
+	          prog = &tampered_prog;
+	        }
+
+	        auto tb = Clock::now();
+	        TileBV out = sess.run_artifact<TileBV>(*prog, stack_vals.back());
+	        timing.branch_total_s += secs(tb, Clock::now());
+	        timing.new_hashes += kCacheTileLeaves - 1;
+	        ++timing.branch_instances;
+	        ++timing.tile_count;
+	        ++step;
+	        tile_pos[tile_base] = tile_outs.size();
+	        tile_outs.push_back(TileOut{tile_base, out});
+
+	        if (tile_base == lo) break;
+	        I = tile_base - 1;
+	        continue;
+	      }
+
+	      std::vector<int> low = SetBitsDesc(I & low_mask);  // high to low
+	      align_stack(low);
+	      single_pos[I] = single_outs.size();
+	      single_outs.push_back(SingleOut{I, stack_vals.back()});
+	      if (I == lo) break;
+	      --I;
+	    }
+
+	    // ---- reveal every requested output, one-by-one, after precomputation ----
+	    for (uint64_t I = hi;; --I) {
+	      auto trv = Clock::now();
+	      const uint64_t tile_base = I & ~tile_mask;
+	      auto tit = tile_pos.find(tile_base);
+	      if (tit != tile_pos.end()) {
+	        int slot = static_cast<int>(I & tile_mask);
+	        results[(std::size_t)(I - lo)] = DecodeRevealedValue(
+	            RevealTileSlotRaw(sess, tile_outs[tit->second].value, slot));
+	      } else {
+	        auto sit = single_pos.find(I);
+	        if (sit == single_pos.end()) {
+	          throw std::runtime_error("shachain2pc: missing cached output");
+	        }
+	        results[(std::size_t)(I - lo)] = DecodeRevealedValue(
+	            sess.reveal(single_outs[sit->second].value, emp::PUBLIC));
+	      }
+	      timing.reveal_total_s += secs(trv, Clock::now());
+	      if (I == lo) break;
+	    }
+	    io->flush();
     timing.rounds = io->rounds;
     timing.bytes_sent = io->send_counter;
     timing.bytes_recv = io->recv_counter;

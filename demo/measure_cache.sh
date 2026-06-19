@@ -4,7 +4,7 @@
 #   measure_cache.sh <lo-hi> [portbase] [trunk_chunk_size]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-SPEC="${1:-ffffffffff00-ffffffffffff}"; PORT="${2:-28400}"; TCB="${3:-1}"
+SPEC="${1:-ffffffffff00-ffffffffffff}"; PORT="${2:-28400}"; TCB="${3:-16}"
 AS=$(printf 'aa%.0s' {1..32}); BS=$(printf 'ab%.0s' {1..32})
 
 if [[ "$SPEC" != *-* ]]; then
@@ -86,7 +86,10 @@ while read -r tag I val; do
   [ "$val" = "$r" ] || bad=$((bad+1))
 done <"$BR"
 per_secret=$(awk -v w="$wall" -v n="$expected" 'BEGIN{printf "%.4f", w/n}')
-printf "cache %s: wall=%.2fs perSecret=%ss peakRSS=%dMB results=%s mismatches=%s\n" \
-  "$SPEC" "$wall" "$per_secret" "$((peak/1024))" "$n" "$bad"
+pre_reveal=$(awk '/CACHE pre-reveal total/{print $4; exit}' "$AE")
+pre_reveal=${pre_reveal:-0}
+pre_secret=$(awk -v w="$pre_reveal" -v n="$expected" 'BEGIN{printf "%.4f", w/n}')
+printf "cache %s: wall=%.2fs perSecret=%ss preReveal=%ss preRevealPerSecret=%ss peakRSS=%dMB results=%s mismatches=%s\n" \
+  "$SPEC" "$wall" "$per_secret" "$pre_reveal" "$pre_secret" "$((peak/1024))" "$n" "$bad"
 grep -E 'CACHE|NET' "$AE"
 [ "$bad" -eq 0 ]

@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 SPEC="${1:-fffffffffff0-ffffffffffff}"
 STEP="${2:-0}"
 PORT="${3:-28680}"
-TCB="${4:-1}"
+TCB="${4:-16}"
 AS=$(printf 'aa%.0s' {1..32})
 BS=$(printf 'ab%.0s' {1..32})
 

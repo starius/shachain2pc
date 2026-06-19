@@ -88,6 +88,22 @@ std::vector<uint8_t> PaddingBits() {
   return bits;
 }
 
+int PopCountInt(int x) {
+  int n = 0;
+  while (x != 0) {
+    n += x & 1;
+    x >>= 1;
+  }
+  return n;
+}
+
+int LowestSetBit(int x) {
+  for (int b = 0; b < kIndexBits; ++b) {
+    if ((x >> b) & 1) return b;
+  }
+  throw std::runtime_error("LowestSetBit: zero has no set bit");
+}
+
 }  // namespace
 
 Circuit BuildDerivationCircuit(const Circuit& sha, uint64_t I) {
@@ -189,6 +205,48 @@ Circuit BuildChunkCircuit(const Circuit& sha, const std::vector<int>& chain_bits
   for (int i = 0; i < kValueBits; ++i) out[i] = b.XorW(p[i], c0);
 
   return b.Finish(kValueBits, first ? kValueBits : 0, kValueBits);
+}
+
+Circuit BuildTileCircuit(const Circuit& sha, int tile_height) {
+  if (tile_height < 1 || tile_height > kIndexBits) {
+    throw std::runtime_error("BuildTileCircuit: invalid tile height");
+  }
+  if (sha.n1 + sha.n2 != 512 || sha.n3 != kValueBits) {
+    throw std::runtime_error("BuildTileCircuit: gadget is not 512->256");
+  }
+  const int leaves = 1 << tile_height;
+  Builder b(kValueBits);  // one carried tile root input
+
+  const int c0 = b.XorW(0, 0);
+  const int c1 = b.InvW(c0);
+  const std::vector<uint8_t> pad = PaddingBits();
+
+  std::vector<std::vector<int>> node(leaves);
+  node[0].resize(kValueBits);
+  for (int i = 0; i < kValueBits; ++i) node[0][i] = i;
+
+  for (int depth = 1; depth <= tile_height; ++depth) {
+    for (int suffix = 1; suffix < leaves; ++suffix) {
+      if (PopCountInt(suffix) != depth) continue;
+      const int bit = LowestSetBit(suffix);
+      const int parent = suffix & (suffix - 1);
+      std::vector<int> p = node[parent];
+      p[FlipBitIndex(bit)] = b.InvW(p[FlipBitIndex(bit)]);
+
+      std::vector<int> block(512);
+      for (int i = 0; i < kValueBits; ++i) block[i] = p[i];
+      for (int i = 0; i < kValueBits; ++i) block[kValueBits + i] = pad[i] ? c1 : c0;
+      node[suffix] = b.ApplyGadget(sha, block);
+    }
+  }
+
+  for (int suffix = 0; suffix < leaves; ++suffix) {
+    for (int i = 0; i < kValueBits; ++i) {
+      (void)b.XorW(node[suffix][i], c0);
+    }
+  }
+
+  return b.Finish(kValueBits, 0, kValueBits * leaves);
 }
 
 }  // namespace shachain2pc::protocol

@@ -52,6 +52,11 @@ std::vector<std::vector<int>> SplitChainBits(uint64_t I, int blocks_per_chunk);
 Circuit BuildChunkCircuit(const Circuit& sha256_compress,
                           const std::vector<int>& chain_bits, bool first);
 
+// BuildTileCircuit builds a full low-bit subtree tile. Input is one carried
+// 256-bit tile root; output is every leaf in ascending suffix order. For
+// tile_height=4 this outputs 16 * 256 bits and uses 15 SHA-256 blocks internally.
+Circuit BuildTileCircuit(const Circuit& sha256_compress, int tile_height);
+
 }  // namespace shachain2pc::protocol
 
 #endif  // SHACHAIN2PC_PROTOCOL_CIRCUIT_GEN_H

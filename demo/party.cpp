@@ -146,13 +146,13 @@ int main(int argc, char** argv) {
   ThreadPool pool(run::kThreads);  // session-local compute parallelism (global type)
   try {
     // Adaptive-cache mode (range only): SHACHAIN2PC_CACHE=1 computes the shared
-    // trunk once (chunked by SHACHAIN2PC_CHUNK_BLOCKS, default 1), then derives the
+    // trunk once (chunked by SHACHAIN2PC_CHUNK_BLOCKS, default 16), then derives the
     // range in decreasing index order through a stack-cache of the low-bit subtree,
     // reusing the shared prefix and revealing each. This is the in-session cache.
     if (is_range) {
       const char* cache_env = std::getenv("SHACHAIN2PC_CACHE");
       if (cache_env != nullptr && std::atoi(cache_env) != 0) {
-        int tcb = 1;  // simplest low-memory default: one SHA block per chunk
+        int tcb = run::kDefaultCacheTrunkChunkBlocks;
         if (const char* ce = std::getenv("SHACHAIN2PC_CHUNK_BLOCKS")) {
           tcb = std::atoi(ce);
         }
@@ -170,18 +170,24 @@ int main(int argc, char** argv) {
                       static_cast<unsigned long long>(indices[k]),
                       util::ToHex(outs[k]).c_str());
         }
-        const double grand =
-            ct.setup_s + ct.trunk_s + ct.branch_total_s + ct.reveal_total_s;
+        const double pre_reveal = ct.setup_s + ct.trunk_s + ct.branch_total_s;
+        const double grand = pre_reveal + ct.reveal_total_s;
         std::fprintf(stderr, "CACHE setup            %9.4f s\n", ct.setup_s);
         std::fprintf(stderr,
                      "CACHE trunk            %9.4f s   (%d blocks, %d chunk(s), "
                      "split=bit %d)\n",
                      ct.trunk_s, ct.trunk_blocks, ct.trunk_chunks, ct.split_bit);
         std::fprintf(stderr,
-                     "CACHE branches total   %9.4f s   (%ld new hashes for %d "
-                     "secrets = %.2f/secret)\n",
-                     ct.branch_total_s, ct.new_hashes, ct.num_indices,
+                     "CACHE branches total   %9.4f s   (%ld SHA edges, %ld "
+                     "instance(s), %d tile(s) x %d leaves; %.2f edges/secret)\n",
+                     ct.branch_total_s, ct.new_hashes, ct.branch_instances,
+                     ct.tile_count, ct.tile_leaves,
                      ct.num_indices ? (double)ct.new_hashes / ct.num_indices : 0.0);
+        std::fprintf(stderr,
+                     "CACHE pre-reveal total  %9.4f s   (%.4f s/secret over %d)\n",
+                     pre_reveal,
+                     ct.num_indices ? pre_reveal / ct.num_indices : 0.0,
+                     ct.num_indices);
         std::fprintf(stderr, "CACHE reveal total     %9.4f s\n", ct.reveal_total_s);
         std::fprintf(stderr,
                      "CACHE grand-total      %9.4f s   (%.4f s/secret over %d)\n",

@@ -508,8 +508,21 @@ inline protocol::Value RunDerivationChunked(emp::NetIO* io, ThreadPool* pool,
 // revealed one-by-one. Throughput: the trunk is shared instead of recomputed per
 // index. Memory: trunk (optionally chunked) + one branch at a time + the carried
 // 256-bit outputs (tiny). Security is the same as the single circuit: T is carried
-// as an authenticated wire (reused, never re-input), branch flips are in-circuit
-// constants, and revealing one output never opens another (independent masks).
+// as an authenticated wire (reused, never re-input) and branch flips are
+// in-circuit constants, so a tampered branch aborts.
+//
+// Reveal scope: at the MPC level, reveal(out_k) opens only that branch's wires;
+// the other branches keep their independent secret masks, so the protocol leaks
+// no UN-revealed output. BUT shachain itself is a tree -- H(I) lets ANYONE derive
+// H(I') for every descendant I' of I (I' = I with some of I's trailing-zero bits
+// set). That derivation happens outside the MPC and is inherent to shachain, not
+// an MPC leak. So this routine is safe for "derive all requested outputs now"
+// (it reveals the whole set anyway). It is NOT automatically safe for "precompute
+// a range, reveal only one later": the caller must ensure the still-secret set
+// contains no descendant of an already-revealed index (e.g. reveal in increasing
+// trailing-zero / ancestor-last order, or exclude ancestors), or accept that
+// shachain-derivable descendants become known. The I=0 seed is the extreme case
+// (it derives the whole tree) and is gated separately in the party CLI.
 
 // SetBitsDesc returns the set bit positions of x (0..47), high to low.
 inline std::vector<int> SetBitsDesc(uint64_t x) {

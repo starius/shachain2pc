@@ -183,9 +183,10 @@ impl PhaseTiming {
 }
 
 fn ensure_index_allowed(index: Index48, allow_seed_reveal: bool) -> Result<(), PartyError> {
-    // This is a deliberate Rust-only hardening divergence from the C++ demo,
-    // which accepts I=0 silently. Index 0 is the shachain seed, not a normal
-    // per-commitment reveal, so require an explicit local override.
+    // Index 0 is the shachain seed (generate_from_seed runs no SHA round at I=0),
+    // not a normal per-commitment reveal, so require an explicit local override.
+    // The C++ party (demo/party.cpp) enforces the same guard, including ranges
+    // that contain 0.
     if index.get() == 0 && !allow_seed_reveal {
         Err(PartyError::SeedRevealRefused)
     } else {

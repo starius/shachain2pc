@@ -218,13 +218,18 @@ Set `SHACHAIN2PC_COMPAT_TIMING=1` as well to print Fpre/C2PC subphase timings.
   `I=ffffffffffff` case is about 11-14s with roughly 1.06 GB peak RSS for
   ALICE and 1.01 GB for BOB. The future streaming / low-memory protocol work
   belongs to a later version.
-- **The cache optimization is dropped.** A semi-honest implementation can resume
-  a derivation from a *secret-shared* intermediate checkpoint; doing that
-  maliciously requires carrying **authenticated** shared state across circuits
-  (a "stateful authenticated garbling" extension), which is left as future work.
-  Each derivation here recomputes from the seed in one circuit
-  (`popcount(I) ≤ 48` SHA-256 blocks). Security is preferred over the
-  optimization.
+- **Shared-trunk reuse, and its update budget.** A single derivation recomputes
+  from the seed in one circuit (`popcount(I) ≤ 48` SHA-256 blocks). For a batch
+  that shares a high-bit prefix, `SHACHAIN2PC_TREE=1` computes the shared trunk
+  once and derives each branch from it, carrying the intermediate as an
+  **authenticated** wire (malicious-secure — unlike the semi-honest re-input
+  cache it generalizes). Reusing such a value is sound, but the bucketing's
+  `~2^-ssp` error accumulates as `N · 2^-ssp` over `N` derivations against one
+  seed. At the current `ssp = 40` (`run::kSsp`) the **safe limit is ~1,000,000
+  channel updates per seed** (residual `2^-20`); beyond that, **rotate the seed**
+  (new channel — resets the budget for free) or raise `kSsp` (coordinated, ~linear
+  cost). Cross-restart persistence of the authenticated cache is still future
+  work. Full analysis and the cost trade-off: [`docs/shared-trunk-cache.md`](docs/shared-trunk-cache.md).
 - Both parties derive the circuit independently from the authorized `I`, so they
   evaluate byte-identical circuits. If one party enters a different `I`, the
   circuit-digest handshake aborts before any preprocessing. A party that garbles

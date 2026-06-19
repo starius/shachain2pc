@@ -11,6 +11,38 @@ refilled from the seed at the start of each session (accepted trade-off).
 
 ---
 
+## 0. Current setting & operating limit (TL;DR)
+
+**Decision: keep `ssp = 40`** (emp's default; the constant `run::kSsp` in
+`run/derive.h`, passed to every `AG2PCSession`). We accept its operating limit
+rather than pay the permanent cost of a higher value (§3 "cost of raising ssp").
+
+**What this means in practice.** The bucketing error is `~2^-40` per derivation
+and accumulates as `N · 2^-40` over `N` derivations against **one seed**, where
+`N` = revealed per-commitment secrets = **channel updates** (not the 2^48 index
+space — that is never derived; see §3). So per channel/seed at `ssp = 40`:
+
+| max channel updates (one seed) | residual leak probability |
+|---|---|
+| **~1,000,000** (2^20) | ≤ 2^-20  (~1 in a million) |
+| **~1,000** (2^10) | ≤ 2^-30  (~1 in a billion, strong margin) |
+
+The residual is the chance of a *single, undetected, ~1-bit* leak — a real
+attempt aborts with prob `~1 - 2^-40` (almost always caught) and stealing funds
+needs far more than one bit — so **~1M updates per channel is comfortably safe**
+and ~1k is paranoid-safe.
+
+**To expand beyond the limit:**
+1. **Rotate the seed** (open a fresh channel) — the budget is per-seed, so this
+   resets it for free, no code change. This is the normal path.
+2. **Raise `kSsp`** — a coordinated change (both parties must match). Cost is
+   ~linear (§3): `ssp = 64` buys ~2^24 (16 M) updates at a `2^-40` residual for
+   ~1.3–1.6× triple-gen compute/bandwidth/latency (memory unaffected).
+
+The rest of this doc is the analysis behind these numbers.
+
+---
+
 ## 1. Plan — in-session adaptive cache (no persistence)
 
 The trunk is a one-shot, fixed-prefix special case of the BOLT-03 / Go
@@ -245,12 +277,16 @@ upfront. **`ssp ≈ 64` is the sweet spot**: ~1.3–1.6× for a `2^{-40}` residu
    maintain the authenticated frontier, derive on demand, update the cache in
    decreasing-index order; **refill from the seed at session start** (no
    persistence).
-2. Make **`ssp` an explicit session parameter** sized for *derivations actually
-   performed* (≈ commitment updates, `≤ ~2^24` for any real channel — never the
-   2^48 tree): `ssp ≈ κ + log2(N_max)`, e.g. **`ssp = 64`** for `≤ 2^24` updates
-   at `2^{-40}`. Resetting the *session* (same seed) does not reset the budget;
-   rotating the *seed* (new channel) does — so a hard cap near `2^{ssp-κ}` that
-   triggers a seed rotation is the clean backstop, not session restarts.
+2. **Keep `ssp = 40`** (the documented constant `run::kSsp`), and live within its
+   operating limit of **~1,000,000 updates per channel/seed** (residual `2^-20`;
+   §0). Sizing `ssp` for *derivations actually performed* (≈ commitment updates,
+   never the 2^48 tree) is the right mental model: `ssp ≈ κ + log2(N_max)`. We do
+   not raise it now because the cost is a permanent per-derivation tax (§3) and
+   the per-seed rotation backstop covers the tail. If a future deployment needs
+   more headroom, raise `kSsp` (coordinated, both parties; `ssp = 64` → ~2^24
+   updates at `2^-40`, ~1.3–1.6×). Resetting the *session* (same seed) does **not**
+   reset the budget; rotating the *seed* (new channel) does — so a cap near
+   `2^{ssp-κ}` that triggers a seed rotation is the clean backstop.
 3. Prefer **unchunked branches / coarse trunk chunking** when the budget matters;
    chunk only as memory requires, and raise `ssp` to compensate for the extra
    `compute_inplace` instances.

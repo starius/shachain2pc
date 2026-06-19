@@ -92,6 +92,49 @@ static proto::Value RunTreePlain(const proto::Circuit& sha, const proto::Value& 
   return proto::BitsToValue(v);
 }
 
+// Plaintext mirror of RunDerivationCache's stack-cache: trunk once, then the range
+// [lo,hi] in decreasing order through a set-bit-prefix stack. Verifies every H(I)
+// equals the reference (validates the pop/push/prefix-reuse logic, not just one
+// branch). Returns true iff all match.
+static bool VerifyCachePlain(const proto::Circuit& sha, const proto::Value& seed,
+                             const proto::Value& share, uint64_t lo, uint64_t hi) {
+  uint64_t diff = lo ^ hi;
+  int split = -1;
+  for (int b = 47; b >= 0; --b)
+    if ((diff >> b) & 1) { split = b; break; }
+  uint64_t low_mask = (split < 0) ? 0ULL : (((uint64_t)1 << (split + 1)) - 1);
+  uint64_t high_mask = (((uint64_t)1 << 48) - 1) & ~low_mask;
+  proto::Value a = share;
+  proto::Value b{};
+  for (int i = 0; i < 32; ++i) b[i] = seed[i] ^ a[i];
+  std::vector<uint8_t> in = proto::ValueToBits(a);
+  std::vector<uint8_t> bb = proto::ValueToBits(b);
+  in.insert(in.end(), bb.begin(), bb.end());
+  std::vector<std::vector<int>> tg = proto::SplitChainBits(lo & high_mask, 48);
+  std::vector<uint8_t> T =
+      proto::EvalBristol(proto::BuildChunkCircuit(sha, tg[0], true), in);
+
+  std::vector<int> sbits;
+  std::vector<std::vector<uint8_t>> svals;
+  svals.push_back(T);
+  for (uint64_t I = hi;; --I) {
+    std::vector<int> low = proto::SplitChainBits(I & low_mask, 48)[0];
+    std::size_t p = 0;
+    while (p < sbits.size() && p < low.size() && sbits[p] == low[p]) ++p;
+    sbits.resize(p);
+    svals.resize(p + 1);
+    for (std::size_t j = p; j < low.size(); ++j) {
+      svals.push_back(proto::EvalBristol(
+          proto::BuildChunkCircuit(sha, {low[j]}, false), svals.back()));
+      sbits.push_back(low[j]);
+    }
+    if (proto::BitsToValue(svals.back()) != ref::GenerateFromSeed(seed, I))
+      return false;
+    if (I == lo) break;
+  }
+  return true;
+}
+
 int main() {
   proto::Circuit sha = proto::LoadBristol(
       ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt");
@@ -200,6 +243,29 @@ int main() {
       }
     }
     std::printf("shared-trunk (ranges x I x splits): %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // Adaptive cache: the decreasing-order stack-cache must reproduce the reference
+  // for every index in several ranges (exercises prefix reuse + pop/push).
+  {
+    struct R { uint64_t lo, hi; };
+    const R ranges[] = {{0xffffffffff00ULL, 0xffffffffffffULL},
+                        {0xfffffffffff0ULL, 0xffffffffffffULL},
+                        {0x12300ULL, 0x123ffULL},
+                        {0xabcdeULL, 0xabcdeULL}};
+    bool ok = true;
+    for (const R& r : ranges) {
+      for (const proto::Value* sh : {&split0, &split1}) {
+        if (!VerifyCachePlain(sha, ref::FillSeed(0xab), *sh, r.lo, r.hi)) {
+          ok = false;
+          std::printf("  cache mismatch range[%llx,%llx]\n",
+                      static_cast<unsigned long long>(r.lo),
+                      static_cast<unsigned long long>(r.hi));
+        }
+      }
+    }
+    std::printf("adaptive-cache (ranges x splits): %s\n", ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 

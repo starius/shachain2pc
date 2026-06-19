@@ -65,6 +65,33 @@ static proto::Value RunChunked(const proto::Circuit& sha, const proto::Value& se
   return proto::BitsToValue(v);
 }
 
+// Evaluate the shared-trunk decomposition for index I within a range [lo,hi]:
+// the trunk processes the high bits common to the range, the branch the low bits
+// of I (the same split the MPC RunDerivationTree uses). Must equal the reference.
+static proto::Value RunTreePlain(const proto::Circuit& sha, const proto::Value& seed,
+                                 const proto::Value& share, uint64_t lo, uint64_t hi,
+                                 uint64_t I) {
+  uint64_t diff = lo ^ hi;
+  int split = -1;
+  for (int b = 47; b >= 0; --b)
+    if ((diff >> b) & 1) { split = b; break; }
+  uint64_t low_mask = (split < 0) ? 0ULL : (((uint64_t)1 << (split + 1)) - 1);
+  uint64_t high_mask = (((uint64_t)1 << 48) - 1) & ~low_mask;
+  proto::Value a = share;
+  proto::Value b{};
+  for (int i = 0; i < 32; ++i) b[i] = seed[i] ^ a[i];
+  std::vector<uint8_t> in = proto::ValueToBits(a);
+  std::vector<uint8_t> bb = proto::ValueToBits(b);
+  in.insert(in.end(), bb.begin(), bb.end());
+  std::vector<std::vector<int>> tg = proto::SplitChainBits(lo & high_mask, 48);
+  std::vector<uint8_t> T =
+      proto::EvalBristol(proto::BuildChunkCircuit(sha, tg[0], true), in);
+  std::vector<int> branch = proto::SplitChainBits(I & low_mask, 48)[0];
+  std::vector<uint8_t> v =
+      proto::EvalBristol(proto::BuildChunkCircuit(sha, branch, false), T);
+  return proto::BitsToValue(v);
+}
+
 int main() {
   proto::Circuit sha = proto::LoadBristol(
       ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt");
@@ -146,6 +173,33 @@ int main() {
       }
     }
     std::printf("block-chunking (all I x N x splits): %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // Shared-trunk: trunk(common high bits) + per-I branch(low bits) must equal the
+  // reference for every I in several ranges (incl. the degenerate single-index).
+  {
+    struct R { uint64_t lo, hi; };
+    const R ranges[] = {{0xffffffffff00ULL, 0xffffffffffffULL},
+                        {0x100ULL, 0x10fULL},
+                        {0xabc0ULL, 0xabffULL},
+                        {7ULL, 7ULL}};
+    bool ok = true;
+    for (const R& r : ranges) {
+      for (uint64_t I = r.lo; I <= r.hi && ok; ++I) {
+        proto::Value want = ref::GenerateFromSeed(ref::FillSeed(0xab), I);
+        for (const proto::Value* sh : {&split0, &split1}) {
+          if (RunTreePlain(sha, ref::FillSeed(0xab), *sh, r.lo, r.hi, I) != want) {
+            ok = false;
+            std::printf("  tree mismatch range[%llx,%llx] I=%llx\n",
+                        static_cast<unsigned long long>(r.lo),
+                        static_cast<unsigned long long>(r.hi),
+                        static_cast<unsigned long long>(I));
+          }
+        }
+      }
+    }
+    std::printf("shared-trunk (ranges x I x splits): %s\n", ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 

@@ -115,6 +115,50 @@ int main(int argc, char** argv) {
   SetTransportTimeout(io);  // bound blocking recv/send so a stalled peer aborts
   ThreadPool pool(run::kThreads);  // session-local compute parallelism (global type)
   try {
+    // Shared-trunk mode (range only): SHACHAIN2PC_TREE=1 computes the shared
+    // high-bit prefix once, then derives each index's low-bit branch from it;
+    // SHACHAIN2PC_CHUNK_BLOCKS optionally chunks the trunk. Branches are all
+    // computed, then revealed one-by-one.
+    if (is_range) {
+      const char* tree_env = std::getenv("SHACHAIN2PC_TREE");
+      if (tree_env != nullptr && std::atoi(tree_env) != 0) {
+        int tcb = 0;
+        if (const char* ce = std::getenv("SHACHAIN2PC_CHUNK_BLOCKS")) {
+          tcb = std::atoi(ce);
+        }
+        int tamper_branch = -1;
+        if (const char* te = std::getenv("SHACHAIN2PC_TAMPER")) {
+          tamper_branch = std::atoi(te);  // TEST ONLY
+        }
+        run::TreeTiming tt;
+        std::vector<protocol::Value> outs = run::RunDerivationTree(
+            io, &pool, party, indices, share, tcb, tt, tamper_branch);
+        delete io;
+        for (std::size_t k = 0; k < indices.size(); ++k) {
+          std::printf("RESULT %012llx %s\n",
+                      static_cast<unsigned long long>(indices[k]),
+                      util::ToHex(outs[k]).c_str());
+        }
+        std::fprintf(stderr, "TREE  setup            %9.4f s\n", tt.setup_s);
+        std::fprintf(stderr,
+                     "TREE  trunk            %9.4f s   (%d blocks, %d chunk(s), "
+                     "split=bit %d)\n",
+                     tt.trunk_s, tt.trunk_blocks, tt.trunk_chunks, tt.split_bit);
+        std::fprintf(stderr,
+                     "TREE  branches total   %9.4f s   (%zu branches)\n",
+                     tt.branch_total_s(), indices.size());
+        std::fprintf(stderr, "TREE  reveal total     %9.4f s\n",
+                     tt.reveal_total_s());
+        std::fprintf(stderr, "TREE  grand-total      %9.4f s\n",
+                     tt.setup_s + tt.trunk_s + tt.branch_total_s() +
+                         tt.reveal_total_s());
+        std::fprintf(stderr, "NET   rounds=%llu sent=%llu recv=%llu (bytes)\n",
+                     static_cast<unsigned long long>(tt.rounds),
+                     static_cast<unsigned long long>(tt.bytes_sent),
+                     static_cast<unsigned long long>(tt.bytes_recv));
+        return 0;
+      }
+    }
     // Block-chunking mode (single index only): SHACHAIN2PC_CHUNK_BLOCKS=N runs the
     // derivation as a chain of N-block chunks, carrying the authenticated
     // intermediate, to cap the memory peak. Reports per-chunk timing + net rounds.

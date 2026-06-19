@@ -163,11 +163,16 @@ from the running transcript,
 `st.mitc.setS(RO(...).absorb(io.digest()).absorb(sib.digest()).squeeze())`
 (`backend/engine.h:179`). So even though `T`'s label/mask are reused, every branch
 hashes them under a *different* seed → independent, simulatable garbled material.
-No "reused garbled circuit" correlation. `T` is an internal wire, never opened
-(only branch outputs are revealed), so by standard composition reuse leaks nothing
-about `T` beyond the revealed outputs. (This is the Go README's "a fixed shared
-value fed into many fresh circuits leaks nothing beyond the outputs" — here with
-malicious integrity added.)
+No "reused garbled circuit" correlation. The function-dependent leaky-AND /
+`compute_inplace` path has its own hashing and bucketing state (not just this
+half-gate seed), so the cache argument also relies on the AG2PC/WRK17/KRRW18
+proof that each fresh `compute_inplace` remains secure when its representative
+inputs are carried authenticated wires from prior computations. Subject to that
+proof obligation, `T` is an internal wire, never opened (only branch outputs are
+revealed), so standard composition says reuse leaks nothing about `T` beyond the
+revealed outputs. (This is the Go README's "a fixed shared value fed into many
+fresh circuits leaks nothing beyond the outputs" — here with malicious integrity
+added.)
 
 ### 2b. Integrity — can a malicious peer steer via reuse? No.
 
@@ -219,20 +224,22 @@ i.e.
 
 >   **N ≤ 2^{ssp − κ}**,  where N ≈ (number of leaves) × (compute_inplace per branch).
 
-With unchunked branches, `N ≈ number of leaves`. At emp's default **ssp = 40**:
+For budget calculations, count instances first. With one unchunked branch per
+leaf, instances are approximately leaves; with the planned 1-SHA cached branch,
+instances are roughly 1-2× leaves. At emp's default **ssp = 40**:
 
-| residual target | max leaves (ssp=40) | max leaves (ssp=50) | max leaves (ssp=60) |
+| residual target | max instances (ssp=40) | max instances (ssp=50) | max instances (ssp=60) |
 |---|---|---|---|
 | `2^{-20}` | ~`2^20` (1.0 M) | ~`2^30` (1.1 B) | ~`2^40` (1.1 T) |
 | `2^{-30}` | ~`2^10` (1 024) | ~`2^20` (1.0 M) | ~`2^30` (1.1 B) |
 | `2^{-40}` | 1 | ~`2^10` (1 024) | ~`2^20` (1.0 M) |
 
-So at the default ssp=40, deriving ~1 000 leaves keeps the residual at `2^{-30}`;
-~1 M leaves drops it to `2^{-20}`. For a realistic Lightning channel (say up to
-`2^20 ≈ 1 M` commitment updates) you want a comfortable residual (`2^{-40}`),
-which needs **ssp ≈ 60**.
+So at the default ssp=40, ~1 000 instances keep the residual at `2^{-30}`;
+~1 M instances drop it to `2^{-20}`. For a realistic Lightning channel (say up to
+`2^20 ≈ 1 M` commitment updates, and therefore ~1-2 M instances in the planned
+cache), a comfortable residual (`2^{-40}`) needs **ssp ≈ 60-64**.
 
-### Crucial: `N` is derivations *performed*, NOT the 2^48 index space.
+### Crucial: `N` is bucketing instances, NOT the 2^48 index space.
 
 It is tempting to read this as "to support a 48-bit tree we need `ssp ≥ 48 + κ`."
 That is **wrong**, for two reasons:
@@ -241,18 +248,21 @@ That is **wrong**, for two reasons:
    number), not a workload. 2^48 MPC runs is ~2.8e14 derivations — at an
    optimistic 1000/s that is **~9 000 years**, at the measured ~0.13 s/branch
    ~1 million years. No one runs it.
-2. **One derivation costs one `2^{-ssp}`, regardless of its depth.**
+2. **One unchunked `run_artifact` costs one `2^{-ssp}`, regardless of depth.**
    `get_bucket_size(L)` buckets the *whole* batch of `L` ANDs (≈1 M for a 48-deep
-   derivation) to `< 2^{-ssp}` in a single instance, so a full-depth derivation
-   spends one `2^{-ssp}`, not 48 and not 2^48.
+   derivation) to `< 2^{-ssp}` in a single instance, so an unchunked full-depth
+   derivation spends one `2^{-ssp}`, not 48 and not 2^48. Chunked execution spends
+   one term per chunk, and the planned cached branch spends about 1-2 terms per
+   channel update.
 
-So `N` = secrets actually revealed ≈ commitment updates over the channel's life,
-which is `≤ ~2^20`–`2^24` even for an extreme channel — never 2^48. Size `ssp` for
-*that*, not the tree. Your "1/1 000 000" target (κ=20) over 1 M derivations is met
-by the **default ssp=40**; `ssp=64` gives `2^{-40}` over 2^24 (16 M) derivations,
-beyond any real channel. (You *may* set `ssp=68` to nominally cover the full 2^48
-at `2^{-20}` — feasible, buckets B≈4→7, ~1.5–2× the triple-gen COTs — but it
-guards a workload that cannot physically occur.)
+So `N` = total `compute_inplace` instances over the channel's life, which is
+roughly 1-2× actual updates in the planned cache and still nowhere near 2^48. Size
+`ssp` for *that*, not the tree. A "1/1 000 000" target (κ=20) over about 1 M
+instances is met by the **demo/research default ssp=40**; production funds should
+target a stronger residual, e.g. `ssp=64` gives `2^{-40}` over 2^24 (16 M)
+instances. (You *may* set `ssp=68` to nominally cover the full 2^48 at `2^{-20}`
+— feasible, buckets B≈4→7, ~1.5–2× the triple-gen COTs — but it guards a workload
+that cannot physically occur.)
 
 ### Do we need to reset from time to time? Per-session no; per-seed yes (and trivial).
 
@@ -350,16 +360,16 @@ upfront. **`ssp ≈ 64` is the sweet spot**: ~1.3–1.6× for a `2^{-40}` residu
    maintain the authenticated frontier, derive on demand, update the cache in
    decreasing-index order; **refill from the seed at session start** (no
    persistence).
-2. **Keep `ssp = 40`** (the documented constant `run::kSsp`), and live within its
-   operating limit of **~1,000,000 updates per channel/seed** (residual `2^-20`;
-   §0). Sizing `ssp` for *derivations actually performed* (≈ commitment updates,
-   never the 2^48 tree) is the right mental model: `ssp ≈ κ + log2(N_max)`. We do
-   not raise it now because the cost is a permanent per-derivation tax (§3) and
-   the per-seed rotation backstop covers the tail. If a future deployment needs
-   more headroom, raise `kSsp` (coordinated, both parties; `ssp = 64` → ~2^24
-   updates at `2^-40`, ~1.3–1.6×). Resetting the *session* (same seed) does **not**
-   reset the budget; rotating the *seed* (new channel) does — so a cap near
-   `2^{ssp-κ}` that triggers a seed rotation is the clean backstop.
+2. **For the current PoC, keep `ssp = 40`** (the documented constant
+   `run::kSsp`) to preserve performance while measuring the cache. This is a
+   demo/research setting: it gives residual `2^-20` over about 1 M
+   `compute_inplace` instances, i.e. roughly 500k-1M updates for the planned cache,
+   and is not a production target for funds. **For production, use `ssp ≈ 60-64`**
+   and track the per-seed instance count. Sizing `ssp` for instances actually
+   performed, never the 2^48 tree, is the right mental model:
+   `ssp ≈ κ + log2(N_max)`. Resetting the *session* with the same seed does **not**
+   reset the budget; rotating the *seed* (new channel) does. A cap near
+   `2^{ssp-κ}` that triggers seed rotation is the clean backstop.
 3. **Chunking: commit `N = 2^n`, chunk the trunk at `trunk_chunk_size` (the one
    toggle, default 2), and run branches 1-SHA + cached** (§1 "Chunking in the
    cache"). The fixed-N split gives a `(48-n)`-block trunk (chunked, computed once,

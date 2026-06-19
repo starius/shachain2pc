@@ -22,15 +22,18 @@ and accumulates as `N · 2^-40` over `N` derivations against **one seed**, where
 `N` = revealed per-commitment secrets = **channel updates** (not the 2^48 index
 space — that is never derived; see §3). So per channel/seed at `ssp = 40`:
 
-| max channel updates (one seed) | residual leak probability |
+| bucketing instances (one seed) | residual leak probability |
 |---|---|
 | **~1,000,000** (2^20) | ≤ 2^-20  (~1 in a million) |
 | **~1,000** (2^10) | ≤ 2^-30  (~1 in a billion, strong margin) |
 
 The residual is the chance of a *single, undetected, ~1-bit* leak — a real
 attempt aborts with prob `~1 - 2^-40` (almost always caught) and stealing funds
-needs far more than one bit — so **~1M updates per channel is comfortably safe**
-and ~1k is paranoid-safe.
+needs far more than one bit. The table counts **bucketing instances**; the planned
+design (§1: 1-SHA cached branches) spends **~2 instances per update**, so the safe
+**update** count is about half — **~500k updates per seed at `2^-20`** (commit
+`N = 2^n` with `n ≤ 19`), ~512 at `2^-30`. Still comfortably more than any real
+channel does.
 
 **To expand beyond the limit:**
 1. **Rotate the seed** (open a fresh channel) — the budget is per-seed, so this
@@ -73,45 +76,55 @@ Design:
 
 This is a strict generalization of `RunDerivationTree`; it needs no emp changes.
 
-### Chunking within the cache (RAM ↔ latency ↔ budget)
+### Chunking in the cache: fixed-N trunk + 1-SHA cached branches
 
-Chunking is **a toggle, not forced to one SHA per step.** `SHACHAIN2PC_CHUNK_BLOCKS=N`
-sets how many SHA-256 blocks per `run_artifact`; unset = whole circuit, `N=1` = one
-SHA per step (minimum RAM). The mandatory boundary is **trunk vs branch**; chunking
-is the optional knob *within* each. The cache has two distinct chains:
+The concrete design, given a committed **maximum updates `N = 2^n`**:
 
-- **Trunk refill** — the long shared chain (up to ~48 blocks), run **once per
-  session**.
-- **Branches** — the short low-bit suffix (a few blocks), run **per update**.
+**Commit to `N = 2^n` up front.** Near StartIndex the first `2^n` indices share their
+high `(48-n)` bits, so the chain splits cleanly and permanently:
 
-Both are chunkable, and chunk size is now a **three-way** trade (not just
-RAM↔latency): each chunk is its own `compute_inplace` = one bucketing instance =
-one `~2^{-ssp}` term, so finer chunks also spend the per-seed update budget faster.
-Measured on the 48-block worst-case chain:
+- **Trunk** = the `(48-n)` shared high blocks. Computed **once per session**; only
+  its **tip** is cached. *Do not cache inside the trunk* — every update traverses
+  the whole trunk, so its internals are never branch points and caching them is
+  useless; the trunk chunks exist only for the one-time refill and are discarded
+  once they produce the tip.
+- **Branches** = the n-bit subtree below the tip.
+- **`n` is bounded by the budget.** Each leaf costs ~1–2 bucketing instances, so
+  `n ≲ ssp − κ − 1`. At `ssp = 40`, `κ = 20` → **`n ≤ 19`, `N ≤ ~500k`, trunk =
+  `48 − n ≥ 29` blocks.** Choosing `N` is choosing the operating point on the
+  budget curve (and tells you the trunk length).
 
-| chunk N | peak RAM | round-trips | wall @50 ms RTT | budget (bucketing instances) |
+**Trunk → chunk at `trunk_chunk_size` (the one real toggle; conservative default 2).**
+The trunk is the single long chain; its chunk size trades the one-time refill cost
+(shape illustrated on a 48-block chain — the real trunk is `48 − n`):
+
+| trunk_chunk_size | peak RAM | round-trips | wall @50 ms RTT | budget (instances) |
 |---|---|---|---|---|
-| 1 (one SHA/step) | **26 MB** | 198 | ~32 s | **48 × 2^{-ssp}** |
+| 1 (one SHA/step) | **26 MB** | 198 | ~32 s | 48 × 2^{-ssp} |
 | 8 | 116 MB | 30 | ~11 s | 6 × 2^{-ssp} |
-| 48 (whole) | 468 MB | 10 | ~5 s | **1 × 2^{-ssp}** |
+| whole | 468 MB | 10 | ~5 s | 1 × 2^{-ssp} |
 
-So `N=1` gives ~18× less RAM but ~6× the latency and ~48× the budget use *for that
-chain*. The trunk/branch split makes this asymmetric:
+Default **2** sits just above the 1-SHA row — ~tens of MB, but ~half the round-trips
+and ~half the trunk's budget instances vs 1-SHA: an **initial trunk speed-up and a
+small budget save at moderate RAM**. Raise to 4–8 on a server for a faster/cheaper
+refill (transient ~tens–hundreds of MB); drop to 1 only if RAM is the hard limit.
+The trunk is once per session, so this cost amortizes over the `2^n` leaves — it
+matters most under frequent restarts.
 
-- **Trunk:** chunking is where the RAM win lives (468→26 MB), and its budget cost
-  is **once per session** (`k·2^{-ssp}` ≈ 40·2^{-40}) — negligible against `N`
-  updates. **Chunk the trunk freely** when RAM-constrained.
-- **Branches:** already low-RAM whole (~tens of MB), so chunking them buys little
-  RAM but multiplies the **per-update** budget by the branch length (~4× → ~4×
-  fewer safe updates, e.g. ~1 M → ~250 k at ssp=40) and adds per-update latency.
-  **Keep branches whole** unless RAM is truly desperate.
+**Branches → always 1-SHA + cache.** Within the n-bit subtree, run one SHA per step
+and cache each output: the BOLT-03 cache truncated to depth `n`. Because secrets are
+revealed in decreasing index order, consecutive leaves share the subtree prefix, so
+each new leaf is ~2 new steps amortized (**~1–2 instances/leaf**) at **minimum RAM
+(~10 MB)**. Caching is **required** here: recomputing each leaf's full branch from
+the tip would be ~`(n/4)×` the compute and infeasible at our `n`. The price of the
+*fine* (1-SHA) cache is ~2× the bucketing instances of a coarser branch cache —
+i.e. ~½ the safe-update count (the ~500k above) — accepted for minimum RAM and
+maximum sharing.
 
-**Planned default: chunk the trunk (e.g. `N=8` → ~116 MB), keep branches whole.**
-This caps the one-time session-start RAM spike at a small, once-per-session latency
-cost while leaving per-update latency and the update budget at their best. Full
-one-SHA-per-step (trunk *and* branches) is the minimum-RAM mode — reserve it for
-hosts where RAM is the hard constraint, accepting the latency and the
-÷(branch-length) cut to the update budget.
+(This supersedes the earlier "keep branches whole" idea: whole branches only make
+sense *without* a cache — recompute per leaf — which is exactly what the cache
+exists to avoid. With the cache, branches are 1-SHA-and-cached, and the only tunable
+is `trunk_chunk_size`.)
 
 ---
 
@@ -284,11 +297,12 @@ upfront. **`ssp ≈ 64` is the sweet spot**: ~1.3–1.6× for a `2^{-40}` residu
   every leaf from the seed independently exposes the seed in *every* derivation;
   so for the single most-sensitive value the cache is, if anything, better. Net:
   the cache is a throughput/memory win at no extra security cost (at equal ssp).
-- **Chunking spends budget** (the third axis, detailed in §1 "Chunking within the
-  cache"). Each chunk is its own `compute_inplace` → its own `< 2^{-ssp}`, so a
-  branch in `c` chunks contributes `c·2^{-ssp}`. Hence the planned default — **chunk
-  the trunk (cheap, once per session), keep branches whole** — and raise `ssp`
-  rather than chunk branches finely when the budget is tight.
+- **Chunking spends budget** (the third axis, detailed in §1 "Chunking in the
+  cache"). Each chunk is its own `compute_inplace` → its own `< 2^{-ssp}`. The
+  design accepts this on the branch side (1-SHA cached branches ≈ 2 instances/leaf
+  — the price of min RAM + max sharing) and minimizes it on the trunk
+  (`trunk_chunk_size`, default 2, computed once per session). Raise `ssp` rather
+  than coarsen the cache when the budget is tight.
 
 ---
 
@@ -325,11 +339,13 @@ upfront. **`ssp ≈ 64` is the sweet spot**: ~1.3–1.6× for a `2^{-40}` residu
    updates at `2^-40`, ~1.3–1.6×). Resetting the *session* (same seed) does **not**
    reset the budget; rotating the *seed* (new channel) does — so a cap near
    `2^{ssp-κ}` that triggers a seed rotation is the clean backstop.
-3. **Default chunking: chunk the trunk (e.g. `N=8`), keep branches whole** (§1
-   "Chunking within the cache"). The trunk chunk caps the once-per-session RAM
-   spike cheaply; whole branches keep per-update latency and budget at their best.
-   Full one-SHA-per-step is the minimum-RAM mode for RAM-constrained hosts only,
-   at the cost of latency and a ÷(branch-length) cut to the update budget.
+3. **Chunking: commit `N = 2^n`, chunk the trunk at `trunk_chunk_size` (the one
+   toggle, default 2), and run branches 1-SHA + cached** (§1 "Chunking in the
+   cache"). The fixed-N split gives a `(48-n)`-block trunk (chunked, computed once,
+   only its tip cached — nothing cached inside it) and an n-bit subtree of cached
+   1-SHA branches (min RAM, max sharing). `n` is bounded by the budget
+   (`n ≤ ssp-κ-1`; ≤ 19 at ssp=40). Raise `trunk_chunk_size` to 4–8 on a server
+   for a faster/cheaper refill; drop to 1 only when RAM is the hard limit.
 4. Persistence across restarts (to skip the per-session refill) remains the
    separate, harder "stateful authenticated garbling with resume" project
    (serialize authenticated state + Δ/COT) — out of scope for now.

@@ -8,8 +8,15 @@
 CXX ?= g++
 EMP_PREFIX := .deps/emp
 
-SIMD := -mssse3 -msse4.1 -msse4.2 -maes -mpclmul
-CXXFLAGS := -std=c++20 -O2 -pthread $(SIMD)
+# Allow -march=native through nix's cc-wrapper (strips native arch by default).
+export NIX_ENFORCE_NO_NATIVE := 0
+
+# Tune for the host CPU (AVX2/FMA/BMI2 over the old SSE4.2 baseline). The
+# header-only emp-ag2pc engine -- the dominant per-AND garbling cost -- is
+# compiled into the party here, so these flags hit the hot path directly.
+# LTO inlines across our TUs (compile+link is one step). Release-grade -O3.
+ARCH := -march=native
+CXXFLAGS := -std=c++20 -O3 -flto -pthread $(ARCH)
 
 OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl)
 OPENSSL_LIBS := $(shell pkg-config --libs openssl)

@@ -182,8 +182,7 @@ nix develop -c cargo test --manifest-path rust/Cargo.toml
 
 The Rust tests include live C++/Rust interop for the protocol layers and a
 Rust/Rust party E2E test for `I = 1` plus `I = 3` (multi-block chaining). Those
-real-circuit debug tests are intentionally expensive; on the current review
-machine the party crate's real-circuit test is roughly 5-6 minutes. For a faster
+real-circuit debug tests are heavier than the unit/probe tests. For a faster
 optimized check, run the specific release test:
 
 ```sh
@@ -192,23 +191,25 @@ nix develop -c cargo test --release --manifest-path rust/Cargo.toml \
 ```
 
 The full `I = ffffffffffff` 48-block Rust party test exists but is ignored by
-default; the plaintext circuit verifier covers that index, but the full Rust MPC
-run has not yet been demonstrated end-to-end.
+default. It has been run manually in release mode on the current review machine
+and matched the reference in about 11-14s.
 
 Set `SHACHAIN2PC_PHASE_TIMING=1` on the Rust `party` processes to print phase
 timings to stderr without changing stdout's `RESULT <hex>` output.
+Set `SHACHAIN2PC_COMPAT_TIMING=1` as well to print Fpre/C2PC subphase timings.
 
 ## Scope and trade-offs
 
 - **2 parties, asymmetric roles** (party 1 = garbler/ALICE, party 2 =
   evaluator/BOB). Not threshold, not post-quantum.
-- **Rust v1 is a faithful compatibility port, not a performance port.** It
-  preserves the EMP-compatible protocol and wire behavior and is cross-checked
-  against the C++ implementation, but it is still slower than the C++ engine for
-  real SHA circuits. Current local release measurements: `I=1` Rust/Rust is
-  about 1.7s versus 0.43s for C++/C++; `I=3` Rust/Rust is about 4.6s versus
-  0.60s for C++/C++. The future streaming / low-memory protocol work belongs to
-  a later version.
+- **Rust v1 is still a compatibility/correctness port, not the final low-memory
+  protocol.** The protocol layers are cross-checked against C++ probes, but large
+  Rust/Rust real-circuit runs now use Rust-side Fpre chunk sizing to avoid
+  regenerating unused preprocessing. Current local release measurements:
+  `I=1` Rust/Rust is about 0.28s, `I=3` is about 0.49s, and the full
+  `I=ffffffffffff` case is about 11-14s with roughly 1.06 GB peak RSS for
+  ALICE and 1.01 GB for BOB. The future streaming / low-memory protocol work
+  belongs to a later version.
 - **The cache optimization is dropped.** A semi-honest implementation can resume
   a derivation from a *secret-shared* intermediate checkpoint; doing that
   maliciously requires carrying **authenticated** shared state across circuits
@@ -221,6 +222,11 @@ timings to stderr without changing stdout's `RESULT <hex>` output.
   circuit-digest handshake aborts before any preprocessing. A party that garbles
   a *different function* after committing to the same circuit is caught by
   authenticated garbling (clean abort).
+- Large real-circuit Rust/C++ party runs are not the current compatibility
+  target. With the vendored EMP setting `fpre_threads = 1`, EMP's bucket-3/4
+  refill path exposes only `permute_batch_size` usable triples per refill.
+  Rust/Rust uses explicit repeated chunks for those circuits; the C++ interop
+  probes still cover the protocol layers on small circuits.
 
 ## Known limitations
 

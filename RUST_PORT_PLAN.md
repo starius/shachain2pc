@@ -47,11 +47,18 @@ but the MPC protocol logic must live in this repository.
 ## Performance target and current status
 
 The original target was that Rust/Rust v1 should not be materially slower than
-the current C++ baseline. Current measurements do not meet that target: Rust v1
-is a faithful compatibility/correctness port, but real SHA-circuit performance
-is still future optimization work. After the first local optimization pass,
-release Rust/Rust measured about 1.7s for `I = 1` and 4.6s for `I = 3`, versus
-about 0.43s and 0.60s for C++/C++ on the same machine.
+the current C++ baseline. After the local optimization passes, release
+Rust/Rust measured about 0.28s for `I = 1`, 0.49s for `I = 3`, and 11-14s for
+`I = ffffffffffff` on the current review machine. The 48-block run matched the
+reference and peaked at about 1.06 GB RSS for ALICE and 1.01 GB for BOB. C++/C++
+on the same machine measured about 0.43s for `I = 1` and 0.60s for `I = 3`.
+
+The Rust/Rust real-circuit path uses Rust-side Fpre chunk sizing for bucket-3/4
+circuits to avoid regenerating unused preprocessing. That is a deliberate
+performance/correctness choice for Rust/Rust real circuits under the vendored
+`fpre_threads = 1` setting; large real-circuit Rust/C++ party runs are therefore
+not the current release gate even though the protocol-layer C++ probes remain
+mandatory.
 
 Release-gate benchmark:
 
@@ -61,7 +68,7 @@ Release-gate benchmark:
 - measure C++ ALICE + C++ BOB as the baseline;
 - measure Rust ALICE + Rust BOB as the release gate;
 - measure Rust/C++ mixed mode in both directions as an informative compatibility
-  signal;
+  signal for the probed protocol layers;
 - Rust ALICE + Rust BOB must not be statistically slower than the C++/C++
   baseline.
 

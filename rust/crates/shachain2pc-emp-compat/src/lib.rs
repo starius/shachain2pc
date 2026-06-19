@@ -9,8 +9,10 @@ use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
 use shachain2pc_types::Role;
+use std::env;
 use std::fmt;
 use std::sync::OnceLock;
+use std::time::Instant;
 use zeroize::Zeroize;
 
 pub const HASH_DIGEST_BYTES: usize = 32;
@@ -166,18 +168,70 @@ impl Prp {
 
     pub fn permute_block(&self, blocks: &mut [Block]) {
         for block in blocks {
-            let mut aes_block = GenericArray::clone_from_slice(block.as_bytes());
-            self.cipher.encrypt_block(&mut aes_block);
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&aes_block);
-            *block = Block::from_bytes(bytes);
+            *block = self.permute_one(*block);
         }
+    }
+
+    pub fn permute_one(&self, block: Block) -> Block {
+        let mut aes_block = GenericArray::clone_from_slice(block.as_bytes());
+        self.cipher.encrypt_block(&mut aes_block);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&aes_block);
+        Block::from_bytes(bytes)
     }
 }
 
 fn zero_key_prp() -> &'static Prp {
     static ZERO_KEY_PRP: OnceLock<Prp> = OnceLock::new();
     ZERO_KEY_PRP.get_or_init(Prp::zero_key)
+}
+
+struct CompatPhaseTiming {
+    enabled: bool,
+    role: Role,
+    scope: &'static str,
+    start: Instant,
+    last: Instant,
+}
+
+impl CompatPhaseTiming {
+    fn new(role: Role, scope: &'static str) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: compat_timing_enabled(),
+            role,
+            scope,
+            start: now,
+            last: now,
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let phase_ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
+        let total_ms = now.duration_since(self.start).as_secs_f64() * 1000.0;
+        eprintln!(
+            "TIMING compat role={} scope={} phase={} phase_ms={:.3} total_ms={:.3}",
+            self.role.party_id(),
+            self.scope,
+            phase,
+            phase_ms,
+            total_ms
+        );
+        self.last = now;
+    }
+}
+
+fn compat_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("SHACHAIN2PC_COMPAT_TIMING")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    })
 }
 
 pub struct Prg {
@@ -211,17 +265,28 @@ impl Prg {
     }
 
     pub fn random_data(&mut self, nbytes: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(nbytes);
-        let full_blocks = nbytes / 16;
-        for block in self.random_block(full_blocks) {
-            out.extend_from_slice(block.as_bytes());
-        }
-        let rem = nbytes % 16;
-        if rem != 0 {
-            let extra = self.random_block(1);
-            out.extend_from_slice(&extra[0].as_bytes()[..rem]);
-        }
+        let mut out = vec![0u8; nbytes];
+        self.fill_random_data(&mut out);
         out
+    }
+
+    pub fn fill_random_data(&mut self, out: &mut [u8]) {
+        let mut chunks = out.chunks_exact_mut(BLOCK_BYTES);
+        for chunk in &mut chunks {
+            let block = self.next_block();
+            chunk.copy_from_slice(block.as_bytes());
+        }
+        let rem = chunks.into_remainder();
+        if !rem.is_empty() {
+            let block = self.next_block();
+            rem.copy_from_slice(&block.as_bytes()[..rem.len()]);
+        }
+    }
+
+    fn next_block(&mut self) -> Block {
+        let block = Block::make(0, self.counter);
+        self.counter += 1;
+        self.prp.permute_one(block)
     }
 
     pub fn random_bool_aligned(&mut self, length: usize) -> Vec<bool> {
@@ -895,12 +960,14 @@ impl Fpre {
         streams: &mut EmpStreams,
         tamper_eq_for_test: bool,
     ) -> Result<FpreGenerated> {
+        let mut timing = CompatPhaseTiming::new(self.party, "fpre_refill");
         let raw_length = self
             .params
             .batch_size
             .checked_mul(self.params.bucket_size)
             .ok_or(CompatError::LengthOverflow("Fpre refill raw length"))?;
         let mut raw = self.generate(streams, raw_length).await?;
+        timing.mark("generate");
 
         let half_batch = self.params.batch_size / 2;
         let check_length = half_batch
@@ -933,14 +1000,18 @@ impl Fpre {
             fpre_check_on_stream(ctx0, mac0, key0, check_length),
             fpre_check_on_stream(ctx1, mac1, key1, check_length)
         )?;
+        timing.mark("check");
 
         let seed = coin_tossing(self.coin_prg_seed, &mut streams.fpre_io0, self.party).await?;
+        timing.mark("coin_toss");
         let combined = self.combine(seed, streams, &raw).await?;
+        timing.mark("combine");
         self.fold_eq_digests();
         if tamper_eq_for_test {
             self.eq[0].update(b"shachain2pc test tamper");
         }
         self.feq_compare(&mut streams.fpre_io0).await?;
+        timing.mark("feq_compare");
         Ok(combined)
     }
 
@@ -1101,7 +1172,7 @@ impl C2pc {
     pub async fn new(streams: &mut EmpStreams, party: Role, circuit: C2pcCircuit) -> Result<Self> {
         let num_ands = circuit.num_ands();
         let total_pre = circuit.total_pre();
-        let fpre = Fpre::setup(streams, party, num_ands).await?;
+        let fpre = Fpre::setup(streams, party, c2pc_fpre_setup_size(num_ands)).await?;
         Ok(Self {
             party,
             mac: vec![Block::zero(); circuit.num_wire],
@@ -1123,9 +1194,11 @@ impl C2pc {
     }
 
     pub async fn function_independent(&mut self, streams: &mut EmpStreams) -> Result<()> {
+        let mut timing = CompatPhaseTiming::new(self.party, "function_independent");
         if self.party == Role::Alice {
             self.labels = random_blocks(self.circuit.num_wire)?;
         }
+        timing.mark("random_labels");
 
         self.ands_mac.clear();
         self.ands_key.clear();
@@ -1140,6 +1213,7 @@ impl C2pc {
             batch_mac.zeroize();
             batch_key.zeroize();
         }
+        timing.mark("fpre_refill");
 
         let total_pre = self.circuit.total_pre();
         let (preprocess_key, preprocess_mac) = match self.party {
@@ -1176,6 +1250,7 @@ impl C2pc {
         let input_len = self.circuit.input_len();
         self.key[..input_len].copy_from_slice(&self.preprocess_key[..input_len]);
         self.mac[..input_len].copy_from_slice(&self.preprocess_mac[..input_len]);
+        timing.mark("preprocess_dot");
         Ok(())
     }
 
@@ -1717,6 +1792,22 @@ impl Drop for C2pc {
     }
 }
 
+fn c2pc_fpre_setup_size(num_ands: usize) -> usize {
+    let params = FpreParams::for_size(num_ands);
+    // With fpre_threads=1, bucket-3/4 refill combines at most
+    // permute_batch_size triples. Repeated C2PC refills should therefore size
+    // the raw bucket to that usable output instead of regenerating a
+    // num_ands-sized raw bucket for each chunk.
+    if params.bucket_size <= 4 {
+        params
+            .permute_batch_size
+            .map(|size| size.min(num_ands))
+            .unwrap_or(num_ands)
+    } else {
+        num_ands
+    }
+}
+
 fn checked_nonnegative(name: &'static str, value: i32) -> Result<usize> {
     if value < 0 {
         Err(CompatError::BadC2pcCircuit(format!(
@@ -2036,15 +2127,17 @@ async fn send_pre_block(
 ) -> Result<Vec<Block>> {
     let local_block_size = round_up_128(len);
     let row_bytes = local_block_size / 8;
-    let mut rows = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
+    let mut rows = vec![0u8; IKNP_SECURITY_BITS * row_bytes];
     let received_rows = stream.recv_data(IKNP_SECURITY_BITS * row_bytes).await?;
     for i in 0..IKNP_SECURITY_BITS {
-        let mut row = state.g0[i].random_data(row_bytes);
+        let start = i * row_bytes;
+        let end = start + row_bytes;
+        let row = &mut rows[start..end];
+        state.g0[i].fill_random_data(row);
         let received = &received_rows[i * row_bytes..(i + 1) * row_bytes];
         if state.s[i] {
-            xor_bytes_in_place(&mut row, received);
+            xor_bytes_in_place(row, received);
         }
-        rows.extend_from_slice(&row);
     }
     Ok(transpose_128_rows(&rows, row_bytes, local_block_size))
 }
@@ -2098,12 +2191,16 @@ async fn recv_pre_block(
     let local_block_size = round_up_128(len);
     let blocks_per_row = local_block_size / IKNP_SECURITY_BITS;
     let row_bytes = local_block_size / 8;
-    let mut rows = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
-    let mut messages = Vec::with_capacity(IKNP_SECURITY_BITS * row_bytes);
+    let mut rows = vec![0u8; IKNP_SECURITY_BITS * row_bytes];
+    let mut messages = vec![0u8; IKNP_SECURITY_BITS * row_bytes];
+    let mut row1 = vec![0u8; row_bytes];
     for i in 0..IKNP_SECURITY_BITS {
-        let row0 = state.g0[i].random_data(row_bytes);
-        let row1 = state.g1[i].random_data(row_bytes);
-        let mut message = vec![0u8; row_bytes];
+        let start = i * row_bytes;
+        let end = start + row_bytes;
+        let row0 = &mut rows[start..end];
+        let message = &mut messages[start..end];
+        state.g0[i].fill_random_data(row0);
+        state.g1[i].fill_random_data(&mut row1);
         for (j, r_block) in r.iter().enumerate().take(blocks_per_row) {
             let start = j * BLOCK_BYTES;
             let r_bytes = r_block.as_bytes();
@@ -2111,10 +2208,9 @@ async fn recv_pre_block(
                 message[start + k] = row0[start + k] ^ row1[start + k] ^ r_bytes[k];
             }
         }
-        messages.extend_from_slice(&message);
-        rows.extend_from_slice(&row0);
     }
     stream.send_data(&messages).await?;
+    row1.zeroize();
     messages.zeroize();
     Ok(transpose_128_rows(&rows, row_bytes, local_block_size))
 }
@@ -2128,10 +2224,16 @@ fn validate_iknp_len(name: &'static str, len: usize) -> Result<()> {
 }
 
 fn random_blocks(length: usize) -> Result<Vec<Block>> {
-    let mut out = Vec::with_capacity(length);
-    for _ in 0..length {
-        out.push(random_block()?);
-    }
+    let byte_len = length
+        .checked_mul(BLOCK_BYTES)
+        .ok_or(CompatError::LengthOverflow("random blocks"))?;
+    let mut bytes = vec![0u8; byte_len];
+    rand_bytes(&mut bytes)?;
+    let out = bytes
+        .chunks_exact(BLOCK_BYTES)
+        .map(|chunk| Block::from_bytes(chunk.try_into().expect("block length")))
+        .collect();
+    bytes.zeroize();
     Ok(out)
 }
 
@@ -2336,6 +2438,14 @@ mod tests {
                 transpose_128_rows_bit_reference(&rows, row_bytes, output_len)
             );
         }
+    }
+
+    #[test]
+    fn c2pc_fpre_setup_size_caps_bucketed_refills() {
+        assert_eq!(c2pc_fpre_setup_size(2), 2);
+        assert_eq!(c2pc_fpre_setup_size(3_100), 3_100);
+        assert_eq!(c2pc_fpre_setup_size(22_272), 3_100);
+        assert_eq!(c2pc_fpre_setup_size(1_069_056), 280_000);
     }
 
     fn transpose_128_rows_bit_reference(

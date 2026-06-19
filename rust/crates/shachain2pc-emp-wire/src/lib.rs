@@ -421,9 +421,12 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
     use tokio::time::timeout;
 
     const LIVE_INTEROP_TIMEOUT: Duration = Duration::from_secs(60);
+    static LIVE_CPP_INTEROP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
@@ -540,9 +543,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_peer_three_stream_interop() {
+        let _guard = live_cpp_interop_lock().lock().await;
         let bin = cpp_wire_probe();
         run_live_case(&bin, Role::Alice).await;
         run_live_case(&bin, Role::Bob).await;
+    }
+
+    fn live_cpp_interop_lock() -> &'static Mutex<()> {
+        LIVE_CPP_INTEROP_LOCK.get_or_init(|| Mutex::new(()))
     }
 
     async fn run_live_case(bin: &Path, rust_role: Role) {

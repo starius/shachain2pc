@@ -65,6 +65,42 @@ uint32_t out = sess.reveal(c, PUBLIC).value();   // reveal returns std::optional
 - Memory is **linear in (#AND gates + live width)**, not #wires — a slot-reused
   per-wire layout. Stale wires error loudly (a value whose ids were pruned).
 
+## Batching many evaluations in one session (what `party` now does)
+
+The one-time session cost (the SoftSpoken COT mesh set up in the `AG2PCSession`
+ctor + the per-party input authentication) is **constant per session**, not per
+circuit. So evaluating N circuits that share inputs under one session pays it once.
+`run/derive.h::RunDerivationBatch` does exactly this for an I-range:
+
+- **Authenticate the two seed shares once**, then `run_artifact` each index's
+  circuit reusing those same authenticated inputs (only the circuit changes).
+  `run_artifact` materializes the output wires but reveals nothing.
+- **Compute and reveal are separate phases.** The outputs sit as authenticated
+  carried state (`carried_`) until opened; `reveal` does not prune
+  already-materialized values, so all N outputs stay live until the reveal loop.
+- Measured split (portable SSE4.2 build, loopback, ThreadPool=4), I-range 1..8:
+  setup ≈ 0.17 s **once**; compute 0.07–0.28 s per index (scales with popcount =
+  #SHA blocks); **reveal ≈ 0.1 ms per index**. Running the 8 separately would pay
+  ~8× the setup (~1.3 s of setup alone) vs 0.17 s batched.
+
+**Delayed reveal / "almost-instant finish."** Because reveal is ~0.1 ms while
+compute is ~100 ms, you can do all the heavy authenticated work ahead of time and
+open on demand. The new API even supports holding the authenticated outputs across
+*more* computation via `checkpoint(keep...)` (above). What is **not** there yet is
+disk persistence — `carried_` is in-memory, and the COT mesh is per-session, so
+"resume in a fresh process tomorrow" still needs an upstream serialize/restore.
+
+**Neither party can open a computed output alone** (a property we rely on for the
+compute-now/reveal-later split). `reveal`→`AG2PCProtocol::decode` is *interactive*:
+for a PUBLIC reveal the garbler ships its λ-share + `Hash(MACs)` to the evaluator,
+who recomputes the expected MACs from its own `key ⊕ bit·Δ`, **aborts on a digest
+mismatch**, reconstructs `v = my_share ⊕ Lambda ⊕ peer_share`, then broadcasts it
+back. The garbler holds only its λ-share/MACs; the evaluator holds its share +
+`Lambda`. A lone `reveal()` blocks on `io->recv_data` (our `SO_RCVTIMEO` aborts it),
+and the MAC-digest check stops a party feeding a forged share. So in the
+computed-but-unrevealed state, the value is recoverable only with both sides'
+cooperation — structural, not a check we add.
+
 ## Async / parallelism
 
 - The session takes a `ThreadPool*`; the engine uses it for local-compute

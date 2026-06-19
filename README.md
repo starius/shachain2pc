@@ -224,12 +224,16 @@ Set `SHACHAIN2PC_COMPAT_TIMING=1` as well to print Fpre/C2PC subphase timings.
   once and derives each branch from it, carrying the intermediate as an
   **authenticated** wire (malicious-secure — unlike the semi-honest re-input
   cache it generalizes). Reusing such a value is sound, but the bucketing's
-  `~2^-ssp` error accumulates as `N · 2^-ssp` over `N` derivations against one
-  seed. At the current `ssp = 40` (`run::kSsp`) the **safe limit is ~1,000,000
-  channel updates per seed** (residual `2^-20`); beyond that, **rotate the seed**
-  (new channel — resets the budget for free) or raise `kSsp` (coordinated, ~linear
-  cost). Cross-restart persistence of the authenticated cache is still future
-  work. Full analysis and the cost trade-off: [`docs/shared-trunk-cache.md`](docs/shared-trunk-cache.md).
+  `~2^-ssp` error accumulates as `N · 2^-ssp`, where `N` is the total number of
+  `compute_inplace` bucketing instances run against one seed: revealed outputs,
+  precomputed-but-unrevealed outputs, aborted attempts, refills, and chunks. The
+  current `ssp = 40` (`run::kSsp`) is a demo/research default: with the planned
+  cache shape it gives roughly 500k-1M updates at residual `2^-20`, which is not
+  a production target for funds. For production, use `ssp ≈ 60-64`, track every
+  instance against the per-seed budget, and rotate the seed before crossing the
+  chosen risk threshold. Cross-restart persistence of the authenticated cache is
+  still future work. Full analysis and the cost trade-off:
+  [`docs/shared-trunk-cache.md`](docs/shared-trunk-cache.md).
 - Both parties derive the circuit independently from the authorized `I`, so they
   evaluate byte-identical circuits. If one party enters a different `I`, the
   circuit-digest handshake aborts before any preprocessing. A party that garbles

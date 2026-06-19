@@ -23,8 +23,8 @@ theft-adjacent revocation material.
 accumulates as `N · 2^-ssp` against **one seed**, where **`N` = the total number of
 `compute_inplace` bucketing instances** ever run against that seed — *every*
 trunk-refill chunk, branch chunk, precomputed-but-unrevealed output, and *aborted*
-attempt, not just revealed secrets. (It is bounded by derivations performed, never
-the 2^48 index space; see §3.) With the planned design (§1: ~1–2 instances per
+attempt, not just revealed secrets. (It is bounded by the computations actually
+performed, never the 2^48 index space; see §3.) With the planned design (§1: ~1–2 instances per
 update) `N` ≈ 1–2× the channel-update count.
 
 At the **demo/research default `ssp = 40`**:
@@ -91,12 +91,14 @@ Design:
 
 This is a strict generalization of `RunDerivationTree`; it needs no emp changes.
 
-### Chunking in the cache: fixed-N trunk + 1-SHA cached branches
+### Chunking in the cache: fixed update-cap trunk + 1-SHA cached branches
 
-The concrete design, given a committed **maximum updates `N = 2^n`**:
+The concrete design, given a committed **maximum of `2^n` updates** for the channel.
+(This update cap is a design choice; it relates to the budget `N` of §0/§4 — total
+`compute_inplace` instances — by `N ≈ (1–2) · 2^n`.)
 
-**Commit to `N = 2^n` up front.** Near StartIndex the first `2^n` indices share their
-high `(48-n)` bits, so the chain splits cleanly and permanently:
+**Commit to `2^n` updates up front.** Near StartIndex the first `2^n` indices share
+their high `(48-n)` bits, so the chain splits cleanly and permanently:
 
 - **Trunk** = the `(48-n)` shared high blocks. Computed **once per session**; only
   its **tip** is cached. *Do not cache inside the trunk* — every update traverses
@@ -104,10 +106,11 @@ high `(48-n)` bits, so the chain splits cleanly and permanently:
   useless; the trunk chunks exist only for the one-time refill and are discarded
   once they produce the tip.
 - **Branches** = the n-bit subtree below the tip.
-- **`n` is bounded by the budget.** Each leaf costs ~1–2 bucketing instances, so
-  `n ≲ ssp − κ − 1`. At `ssp = 40`, `κ = 20` → **`n ≤ 19`, `N ≤ ~500k`, trunk =
-  `48 − n ≥ 29` blocks.** Choosing `N` is choosing the operating point on the
-  budget curve (and tells you the trunk length).
+- **The cap `n` is bounded by the budget.** Each leaf costs ~1–2 bucketing
+  instances (the §0 `N`), so `n ≲ ssp − κ − 1`. At `ssp = 40`, `κ = 20` →
+  **`n ≤ 19`, i.e. `2^n ≤ ~500k` updates, trunk = `48 − n ≥ 29` blocks.** Choosing
+  `n` is choosing the operating point on the budget curve (and fixes the trunk
+  length).
 
 **Trunk → chunk at `trunk_chunk_size` (the one real toggle; conservative default 2).**
 The trunk is the single long chain; its chunk size trades the one-time refill cost
@@ -267,20 +270,20 @@ that cannot physically occur.)
 ### Do we need to reset from time to time? Per-session no; per-seed yes (and trivial).
 
 - **Restarting the SESSION with the SAME seed does NOT reset the budget.** The
-  error is over *total* derivations against that seed's tree (attempts accumulate
-  across reconnects; composition already covers abort-and-retry). Re-randomizing a
-  cache node does not reclaim it either.
+  error is over *total* `compute_inplace` instances against that seed (attempts
+  accumulate across reconnects; composition already covers abort-and-retry).
+  Re-randomizing a cache node does not reclaim it either.
 - **The budget is per-SEED.** Rotating to a **new shachain seed** (closing/reopening
   the channel) gives a completely fresh budget — the new tree is independent, and
   old leakage only ever concerned the old (now-closed) channel. So if a channel
-  ever approached `2^{ssp-κ}` derivations, it simply rotates the seed. At `ssp≈64`
+  ever approached `2^{ssp-κ}` instances, it simply rotates the seed. At `ssp≈64`
   this never arises for a real channel.
-- **The main lever is `ssp`**, chosen at session start: `ssp ≈ κ + log2(N_max)`.
-  For `N_max = 2^24` at `2^{-40}`, `ssp ≈ 64`. Cost: larger buckets (`B` ~4 → ~6-7),
-  roughly +50–100% COTs in triple generation — a modest per-session overhead.
-  shachain2pc currently uses the **default ssp=40**, so it should be bumped for
-  cache / large-batch use and made an explicit parameter.
-- **Optional safety:** track the derivation count and abort/warn as it approaches
+- **The main lever is `ssp`**, chosen at session start: `ssp ≈ κ + log2(N_max)`
+  over the max instance count `N_max`. For `N_max = 2^24` at `2^{-40}`, `ssp ≈ 64`.
+  Cost: larger buckets (`B` ~4 → ~6-7), roughly +50–100% COTs in triple generation
+  — a modest per-session overhead. shachain2pc uses the **demo/research default
+  `ssp=40`** (the named constant `run::kSsp`); production should use ~60–64 (§0).
+- **Optional safety:** track the instance count and abort/warn as it approaches
   `2^{ssp-κ}`, prompting a seed rotation — so a channel can never silently drift
   past its budget.
 
@@ -297,24 +300,25 @@ Triple generation scales with `B`:
 - **memory**: **unaffected** — the bucketing reuses one sacrifice buffer
   (`~12L` blocks, independent of `B`).
 
-So the price is ~**linear in ssp**, paid on every derivation. Relative to the
-default `ssp=40` (`B≈4`), and noting the cache's small branches sit at the higher
-end (small `L` ⇒ `B ∝ 1/log2(L)`):
+So the price is ~**linear in ssp**, paid on every `compute_inplace`. Relative to
+the default `ssp=40` (`B≈4`), and noting the cache's small branches sit at the
+higher end (small `L` ⇒ `B ∝ 1/log2(L)`):
 
-| ssp | B (L≈1M / L≈22k) | triple-gen cost vs 40 | covers @ `2^{-40}` |
+| ssp | B (L≈1M / L≈22k) | triple-gen cost vs 40 | covers @ `2^{-40}` (instances) |
 |----|----|----|----|
 | 40 | 4 / 4 | 1.0× | 1 |
 | 64 | 5 / 6 | ~1.3–1.6× | `2^24` (16 M) |
 | 88 (nominal full `2^48` @ `2^{-20}`) | 6 / 8 | ~1.6–2.2× | `2^48` |
 | 128 | 8 / 10 | ~2.2–2.8× | `2^88` |
 
-**Why not max it out:** it is a *permanent* per-derivation tax (compute +
+**Why not max it out:** it is a *permanent* per-`compute_inplace` tax (compute +
 bandwidth + latency — directly eating the throughput the cache buys) to cover a
-workload that cannot physically run (`2^48` derivations ≈ millennia), and the
+workload that cannot physically run (`2^48` instances ≈ millennia), and the
 per-seed rotation backstop means you never have to provision the whole tree
-upfront. **`ssp ≈ 64` is the sweet spot**: ~1.3–1.6× for a `2^{-40}` residual over
-`2^24` derivations (beyond any real channel). The default 40 is too thin
-(`2^{-20}` over 1 M); 88+ buys nothing real at a real cost.
+upfront. For **production**, **`ssp ≈ 60–64`** is the operating point: ~1.3–1.6× for
+a `2^{-40}` residual over ~`2^24` instances (beyond any real channel). The
+demo/research default 40 is too thin for funds (`2^{-20}` over ~1 M instances);
+88+ buys nothing real at a real cost.
 
 ---
 
@@ -370,11 +374,11 @@ upfront. **`ssp ≈ 64` is the sweet spot**: ~1.3–1.6× for a `2^{-40}` residu
    `ssp ≈ κ + log2(N_max)`. Resetting the *session* with the same seed does **not**
    reset the budget; rotating the *seed* (new channel) does. A cap near
    `2^{ssp-κ}` that triggers seed rotation is the clean backstop.
-3. **Chunking: commit `N = 2^n`, chunk the trunk at `trunk_chunk_size` (the one
-   toggle, default 2), and run branches 1-SHA + cached** (§1 "Chunking in the
-   cache"). The fixed-N split gives a `(48-n)`-block trunk (chunked, computed once,
-   only its tip cached — nothing cached inside it) and an n-bit subtree of cached
-   1-SHA branches (min RAM, max sharing). `n` is bounded by the budget
+3. **Chunking: commit a `2^n`-update cap, chunk the trunk at `trunk_chunk_size`
+   (the one toggle, default 2), and run branches 1-SHA + cached** (§1 "Chunking in
+   the cache"). The fixed-cap split gives a `(48-n)`-block trunk (chunked, computed
+   once, only its tip cached — nothing cached inside it) and an n-bit subtree of
+   cached 1-SHA branches (min RAM, max sharing). `n` is bounded by the budget
    (`n ≤ ssp-κ-1`; ≤ 19 at ssp=40). Raise `trunk_chunk_size` to 4–8 on a server
    for a faster/cheaper refill; drop to 1 only when RAM is the hard limit.
 4. Persistence across restarts (to skip the per-session refill) remains the

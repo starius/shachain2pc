@@ -8,14 +8,16 @@
 CXX ?= g++
 EMP_PREFIX := .deps/emp
 
-SIMD := -mssse3 -msse4.1 -maes -mpclmul
-CXXFLAGS := -std=c++17 -O2 -pthread $(SIMD)
+SIMD := -mssse3 -msse4.1 -msse4.2 -maes -mpclmul
+CXXFLAGS := -std=c++20 -O2 -pthread $(SIMD)
 
 OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl)
 OPENSSL_LIBS := $(shell pkg-config --libs openssl)
 
 EMP_CFLAGS := -isystem $(EMP_PREFIX)/include -Wno-stringop-overread
-EMP_LIBS := -L$(EMP_PREFIX)/lib -Wl,-rpath,$(EMP_PREFIX)/lib -lemp-tool
+EMP_LIBS := -L$(EMP_PREFIX)/lib -L$(EMP_PREFIX)/lib64 \
+            -Wl,-rpath,$(EMP_PREFIX)/lib -Wl,-rpath,$(EMP_PREFIX)/lib64 \
+            -lemp-ot -lemp-tool
 
 BUILD := .build
 
@@ -27,15 +29,15 @@ RUN_DEPS := run/derive.h protocol/bristol.h protocol/circuit_gen.h \
 # Targets that need only OpenSSL (no emp / no MPC).
 PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
               $(BUILD)/probe_convention $(BUILD)/tamper_circuit
-# Targets that link the emp MPC engine.
-EMP_BINS := $(BUILD)/party $(BUILD)/measure_io $(BUILD)/compat_probe \
-            $(BUILD)/emp_wire_probe $(BUILD)/otco_probe $(BUILD)/iknp_probe \
-            $(BUILD)/fpre_setup_probe $(BUILD)/fpre_generate_probe \
-            $(BUILD)/fpre_check_probe $(BUILD)/fpre_refill_probe \
-            $(BUILD)/c2pc_independent_probe $(BUILD)/c2pc_dependent_probe \
-            $(BUILD)/c2pc_online_probe
+# Targets that link the emp MPC engine. Only the party binary is ported to the
+# rewritten emp-ag2pc. The old Rust-interop probes (emp_wire_probe, otco/iknp/
+# fpre_*/c2pc_* probes) and measure_io/compat_probe target the OLD emp API
+# (emp-ag2pc/helper.h, fpre.h, 2pc.h, the old emp::C2PC) which the new emp install
+# no longer provides; their tools/*.cpp are kept for the eventual Rust re-port but
+# are NOT built. See docs/new-emp-ag2pc-notes.md.
+EMP_BINS := $(BUILD)/party
 
-.PHONY: all plain mpc clean test demo cheat compat-probe
+.PHONY: all plain mpc clean test demo cheat
 all: plain mpc
 plain: $(PLAIN_BINS)
 mpc: $(EMP_BINS)
@@ -62,59 +64,9 @@ $(BUILD)/party: demo/party.cpp $(PROTO_SRC) $(RUN_DEPS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) demo/party.cpp $(PROTO_SRC) \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
-$(BUILD)/measure_io: tools/measure_io.cpp $(PROTO_SRC) $(RUN_DEPS) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/measure_io.cpp $(PROTO_SRC) \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/compat_probe: tools/compat_probe.cpp $(PROTO_SRC) $(REF_SRC) $(RUN_DEPS) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/compat_probe.cpp \
-	    $(PROTO_SRC) $(REF_SRC) $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/emp_wire_probe: tools/emp_wire_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/emp_wire_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/otco_probe: tools/otco_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/otco_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/iknp_probe: tools/iknp_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/iknp_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/fpre_setup_probe: tools/fpre_setup_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/fpre_setup_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/fpre_generate_probe: tools/fpre_generate_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/fpre_generate_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/fpre_check_probe: tools/fpre_check_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/fpre_check_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/fpre_refill_probe: tools/fpre_refill_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/fpre_refill_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/c2pc_independent_probe: tools/c2pc_independent_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/c2pc_independent_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/c2pc_dependent_probe: tools/c2pc_dependent_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/c2pc_dependent_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-$(BUILD)/c2pc_online_probe: tools/c2pc_online_probe.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) tools/c2pc_online_probe.cpp \
-	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
-
-test: $(BUILD)/ref_kat $(BUILD)/verify_circuit $(BUILD)/emp_wire_probe \
-      $(BUILD)/otco_probe $(BUILD)/iknp_probe $(BUILD)/fpre_setup_probe \
-      $(BUILD)/fpre_generate_probe $(BUILD)/fpre_check_probe \
-      $(BUILD)/fpre_refill_probe $(BUILD)/c2pc_independent_probe \
-      $(BUILD)/c2pc_dependent_probe $(BUILD)/c2pc_online_probe
+# `test` builds the new-emp party (compile gate) and runs the plain (no-MPC) KATs:
+# the BOLT-03 reference vectors and the plaintext circuit verifier.
+test: $(BUILD)/ref_kat $(BUILD)/verify_circuit $(BUILD)/party
 	./$(BUILD)/ref_kat
 	./$(BUILD)/verify_circuit
 
@@ -123,9 +75,6 @@ demo: all
 
 cheat: all
 	./demo/run_cheat.sh
-
-compat-probe: $(BUILD)/compat_probe
-	@./$(BUILD)/compat_probe
 
 clean:
 	rm -rf $(BUILD)

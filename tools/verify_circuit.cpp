@@ -47,7 +47,7 @@ static proto::Value RunCircuit(const proto::Circuit& c, const proto::Value& seed
 
 int main() {
   proto::Circuit sha = proto::LoadBristol(
-      ".sources/emp-tool/emp-tool/circuits/files/bristol_format/sha-256.txt");
+      ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt");
 
   struct Case {
     uint8_t seed_fill;

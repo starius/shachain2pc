@@ -44,7 +44,7 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
 # are NOT built. See docs/new-emp-ag2pc-notes.md.
 EMP_BINS := $(BUILD)/party
 
-.PHONY: all plain mpc clean test demo cheat
+.PHONY: all plain mpc clean test test-cache-tamper demo cheat
 all: plain mpc
 plain: $(PLAIN_BINS)
 mpc: $(EMP_BINS)
@@ -73,9 +73,12 @@ $(BUILD)/party: demo/party.cpp $(PROTO_SRC) $(RUN_DEPS) | $(BUILD)
 
 # `test` builds the new-emp party (compile gate) and runs the plain (no-MPC) KATs:
 # the BOLT-03 reference vectors and the plaintext circuit verifier.
-test: $(BUILD)/ref_kat $(BUILD)/verify_circuit $(BUILD)/party
+test: $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit $(BUILD)/party
 	./$(BUILD)/ref_kat
 	./$(BUILD)/verify_circuit
+
+test-cache-tamper: $(BUILD)/party $(BUILD)/ref_cli
+	./demo/cache_tamper_test.sh
 
 demo: all
 	./demo/run_demo.sh

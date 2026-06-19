@@ -179,6 +179,7 @@ descendant becomes derivable.
 
 ```sh
 nix develop -c make test     # reference KATs + plaintext circuit verification
+nix develop -c make test-cache-tamper  # live cache tamper-abort check
 nix develop -c cargo test --manifest-path rust/Cargo.toml
 ```
 
@@ -187,6 +188,10 @@ nix develop -c cargo test --manifest-path rust/Cargo.toml
 - `verify_circuit` — the generated circuit, plaintext-evaluated against the
   reference across those vectors, popcount 0 and 48, three share splits, and a
   serializer round-trip.
+
+`make test-cache-tamper` runs a local two-party adaptive-cache session, then
+reruns it with Alice tampering one cached branch step; the tampered run must abort
+on both sides with no `RESULT`.
 
 The Rust tests include live C++/Rust interop for the protocol layers and a
 Rust/Rust party E2E test for `I = 1` plus `I = 3` (multi-block chaining). Those
@@ -231,8 +236,10 @@ Set `SHACHAIN2PC_COMPAT_TIMING=1` as well to print Fpre/C2PC subphase timings.
   cache shape it gives roughly 500k-1M updates at residual `2^-20`, which is not
   a production target for funds. For production, use `ssp ≈ 60-64`, track every
   instance against the per-seed budget, and rotate the seed before crossing the
-  chosen risk threshold. Cross-restart persistence of the authenticated cache is
-  still future work. Full analysis and the cost trade-off:
+  chosen risk threshold. The adaptive cache's default trunk chunk size is 1
+  (`SHACHAIN2PC_CHUNK_BLOCKS=1`), the simplest low-memory setting. Cross-restart
+  persistence of the authenticated cache is still future work. Full analysis and
+  the cost trade-off:
   [`docs/shared-trunk-cache.md`](docs/shared-trunk-cache.md).
 - Both parties derive the circuit independently from the authorized `I`, so they
   evaluate byte-identical circuits. If one party enters a different `I`, the

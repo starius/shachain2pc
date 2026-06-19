@@ -146,13 +146,13 @@ int main(int argc, char** argv) {
   ThreadPool pool(run::kThreads);  // session-local compute parallelism (global type)
   try {
     // Adaptive-cache mode (range only): SHACHAIN2PC_CACHE=1 computes the shared
-    // trunk once (chunked by SHACHAIN2PC_CHUNK_BLOCKS, default 2), then derives the
+    // trunk once (chunked by SHACHAIN2PC_CHUNK_BLOCKS, default 1), then derives the
     // range in decreasing index order through a stack-cache of the low-bit subtree,
     // reusing the shared prefix and revealing each. This is the in-session cache.
     if (is_range) {
       const char* cache_env = std::getenv("SHACHAIN2PC_CACHE");
       if (cache_env != nullptr && std::atoi(cache_env) != 0) {
-        int tcb = 2;  // conservative default trunk chunk size
+        int tcb = 1;  // simplest low-memory default: one SHA block per chunk
         if (const char* ce = std::getenv("SHACHAIN2PC_CHUNK_BLOCKS")) {
           tcb = std::atoi(ce);
         }

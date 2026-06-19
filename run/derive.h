@@ -67,7 +67,7 @@ constexpr int kThreads = 4;         // session ThreadPool size (local compute on
 // aborts w.p. ~1-2^-kSsp; theft needs far more than one bit) -- adequate for
 // demo/research, but 2^-20 is too thin for production funds.
 //
-// PRODUCTION: use kSsp ~60-64 (2^-40 residual over ~2^24 instances); count every
+// PRODUCTION: use kSsp ~60-64 (2^-40 residual over ~2^20-2^24 instances); count every
 // compute_inplace against the seed, track the per-seed budget, and rotate the seed
 // before crossing the chosen risk threshold.
 //
@@ -75,7 +75,7 @@ constexpr int kThreads = 4;         // session ThreadPool size (local compute on
 //   1. Rotate the seed (fresh channel) -- budget is PER SEED, resets for free.
 //   2. Raise kSsp. Cost ~linear: bucket B ~ kSsp/log2(L), so triple-gen compute
 //      (~3B-2 COTs/AND), bandwidth, and round-trips/latency scale with it (memory
-//      unaffected). kSsp = 64 buys ~2^24 updates at 2^-40 for ~1.3-1.6x. BOTH
+//      unaffected). kSsp = 64 buys ~2^24 instances at 2^-40 for ~1.3-1.6x. BOTH
 //      parties MUST match -- a coordinated change, not a per-run flag.
 // Full analysis: docs/shared-trunk-cache.md.
 constexpr int kSsp = 40;

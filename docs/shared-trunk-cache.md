@@ -39,7 +39,8 @@ aborts w.p. `~1-2^-ssp`, and theft needs far more than one bit) — adequate for
 demo/research, but **`2^-20` is too thin for production funds**.
 
 **Production guidance:**
-1. Use **`ssp ≈ 60–64`** → `2^-40` residual over ~`2^24` (16 M) instances. Cost is
+1. Use **`ssp ≈ 60–64`** → `2^-40` residual over ~`2^20`–`2^24`
+   instances. Cost is
    ~linear (§3); a coordinated change (both parties match).
 2. **Count every `compute_inplace` against the seed** (revealed, precomputed,
    aborted, refills, chunks), track the running per-seed budget, and **rotate the
@@ -112,7 +113,7 @@ their high `(48-n)` bits, so the chain splits cleanly and permanently:
   `n` is choosing the operating point on the budget curve (and fixes the trunk
   length).
 
-**Trunk → chunk at `trunk_chunk_size` (the one real toggle; conservative default 2).**
+**Trunk → chunk at `trunk_chunk_size` (the one real toggle; default 1).**
 The trunk is the single long chain; its chunk size trades the one-time refill cost
 (shape illustrated on a 48-block chain — the real trunk is `48 − n`):
 
@@ -122,10 +123,10 @@ The trunk is the single long chain; its chunk size trades the one-time refill co
 | 8 | 116 MB | 30 | ~11 s | 6 × 2^{-ssp} |
 | whole | 468 MB | 10 | ~5 s | 1 × 2^{-ssp} |
 
-Default **2** sits just above the 1-SHA row — ~tens of MB, but ~half the round-trips
-and ~half the trunk's budget instances vs 1-SHA: an **initial trunk speed-up and a
-small budget save at moderate RAM**. Raise to 4–8 on a server for a faster/cheaper
-refill (transient ~tens–hundreds of MB); drop to 1 only if RAM is the hard limit.
+Default **1** is the simplest and lowest-memory mode: one SHA block per
+`compute_inplace`, no extra chunking choices hidden in the default. Raise to 4–8
+on a server for a faster/cheaper refill under non-trivial RTT (transient
+~tens–hundreds of MB); use the whole trunk only when the RSS spike is acceptable.
 The trunk is once per session, so this cost amortizes over the `2^n` leaves — it
 matters most under frequent restarts.
 
@@ -182,7 +183,8 @@ added.)
 `T` is carried as an **authenticated** wire (MAC-bound) and reused directly; it is
 **never re-input**. A peer cannot substitute a different `T` — the MAC fails and
 the run aborts. Verified: tampering a branch's flip aborts at the leaky-AND F_eq
-check *even with the reused trunk* (`demo/tamper_test.sh` extended to tree mode).
+check *even with the reused trunk* (`make test-cache-tamper`, which runs
+`demo/cache_tamper_test.sh`).
 This is exactly the steering the Go cache was vulnerable to and could not close.
 
 ### 2c. Selective failure — the real accumulation.
@@ -263,7 +265,8 @@ roughly 1-2× actual updates in the planned cache and still nowhere near 2^48. S
 `ssp` for *that*, not the tree. A "1/1 000 000" target (κ=20) over about 1 M
 instances is met by the **demo/research default ssp=40**; production funds should
 target a stronger residual, e.g. `ssp=64` gives `2^{-40}` over 2^24 (16 M)
-instances. (You *may* set `ssp=68` to nominally cover the full 2^48 at `2^{-20}`
+instances, which is about 8-16 M updates at 1-2 instances/update. (You *may* set
+`ssp=68` to nominally cover the full 2^48 at `2^{-20}`
 — feasible, buckets B≈4→7, ~1.5–2× the triple-gen COTs — but it guards a workload
 that cannot physically occur.)
 
@@ -279,7 +282,8 @@ that cannot physically occur.)
   ever approached `2^{ssp-κ}` instances, it simply rotates the seed. At `ssp≈64`
   this never arises for a real channel.
 - **The main lever is `ssp`**, chosen at session start: `ssp ≈ κ + log2(N_max)`
-  over the max instance count `N_max`. For `N_max = 2^24` at `2^{-40}`, `ssp ≈ 64`.
+  over the max instance count `N_max`. For `N_max = 2^24` at `2^{-40}`,
+  `ssp ≈ 64`.
   Cost: larger buckets (`B` ~4 → ~6-7), roughly +50–100% COTs in triple generation
   — a modest per-session overhead. shachain2pc uses the **demo/research default
   `ssp=40`** (the named constant `run::kSsp`); production should use ~60–64 (§0).
@@ -307,7 +311,7 @@ higher end (small `L` ⇒ `B ∝ 1/log2(L)`):
 | ssp | B (L≈1M / L≈22k) | triple-gen cost vs 40 | covers @ `2^{-40}` (instances) |
 |----|----|----|----|
 | 40 | 4 / 4 | 1.0× | 1 |
-| 64 | 5 / 6 | ~1.3–1.6× | `2^24` (16 M) |
+| 64 | 5 / 6 | ~1.3–1.6× | `2^24` instances (≈8-16 M updates) |
 | 88 (nominal full `2^48` @ `2^{-20}`) | 6 / 8 | ~1.6–2.2× | `2^48` |
 | 128 | 8 / 10 | ~2.2–2.8× | `2^88` |
 
@@ -316,8 +320,9 @@ bandwidth + latency — directly eating the throughput the cache buys) to cover 
 workload that cannot physically run (`2^48` instances ≈ millennia), and the
 per-seed rotation backstop means you never have to provision the whole tree
 upfront. For **production**, **`ssp ≈ 60–64`** is the operating point: ~1.3–1.6× for
-a `2^{-40}` residual over ~`2^24` instances (beyond any real channel). The
-demo/research default 40 is too thin for funds (`2^{-20}` over ~1 M instances);
+a `2^{-40}` residual over ~`2^24` instances (≈8-16 M updates, beyond any real
+channel). The demo/research default 40 is too thin for funds (`2^{-20}` over
+~1 M instances);
 88+ buys nothing real at a real cost.
 
 ---
@@ -336,7 +341,7 @@ demo/research default 40 is too thin for funds (`2^{-20}` over ~1 M instances);
   cache"). Each chunk is its own `compute_inplace` → its own `< 2^{-ssp}`. The
   design accepts this on the branch side (1-SHA cached branches ≈ 2 instances/leaf
   — the price of min RAM + max sharing) and minimizes it on the trunk
-  (`trunk_chunk_size`, default 2, computed once per session). Raise `ssp` rather
+  (`trunk_chunk_size`, default 1, computed once per session). Raise `ssp` rather
   than coarsen the cache when the budget is tight.
 
 ---
@@ -375,7 +380,7 @@ demo/research default 40 is too thin for funds (`2^{-20}` over ~1 M instances);
    reset the budget; rotating the *seed* (new channel) does. A cap near
    `2^{ssp-κ}` that triggers seed rotation is the clean backstop.
 3. **Chunking: commit a `2^n`-update cap, chunk the trunk at `trunk_chunk_size`
-   (the one toggle, default 2), and run branches 1-SHA + cached** (§1 "Chunking in
+   (the one toggle, default 1), and run branches 1-SHA + cached** (§1 "Chunking in
    the cache"). The fixed-cap split gives a `(48-n)`-block trunk (chunked, computed
    once, only its tip cached — nothing cached inside it) and an n-bit subtree of
    cached 1-SHA branches (min RAM, max sharing). `n` is bounded by the budget

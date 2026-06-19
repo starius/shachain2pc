@@ -27,12 +27,12 @@ static void SetTransportTimeout(emp::NetIO* io) {
     long v = std::strtol(e, &end, 10);
     if (end != e && v >= 0) secs = v;
   }
-  if (secs == 0 || io->consocket < 0) return;
+  if (secs == 0 || io->sock < 0) return;
   struct timeval tv;
   tv.tv_sec = secs;
   tv.tv_usec = 0;
-  setsockopt(io->consocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  setsockopt(io->consocket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  setsockopt(io->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(io->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 int main(int argc, char** argv) {
@@ -66,8 +66,9 @@ int main(int argc, char** argv) {
   const char* addr = (party == run::kAlice) ? nullptr : peer;
   emp::NetIO* io = new emp::NetIO(addr, port);
   SetTransportTimeout(io);  // bound blocking recv/send so a stalled peer aborts
+  ThreadPool pool(run::kThreads);  // session-local compute parallelism (global type)
   try {
-    protocol::Value out = run::RunDerivation(io, party, index, share);
+    protocol::Value out = run::RunDerivation(io, &pool, party, index, share);
     delete io;
     std::printf("RESULT %s\n", util::ToHex(out).c_str());
     return 0;

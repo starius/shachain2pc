@@ -28,6 +28,7 @@
 #include <openssl/evp.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -200,33 +201,89 @@ inline void ExchangeCircuitDigest(emp::NetIO* io, int party,
   }
 }
 
-// RunDerivation builds and evaluates the agreed circuit for index with this
-// party's seed share, returning the 256-bit derived value both parties obtain.
-// Throws (a clean abort) if the local circuit cannot be generated, if the two
-// parties disagree on the generated circuit, or if cheating is detected (the
-// new engine aborts the reveal rather than emitting a steered value).
-inline protocol::Value RunDerivation(emp::NetIO* io, ThreadPool* pool,
-                                     int party, uint64_t index,
-                                     const protocol::Value& my_share) {
+// BatchDigest commits both parties to the SAME index set over the SAME SHA gadget
+// before any work. Per-gate circuit integrity is enforced by authenticated
+// garbling itself (a party garbling a different circuit desyncs/aborts), so the
+// pre-agreement only needs to pin the index set + gadget.
+inline std::array<uint8_t, 32> BatchDigest(const std::vector<uint64_t>& indices,
+                                           const protocol::Circuit& sha) {
+  std::array<uint8_t, 32> sha_dg = CircuitDigest(sha, ToEmpGateArray(sha));
+  std::array<uint8_t, 32> dg{};
+  unsigned int len = 0;
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) throw std::runtime_error("BatchDigest: EVP_MD_CTX_new failed");
+  auto cleanup = [&]() { EVP_MD_CTX_free(ctx); };
+  if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1 ||
+      EVP_DigestUpdate(ctx, indices.data(),
+                       indices.size() * sizeof(uint64_t)) != 1 ||
+      EVP_DigestUpdate(ctx, sha_dg.data(), sha_dg.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx, dg.data(), &len) != 1 || len != dg.size()) {
+    cleanup();
+    throw std::runtime_error("BatchDigest: EVP digest failed");
+  }
+  cleanup();
+  return dg;
+}
+
+// BatchTiming reports where wall time goes: the one-time session setup (COT mesh
+// + input authentication, amortized over all indices), and per-index compute
+// (garble+evaluate) and reveal (open).
+struct BatchTiming {
+  double setup_s = 0.0;
+  std::vector<double> compute_s;
+  std::vector<double> reveal_s;
+  double compute_total_s() const {
+    double t = 0.0;
+    for (double x : compute_s) t += x;
+    return t;
+  }
+  double reveal_total_s() const {
+    double t = 0.0;
+    for (double x : reveal_s) t += x;
+    return t;
+  }
+};
+
+// RunDerivationBatch evaluates the derivation for every index under ONE session,
+// so the expensive one-time setup (SoftSpoken COT mesh + input authentication) is
+// paid once and amortized across all indices. Two explicit phases:
+//   1. compute -- garble+evaluate each circuit (run_artifact) into an
+//      authenticated output share. NOTHING is revealed here: each party holds only
+//      its MAC/KEY share; an output value is produced ONLY by the interactive,
+//      COT-check-gated reveal below. So neither party can learn any output in this
+//      state without the other running reveal() in lockstep -- a single party that
+//      calls reveal alone simply blocks on its peer. (This is structural to the
+//      protocol, not a check we add.)
+//   2. reveal -- open every output to both parties.
+// The same authenticated seed shares are reused across all indices (only the
+// circuit changes), and reveal does not prune already-materialized outputs, so the
+// per-index outputs stay live until opened.
+inline std::vector<protocol::Value> RunDerivationBatch(
+    emp::NetIO* io, ThreadPool* pool, int party,
+    const std::vector<uint64_t>& indices, const protocol::Value& my_share,
+    BatchTiming& timing) {
   using Ctx = emp::AG2PCSession::DirectCtx;
   using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;  // 256-bit input/output
+  using Clock = std::chrono::steady_clock;
+  auto secs = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
 
-  protocol::Circuit c = BuildCircuitForIndex(index);
-
-  // Agree on the locally generated circuit before preprocessing; abort fast and
-  // clearly on a mismatch rather than desyncing deep inside the MPC.
-  {
-    std::vector<int> gate_arr = ToEmpGateArray(c);
-    ExchangeCircuitDigest(io, party, CircuitDigest(c, gate_arr));
+  if (indices.empty()) throw std::runtime_error("shachain2pc: empty index set");
+  for (uint64_t I : indices) {
+    if (I > protocol::kMaxIndex)
+      throw std::runtime_error("shachain2pc: index exceeds 48 bits");
   }
 
-  emp::circuit::BooleanProgram prog = ToBooleanProgram(c);
-  ReleaseVector(c.gates);
+  protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
 
-  // Each party places its 256-bit share on its own input value; the other
-  // party's clear is unused (passed as zero). BOB's input maps to wires [0,256),
-  // ALICE's to [256,512) -- matching ToBooleanProgram's input ordering, so the
-  // run_artifact argument order is (BOB, ALICE).
+  // Pre-agree on the index set + SHA gadget; clean early abort on mismatch.
+  ExchangeCircuitDigest(io, party, BatchDigest(indices, sha));
+
+  // ---- one-time setup: COT mesh (session ctor) + input authentication ----
+  auto t0 = Clock::now();
+  emp::AG2PCSession sess(io, pool, party);
+  io->flush();
   std::array<bool, protocol::kValueBits> bob_clear{};
   std::array<bool, protocol::kValueBits> alice_clear{};
   {
@@ -235,25 +292,51 @@ inline protocol::Value RunDerivation(emp::NetIO* io, ThreadPool* pool,
         (party == kBob) ? bob_clear : alice_clear;
     for (int i = 0; i < protocol::kValueBits; ++i) mine[i] = share_bits[i] != 0;
   }
-
-  emp::AG2PCSession sess(io, pool, party);
-  io->flush();
-
   BV bob_in = sess.input<BV>(kBob, bob_clear);
   BV alice_in = sess.input<BV>(kAlice, alice_clear);
-  BV out = sess.run_artifact<BV>(prog, bob_in, alice_in);
-  std::optional<std::array<bool, protocol::kValueBits>> revealed =
-      sess.reveal(out, emp::PUBLIC);
-  io->flush();
+  timing.setup_s = secs(t0, Clock::now());
 
-  if (!revealed.has_value()) {
-    throw std::runtime_error("shachain2pc: reveal produced no value");
+  // ---- phase 1: compute every index (garble+evaluate), NO reveal ----
+  std::vector<BV> outs;
+  outs.reserve(indices.size());
+  timing.compute_s.clear();
+  timing.compute_s.reserve(indices.size());
+  for (uint64_t I : indices) {
+    protocol::Circuit c = protocol::BuildDerivationCircuit(sha, I);
+    CheckDerivationCircuit(c, "generated circuit");
+    emp::circuit::BooleanProgram prog = ToBooleanProgram(c);
+    ReleaseVector(c.gates);
+    auto tc = Clock::now();
+    outs.push_back(sess.run_artifact<BV>(prog, bob_in, alice_in));
+    timing.compute_s.push_back(secs(tc, Clock::now()));
   }
-  std::vector<uint8_t> out_bits(protocol::kValueBits);
-  for (int i = 0; i < protocol::kValueBits; ++i) {
-    out_bits[i] = (*revealed)[i] ? 1 : 0;
+
+  // ---- phase 2: reveal every output to both parties ----
+  std::vector<protocol::Value> results;
+  results.reserve(indices.size());
+  timing.reveal_s.clear();
+  timing.reveal_s.reserve(indices.size());
+  for (std::size_t k = 0; k < outs.size(); ++k) {
+    auto tr = Clock::now();
+    std::optional<std::array<bool, protocol::kValueBits>> rev =
+        sess.reveal(outs[k], emp::PUBLIC);
+    timing.reveal_s.push_back(secs(tr, Clock::now()));
+    if (!rev.has_value())
+      throw std::runtime_error("shachain2pc: reveal produced no value");
+    std::vector<uint8_t> out_bits(protocol::kValueBits);
+    for (int i = 0; i < protocol::kValueBits; ++i) out_bits[i] = (*rev)[i] ? 1 : 0;
+    results.push_back(protocol::BitsToValue(out_bits));
   }
-  return protocol::BitsToValue(out_bits);
+  io->flush();
+  return results;
+}
+
+// RunDerivation: single-index convenience wrapper (used by tests / single runs).
+inline protocol::Value RunDerivation(emp::NetIO* io, ThreadPool* pool, int party,
+                                     uint64_t index,
+                                     const protocol::Value& my_share) {
+  BatchTiming timing;
+  return RunDerivationBatch(io, pool, party, {index}, my_share, timing)[0];
 }
 
 }  // namespace shachain2pc::run

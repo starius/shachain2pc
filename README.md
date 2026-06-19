@@ -148,24 +148,32 @@ omitted).
 
 ### Seed-reveal guard
 
-Index `I = 0` is not a normal per-commitment reveal: it returns the shachain
-seed itself. The Rust `party` refuses it by default before opening any socket:
+Index `I = 0` is not a normal per-commitment reveal: `generate_from_seed` runs no
+SHA round at `I = 0`, so it returns the shachain seed itself (`aliceShare XOR
+bobShare`) — the root that derives every revocation secret. Both the C++ and Rust
+`party` refuse it by default, before opening any socket, including any range whose
+span contains 0 (e.g. `0-5`):
 
 ```sh
-rust/target/release/party 1 12345 0 <aliceShareHex>
-# ABORT: I=0 reveals the seed ...
+.build/party 1 12345 0 <aliceShareHex>
+# ABORT I=0 reveals the seed (root of all revocation secrets); re-run with --allow-seed-reveal to proceed
 ```
 
-For compatibility tests only, pass `--allow-seed-reveal` on each Rust side. The
-flag is position-independent:
+For compatibility tests only, pass `--allow-seed-reveal` on each side. The flag is
+position-independent:
 
 ```sh
-rust/target/release/party --allow-seed-reveal 1 12345 0 <aliceShareHex>
-rust/target/release/party 2 12345 0 <bobShareHex> <alice_ip> --allow-seed-reveal
+.build/party --allow-seed-reveal 1 12345 0 <aliceShareHex>
+.build/party 2 12345 0 <bobShareHex> <alice_ip> --allow-seed-reveal
 ```
 
-The C++ demo binary is unchanged and still accepts `I = 0` silently. This is a
-deliberate local hardening divergence in the Rust binary.
+Note this guards only the *seed* (the tree root). shachain is itself a tree, so
+revealing any `H(I)` lets the recipient derive `H(I')` for every descendant `I'`
+of `I` (those that set some of `I`'s trailing-zero bits) — that is inherent to
+shachain, not something the MPC can prevent. When precomputing a batch and
+revealing a subset over time (shared-trunk / tree mode), the caller must avoid
+revealing an ancestor before a still-secret descendant, or accept that the
+descendant becomes derivable.
 
 ## Tests
 

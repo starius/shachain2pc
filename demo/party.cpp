@@ -77,19 +77,35 @@ static std::vector<uint64_t> ParseIndexSpec(const char* spec, bool* is_range) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 5) {
+  using namespace shachain2pc;
+  // Flags before positional parsing. --allow-seed-reveal opts into deriving I=0
+  // (which yields the raw seed -- see the guard below). Unknown --flags abort.
+  bool allow_seed_reveal = false;
+  std::vector<const char*> pos;
+  for (int i = 1; i < argc; ++i) {
+    std::string a(argv[i]);
+    if (a == "--allow-seed-reveal") {
+      allow_seed_reveal = true;
+    } else if (a.rfind("--", 0) == 0) {
+      std::fprintf(stderr, "ABORT unknown flag: %s\n", argv[i]);
+      return 1;
+    } else {
+      pos.push_back(argv[i]);
+    }
+  }
+  if (pos.size() < 4 || pos.size() > 5) {
     std::fprintf(
         stderr,
-        "usage: %s <1|2> <port> <I_spec> <share_hex> [peer_ip]\n"
+        "usage: %s [--allow-seed-reveal] <1|2> <port> <I_spec> <share_hex> "
+        "[peer_ip]\n"
         "  1 = ALICE (garbler, listens), 2 = BOB (evaluator, connects)\n"
         "  I_spec = single hex index (\"64\") or inclusive hex range "
         "(\"64-c8\")\n",
         argv[0]);
     return 2;
   }
-  using namespace shachain2pc;
-  int party = std::atoi(argv[1]);
-  int port = std::atoi(argv[2]);
+  int party = std::atoi(pos[0]);
+  int port = std::atoi(pos[1]);
   std::vector<uint64_t> indices;
   bool is_range = false;
   protocol::Value share{};
@@ -100,13 +116,27 @@ int main(int argc, char** argv) {
     if (port <= 0 || port > 65535) {
       throw std::runtime_error("port must be in 1..65535");
     }
-    indices = ParseIndexSpec(argv[3], &is_range);
-    share = util::FromHex32(argv[4]);
+    indices = ParseIndexSpec(pos[2], &is_range);
+    share = util::FromHex32(pos[3]);
+    // Seed-reveal guard. generate_from_seed(seed, 0) runs NO SHA round, so H(0)
+    // is the seed itself (aliceShare XOR bobShare) -- the root that derives every
+    // revocation secret, not a normal per-commitment reveal. Refuse to open it
+    // (any index 0 in the spec, including a range that contains 0) unless the
+    // operator explicitly opts in. Checked here, before the socket is opened.
+    if (!allow_seed_reveal) {
+      for (uint64_t idx : indices) {
+        if (idx == 0) {
+          throw std::runtime_error(
+              "I=0 reveals the seed (root of all revocation secrets); re-run "
+              "with --allow-seed-reveal to proceed");
+        }
+      }
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "ABORT %s\n", e.what());
     return 1;
   }
-  const char* peer = argc > 5 ? argv[5] : "127.0.0.1";
+  const char* peer = pos.size() > 4 ? pos[4] : "127.0.0.1";
 
   const char* addr = (party == run::kAlice) ? nullptr : peer;
   // quiet=true: keep stdout clean (only RESULT lines) -- emp's NetIO otherwise

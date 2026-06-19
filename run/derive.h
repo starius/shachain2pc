@@ -50,28 +50,33 @@ constexpr int kBob = emp::BOB;      // 2, evaluator, connects
 constexpr int kThreads = 4;         // session ThreadPool size (local compute only)
 
 // Statistical security parameter for the authenticated-AND bucketing (emp's
-// AG2PCSession `ssp`). We keep emp's default, 40.
+// AG2PCSession `ssp`). 40 is emp's default, kept here for DEMO/RESEARCH
+// performance. For PRODUCTION funds use ~60-64 (see below) -- 2^-20 per channel is
+// not a production-grade target for theft-adjacent revocation material.
 //
-// CONSEQUENCE / OPERATING LIMIT. The bucketing's soundness+leakage error is
-// ~2^-kSsp PER derivation, and it accumulates as N * 2^-kSsp over N derivations
-// against ONE seed -- where N = the number of revealed per-commitment secrets,
-// i.e. channel updates (NOT the 2^48 index space, which is never derived). So at
-// kSsp = 40 the safe operating limit for one channel/seed is about:
-//     <= ~1,000,000 updates (2^20)  -> residual <= 2^-20  (~1 in a million)
-//     <= ~1,000     updates (2^10)  -> residual <= 2^-30  (~1 in a billion)
-// This residual is the probability of a *single, undetected, ~1-bit* leak; a real
-// attempt aborts with prob ~1-2^-40 (so it is almost always caught), and stealing
-// funds needs far more than one bit -- so ~1M updates is comfortably safe and ~1k
-// is paranoid-safe.
+// CONSEQUENCE / OPERATING LIMIT. The bucketing soundness+leakage error is
+// < 2^-kSsp PER compute_inplace, accumulating as N * 2^-kSsp against ONE seed,
+// where N = the TOTAL compute_inplace bucketing instances run on that seed
+// (every revealed branch, precomputed-but-unrevealed output, ABORTED attempt,
+// trunk-refill chunk, and branch chunk -- not just revealed secrets), bounded by
+// derivations performed, never the 2^48 index space. With ~1-2 instances/update,
+// at kSsp = 40:
+//     ~2^20 instances (~500k-1M updates) -> residual <= 2^-20  (~1 in a million)
+//     ~2^10 instances (~500-1k updates)  -> residual <= 2^-30  (~1 in a billion)
+// The residual is the prob of a single, undetected, ~1-bit leak (a real attempt
+// aborts w.p. ~1-2^-kSsp; theft needs far more than one bit) -- adequate for
+// demo/research, but 2^-20 is too thin for production funds.
 //
-// TO EXPAND BEYOND THE LIMIT (in priority order):
-//   1. Rotate the seed (open a fresh channel). The budget is PER SEED, so a new
-//      seed resets it for free -- no parameter change.
-//   2. Raise kSsp. Cost is ~linear: bucket size B ~ kSsp/log2(L), so triple-gen
-//      compute (~3B-2 COTs/AND), bandwidth, and round-trips/latency scale with it
-//      (memory is unaffected). E.g. kSsp = 64 buys ~2^24 (16M) updates at a 2^-40
-//      residual for ~1.3-1.6x triple-gen cost. BOTH parties MUST use the same
-//      value, so this is a coordinated change, not a per-run flag.
+// PRODUCTION: use kSsp ~60-64 (2^-40 residual over ~2^24 instances); count every
+// compute_inplace against the seed, track the per-seed budget, and rotate the seed
+// before crossing the chosen risk threshold.
+//
+// EXPANDING THE LIMIT:
+//   1. Rotate the seed (fresh channel) -- budget is PER SEED, resets for free.
+//   2. Raise kSsp. Cost ~linear: bucket B ~ kSsp/log2(L), so triple-gen compute
+//      (~3B-2 COTs/AND), bandwidth, and round-trips/latency scale with it (memory
+//      unaffected). kSsp = 64 buys ~2^24 updates at 2^-40 for ~1.3-1.6x. BOTH
+//      parties MUST match -- a coordinated change, not a per-run flag.
 // Full analysis: docs/shared-trunk-cache.md.
 constexpr int kSsp = 40;
 

@@ -13,34 +13,38 @@ refilled from the seed at the start of each session (accepted trade-off).
 
 ## 0. Current setting & operating limit (TL;DR)
 
-**Decision: keep `ssp = 40`** (emp's default; the constant `run::kSsp` in
-`run/derive.h`, passed to every `AG2PCSession`). We accept its operating limit
-rather than pay the permanent cost of a higher value (§3 "cost of raising ssp").
+**Code default: `ssp = 40`** (emp's default; the constant `run::kSsp`, passed to
+every `AG2PCSession`) — kept for **demo/research performance only**. For
+**production funds, raise it to `ssp ≈ 60–64`** ("Production guidance" below):
+`2^-20` per channel at ssp=40 is **not** a production-grade target for
+theft-adjacent revocation material.
 
-**What this means in practice.** The bucketing error is `~2^-40` per derivation
-and accumulates as `N · 2^-40` over `N` derivations against **one seed**, where
-`N` = revealed per-commitment secrets = **channel updates** (not the 2^48 index
-space — that is never derived; see §3). So per channel/seed at `ssp = 40`:
+**The budget.** The bucketing error is `< 2^-ssp` per `compute_inplace`, and it
+accumulates as `N · 2^-ssp` against **one seed**, where **`N` = the total number of
+`compute_inplace` bucketing instances** ever run against that seed — *every*
+trunk-refill chunk, branch chunk, precomputed-but-unrevealed output, and *aborted*
+attempt, not just revealed secrets. (It is bounded by derivations performed, never
+the 2^48 index space; see §3.) With the planned design (§1: ~1–2 instances per
+update) `N` ≈ 1–2× the channel-update count.
 
-| bucketing instances (one seed) | residual leak probability |
-|---|---|
-| **~1,000,000** (2^20) | ≤ 2^-20  (~1 in a million) |
-| **~1,000** (2^10) | ≤ 2^-30  (~1 in a billion, strong margin) |
+At the **demo/research default `ssp = 40`**:
 
-The residual is the chance of a *single, undetected, ~1-bit* leak — a real
-attempt aborts with prob `~1 - 2^-40` (almost always caught) and stealing funds
-needs far more than one bit. The table counts **bucketing instances**; the planned
-design (§1: 1-SHA cached branches) spends **~2 instances per update**, so the safe
-**update** count is about half — **~500k updates per seed at `2^-20`** (commit
-`N = 2^n` with `n ≤ 19`), ~512 at `2^-30`. Still comfortably more than any real
-channel does.
+| residual leak prob | safe instances `N` | ≈ channel updates (~1–2 inst/update) |
+|---|---|---|
+| `2^-20` (~1 in 1 M) | ~`2^20` | ~500 k – 1 M |
+| `2^-30` (~1 in 1 B) | ~`2^10` | ~500 – 1 000 |
 
-**To expand beyond the limit:**
-1. **Rotate the seed** (open a fresh channel) — the budget is per-seed, so this
-   resets it for free, no code change. This is the normal path.
-2. **Raise `kSsp`** — a coordinated change (both parties must match). Cost is
-   ~linear (§3): `ssp = 64` buys ~2^24 (16 M) updates at a `2^-40` residual for
-   ~1.3–1.6× triple-gen compute/bandwidth/latency (memory unaffected).
+The residual is the chance of a *single, undetected, ~1-bit* leak (a real attempt
+aborts w.p. `~1-2^-ssp`, and theft needs far more than one bit) — adequate for
+demo/research, but **`2^-20` is too thin for production funds**.
+
+**Production guidance:**
+1. Use **`ssp ≈ 60–64`** → `2^-40` residual over ~`2^24` (16 M) instances. Cost is
+   ~linear (§3); a coordinated change (both parties match).
+2. **Count every `compute_inplace` against the seed** (revealed, precomputed,
+   aborted, refills, chunks), track the running per-seed budget, and **rotate the
+   seed** (open a fresh channel — resets the budget for free) before crossing the
+   chosen risk threshold.
 
 The rest of this doc is the analysis behind these numbers.
 
@@ -62,10 +66,21 @@ Design:
   each a 256-bit authenticated intermediate (each party's share ≈
   `AShareBundle` + label + Lambda ≈ ~50 B/bit → **~600 KB** for 48×256). Levels
   are public (like the Go `(index, tag)` tags); each party holds only its shares.
-- **Derive on demand.** For `H(I)`, branch from the deepest cached ancestor (a
-  few hashes via `BuildChunkCircuit(first=false)` on the carried node), reveal,
-  and cache the new intermediates along `I`'s path for the next (lower-index)
-  secret — the BOLT-03 insertion logic on authenticated values.
+  *(~600 KB is an order-of-magnitude estimate of the raw share material; the actual
+  `AG2PCSession::carried_` RSS — map overhead, `AShareBundle` layout — is unmeasured
+  until implemented.)*
+- **Derive on demand.** For `H(I)`, branch from the deepest cached ancestor (a few
+  hashes via `BuildChunkCircuit(first=false)` on the carried node), reveal, and
+  cache the new intermediates along `I`'s path for the next (lower-index) secret —
+  the BOLT-03 insertion logic on authenticated values. **Caching detail:** to cache
+  those intermediates in *one* bucketing instance, the branch circuit must be
+  **multi-output** — expose every node-to-cache as an output of a single
+  `run_artifact`, then `checkpoint` all of them. Today `BuildChunkCircuit` outputs
+  only the final value, so this needs a multi-output extension. The fallback —
+  splitting the branch into 1-SHA steps so each step's output is carried — also
+  caches them, but spends one bucketing instance *per step* (~2× the budget; §1
+  "Chunking in the cache"). So the budget-optimal cache is multi-output-single-run;
+  the min-RAM cache is 1-SHA-per-step.
 - **No persistence.** The cache + COT mesh live in the in-memory session. On a new
   session (or reconnect) we **refill from the seed** (recompute the trunk once,
   ~one 48-block chain) and re-warm. Cross-restart persistence of authenticated
@@ -111,20 +126,26 @@ refill (transient ~tens–hundreds of MB); drop to 1 only if RAM is the hard lim
 The trunk is once per session, so this cost amortizes over the `2^n` leaves — it
 matters most under frequent restarts.
 
-**Branches → always 1-SHA + cache.** Within the n-bit subtree, run one SHA per step
-and cache each output: the BOLT-03 cache truncated to depth `n`. Because secrets are
-revealed in decreasing index order, consecutive leaves share the subtree prefix, so
-each new leaf is ~2 new steps amortized (**~1–2 instances/leaf**) at **minimum RAM
-(~10 MB)**. Caching is **required** here: recomputing each leaf's full branch from
-the tip would be ~`(n/4)×` the compute and infeasible at our `n`. The price of the
-*fine* (1-SHA) cache is ~2× the bucketing instances of a coarser branch cache —
-i.e. ~½ the safe-update count (the ~500k above) — accepted for minimum RAM and
-maximum sharing.
+**Branches → cache the n-bit subtree.** Within the subtree, cache the intermediate
+nodes (the BOLT-03 cache truncated to depth `n`). Because secrets are revealed in
+decreasing index order, consecutive leaves share the subtree prefix, so each new
+leaf adds only ~2 new steps amortized. Caching is **required**: recomputing each
+leaf's full branch from the tip would be ~`(n/4)×` the compute and infeasible at our
+`n`. Two ways to realize it, a RAM↔budget choice:
 
-(This supersedes the earlier "keep branches whole" idea: whole branches only make
-sense *without* a cache — recompute per leaf — which is exactly what the cache
-exists to avoid. With the cache, branches are 1-SHA-and-cached, and the only tunable
-is `trunk_chunk_size`.)
+- **1-SHA-per-step (min RAM).** One `run_artifact` per step, each output carried
+  → cached. ~10 MB, but **~1 instance per step ≈ ~2 instances/leaf** → ~½ the
+  safe-update count (the ~500k above). Works with today's `BuildChunkCircuit`.
+- **Multi-output single-run (budget-optimal; finding 3).** Run the new steps in
+  *one* `run_artifact` whose circuit **exposes every node-to-cache as an output**,
+  then `checkpoint` them all → **~1 instance/leaf** (≈2× the safe-update count). RAM
+  = the branch's few blocks in one circuit (~tens of MB). Needs a multi-output
+  extension to `BuildChunkCircuit` (it currently emits only the final value).
+
+So caching intermediates is *not* free with the current circuit: either accept the
+1-SHA per-step budget, or add multi-output. (This supersedes the earlier "keep
+branches whole" idea — whole branches mean no cache, i.e. recompute per leaf, which
+is exactly what the cache avoids.) The trunk knob remains `trunk_chunk_size`.
 
 ---
 

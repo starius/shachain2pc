@@ -339,6 +339,167 @@ inline protocol::Value RunDerivation(emp::NetIO* io, ThreadPool* pool, int party
   return RunDerivationBatch(io, pool, party, {index}, my_share, timing)[0];
 }
 
+// ---------------------------------------------------------------------------
+// Block-chunking: evaluate ONE derivation as a sequence of smaller circuits to
+// bound the per-circuit preprocessing peak. The chain's intermediate value is
+// carried between chunks as an AUTHENTICATED wire (run_artifact reuses the
+// carried AShareBundle directly -- it is never revealed and never re-input), and
+// every per-link flip is an in-circuit public constant. So a malicious party
+// cannot flip a bit of the carried value or substitute a different chain without
+// breaking a MAC -- caught by the per-chunk COT consistency check and the final
+// reveal. This is the malicious-secure equivalent of the one big circuit (it is
+// exactly the steering attack the semi-honest re-input design suffers from).
+struct ChunkTiming {
+  double setup_s = 0.0;
+  std::vector<double> chunk_s;  // per-chunk compute (garble+evaluate)
+  double reveal_s = 0.0;
+  int blocks_per_chunk = 0;
+  int num_chunks = 0;
+  uint64_t rounds = 0;       // NetIO direction-changes on the primary channel
+  uint64_t bytes_sent = 0;
+  uint64_t bytes_recv = 0;
+  double chunk_total_s() const {
+    double t = 0.0;
+    for (double x : chunk_s) t += x;
+    return t;
+  }
+};
+
+// CheckChunkCircuit validates a chunk's shape: 256-bit output, and either a
+// 256-bit carried input (later chunks) or a 512-bit two-share input (chunk 0).
+inline void CheckChunkCircuit(const protocol::Circuit& c) {
+  const int ni = c.n1 + c.n2;
+  if ((ni != protocol::kValueBits && ni != 2 * protocol::kValueBits) ||
+      c.n3 != protocol::kValueBits) {
+    throw std::runtime_error("shachain2pc: chunk circuit has wrong shape");
+  }
+}
+
+// ChunkSpecDigest pins index + chunk size + SHA gadget so both parties agree on
+// the chunking before any work (a size mismatch would otherwise desync mid-run).
+inline std::array<uint8_t, 32> ChunkSpecDigest(uint64_t index,
+                                               int blocks_per_chunk,
+                                               const protocol::Circuit& sha) {
+  std::array<uint8_t, 32> sha_dg = CircuitDigest(sha, ToEmpGateArray(sha));
+  std::array<uint8_t, 32> dg{};
+  unsigned int len = 0;
+  int bpc = blocks_per_chunk;
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) throw std::runtime_error("ChunkSpecDigest: EVP_MD_CTX_new failed");
+  auto cleanup = [&]() { EVP_MD_CTX_free(ctx); };
+  if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1 ||
+      EVP_DigestUpdate(ctx, &index, sizeof(index)) != 1 ||
+      EVP_DigestUpdate(ctx, &bpc, sizeof(bpc)) != 1 ||
+      EVP_DigestUpdate(ctx, sha_dg.data(), sha_dg.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx, dg.data(), &len) != 1 || len != dg.size()) {
+    cleanup();
+    throw std::runtime_error("ChunkSpecDigest: EVP digest failed");
+  }
+  cleanup();
+  return dg;
+}
+
+// TamperFirstFlip (TEST ONLY) redirects a chunk's first bit-flip (Inv) gate to
+// read input wire 0 instead of its intended wire -- a malicious party trying to
+// steer the chain to a different I' WITHOUT changing the circuit shape (so it is
+// not caught by the digest handshake; only authenticated garbling can catch it).
+// gate 0 is the c0 constant (XorW(0,0)); c1 = Inv(c0); the real flips are Inv
+// gates whose input is not the c0 wire. Used only by the abort/safety test.
+inline void TamperFirstFlip(protocol::Circuit& c) {
+  const int c0_wire = c.gates.empty() ? -1 : c.gates[0].out;
+  for (protocol::Gate& g : c.gates) {
+    if (g.type == protocol::Gate::kInv && g.in0 != c0_wire) {
+      g.in0 = 0;  // read input wire 0 -> wrong function (steered chain)
+      return;
+    }
+  }
+}
+
+// tamper_chunk >= 0 (TEST ONLY): this party garbles a steered flip in that chunk
+// (see TamperFirstFlip). With one honest party, authenticated garbling must abort
+// rather than reveal the steered value. -1 disables it (the normal path).
+inline protocol::Value RunDerivationChunked(emp::NetIO* io, ThreadPool* pool,
+                                            int party, uint64_t index,
+                                            const protocol::Value& my_share,
+                                            int blocks_per_chunk,
+                                            ChunkTiming& timing,
+                                            int tamper_chunk = -1) {
+  using Ctx = emp::AG2PCSession::DirectCtx;
+  using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;
+  using Clock = std::chrono::steady_clock;
+  auto secs = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
+
+  if (index > protocol::kMaxIndex)
+    throw std::runtime_error("shachain2pc: index exceeds 48 bits");
+  if (blocks_per_chunk < 1)
+    throw std::runtime_error("shachain2pc: blocks_per_chunk must be >= 1");
+
+  protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
+  std::vector<std::vector<int>> groups =
+      protocol::SplitChainBits(index, blocks_per_chunk);
+  ExchangeCircuitDigest(io, party, ChunkSpecDigest(index, blocks_per_chunk, sha));
+
+  // ---- one-time setup: COT mesh + input authentication ----
+  auto t0 = Clock::now();
+  emp::AG2PCSession sess(io, pool, party);
+  io->flush();
+  std::array<bool, protocol::kValueBits> bob_clear{};
+  std::array<bool, protocol::kValueBits> alice_clear{};
+  {
+    std::vector<uint8_t> share_bits = protocol::ValueToBits(my_share);
+    std::array<bool, protocol::kValueBits>& mine =
+        (party == kBob) ? bob_clear : alice_clear;
+    for (int i = 0; i < protocol::kValueBits; ++i) mine[i] = share_bits[i] != 0;
+  }
+  BV bob_in = sess.input<BV>(kBob, bob_clear);
+  BV alice_in = sess.input<BV>(kAlice, alice_clear);
+  timing.setup_s = secs(t0, Clock::now());
+  timing.blocks_per_chunk = blocks_per_chunk;
+  timing.num_chunks = static_cast<int>(groups.size());
+  timing.chunk_s.reserve(groups.size());
+
+  // ---- chunk 0: recombine the seed shares, apply the first group of flips ----
+  protocol::Circuit c0 = protocol::BuildChunkCircuit(sha, groups[0], true);
+  if (tamper_chunk == 0) TamperFirstFlip(c0);  // TEST ONLY
+  CheckChunkCircuit(c0);
+  emp::circuit::BooleanProgram prog0 = ToBooleanProgram(c0);
+  ReleaseVector(c0.gates);
+  auto tc0 = Clock::now();
+  BV cur = sess.run_artifact<BV>(prog0, bob_in, alice_in);
+  timing.chunk_s.push_back(secs(tc0, Clock::now()));
+  sess.checkpoint(cur);  // free the seed-share inputs; keep only the carried value
+
+  // ---- chunks 1..: carry the authenticated value directly into the next ----
+  for (std::size_t k = 1; k < groups.size(); ++k) {
+    protocol::Circuit c = protocol::BuildChunkCircuit(sha, groups[k], false);
+    if (static_cast<int>(k) == tamper_chunk) TamperFirstFlip(c);  // TEST ONLY
+    CheckChunkCircuit(c);
+    emp::circuit::BooleanProgram prog = ToBooleanProgram(c);
+    ReleaseVector(c.gates);
+    auto tc = Clock::now();
+    cur = sess.run_artifact<BV>(prog, cur);
+    timing.chunk_s.push_back(secs(tc, Clock::now()));
+    sess.checkpoint(cur);  // free the previous chunk's intermediate
+  }
+
+  // ---- reveal the final value ----
+  auto tr = Clock::now();
+  std::optional<std::array<bool, protocol::kValueBits>> rev =
+      sess.reveal(cur, emp::PUBLIC);
+  timing.reveal_s = secs(tr, Clock::now());
+  io->flush();
+  timing.rounds = io->rounds;
+  timing.bytes_sent = io->send_counter;
+  timing.bytes_recv = io->recv_counter;
+  if (!rev.has_value())
+    throw std::runtime_error("shachain2pc: reveal produced no value");
+  std::vector<uint8_t> out_bits(protocol::kValueBits);
+  for (int i = 0; i < protocol::kValueBits; ++i) out_bits[i] = (*rev)[i] ? 1 : 0;
+  return protocol::BitsToValue(out_bits);
+}
+
 }  // namespace shachain2pc::run
 
 #endif  // SHACHAIN2PC_RUN_DERIVE_H

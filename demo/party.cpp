@@ -115,6 +115,45 @@ int main(int argc, char** argv) {
   SetTransportTimeout(io);  // bound blocking recv/send so a stalled peer aborts
   ThreadPool pool(run::kThreads);  // session-local compute parallelism (global type)
   try {
+    // Block-chunking mode (single index only): SHACHAIN2PC_CHUNK_BLOCKS=N runs the
+    // derivation as a chain of N-block chunks, carrying the authenticated
+    // intermediate, to cap the memory peak. Reports per-chunk timing + net rounds.
+    if (const char* ce = std::getenv("SHACHAIN2PC_CHUNK_BLOCKS")) {
+      int chunk_blocks = std::atoi(ce);
+      if (chunk_blocks > 0) {
+        if (is_range) {
+          throw std::runtime_error(
+              "SHACHAIN2PC_CHUNK_BLOCKS is single-index only (no range)");
+        }
+        // SHACHAIN2PC_TAMPER=<chunk> (TEST ONLY): garble a steered flip in that
+        // chunk to confirm authenticated garbling aborts instead of revealing it.
+        int tamper_chunk = -1;
+        if (const char* te = std::getenv("SHACHAIN2PC_TAMPER")) {
+          tamper_chunk = std::atoi(te);
+        }
+        run::ChunkTiming ct;
+        protocol::Value out = run::RunDerivationChunked(
+            io, &pool, party, indices[0], share, chunk_blocks, ct, tamper_chunk);
+        delete io;
+        std::printf("RESULT %s\n", util::ToHex(out).c_str());
+        std::fprintf(stderr, "TIMING setup            %9.4f s\n", ct.setup_s);
+        for (std::size_t k = 0; k < ct.chunk_s.size(); ++k) {
+          std::fprintf(stderr, "TIMING chunk[%3zu]       %9.4f s\n", k,
+                       ct.chunk_s[k]);
+        }
+        std::fprintf(stderr,
+                     "TIMING compute total    %9.4f s   (%d chunks x %d blocks)\n",
+                     ct.chunk_total_s(), ct.num_chunks, ct.blocks_per_chunk);
+        std::fprintf(stderr, "TIMING reveal           %9.4f s\n", ct.reveal_s);
+        std::fprintf(stderr, "TIMING grand-total      %9.4f s\n",
+                     ct.setup_s + ct.chunk_total_s() + ct.reveal_s);
+        std::fprintf(stderr, "NET   rounds=%llu sent=%llu recv=%llu (bytes)\n",
+                     static_cast<unsigned long long>(ct.rounds),
+                     static_cast<unsigned long long>(ct.bytes_sent),
+                     static_cast<unsigned long long>(ct.bytes_recv));
+        return 0;
+      }
+    }
     run::BatchTiming timing;
     std::vector<protocol::Value> outs =
         run::RunDerivationBatch(io, &pool, party, indices, share, timing);

@@ -28,6 +28,30 @@ namespace shachain2pc::protocol {
 // gadget and I. popcount(I) ranges 0..48; I uses only its low 48 bits.
 Circuit BuildDerivationCircuit(const Circuit& sha256_compress, uint64_t I);
 
+// --- Block-chunking: split the one chain into a sequence of smaller circuits so
+// the per-circuit preprocessing peak is bounded by chunk size instead of the
+// whole chain. The intermediate value is carried between chunks as an
+// *authenticated* wire (never re-input), and the per-link flips stay in-circuit
+// public constants -- so this is the malicious-secure equivalent of the single
+// circuit (see README / the semi-honest steering caveat it avoids).
+
+// SplitChainBits returns the set chain-bit positions of I (high to low, the BOLT
+// processing order) grouped into chunks of `blocks_per_chunk`. The first group is
+// chunk 0 (which additionally does the seed XOR). Always returns >= 1 group: an
+// empty first group means popcount(I) == 0 (chunk 0 is seed-only). Throws on
+// blocks_per_chunk < 1 or I out of range.
+std::vector<std::vector<int>> SplitChainBits(uint64_t I, int blocks_per_chunk);
+
+// BuildChunkCircuit builds one chunk. If `first`, inputs are 256 ALICE + 256 BOB
+// share bits and the circuit computes seed = ALICE XOR BOB; otherwise the single
+// 256-bit input IS the carried value (chained directly, not re-input). It then
+// applies each bit in `chain_bits` (already high-to-low) as a public-constant flip
+// followed by one SHA-256 compression. Output: 256 bits.
+//   first == true  -> n1 = n2 = 256 (num_inputs 512)
+//   first == false -> n1 = 256, n2 = 0 (num_inputs 256, the carried value)
+Circuit BuildChunkCircuit(const Circuit& sha256_compress,
+                          const std::vector<int>& chain_bits, bool first);
+
 }  // namespace shachain2pc::protocol
 
 #endif  // SHACHAIN2PC_PROTOCOL_CIRCUIT_GEN_H

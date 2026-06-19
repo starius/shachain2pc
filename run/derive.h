@@ -48,6 +48,33 @@ namespace shachain2pc::run {
 constexpr int kAlice = emp::ALICE;  // 1, garbler, listens
 constexpr int kBob = emp::BOB;      // 2, evaluator, connects
 constexpr int kThreads = 4;         // session ThreadPool size (local compute only)
+
+// Statistical security parameter for the authenticated-AND bucketing (emp's
+// AG2PCSession `ssp`). We keep emp's default, 40.
+//
+// CONSEQUENCE / OPERATING LIMIT. The bucketing's soundness+leakage error is
+// ~2^-kSsp PER derivation, and it accumulates as N * 2^-kSsp over N derivations
+// against ONE seed -- where N = the number of revealed per-commitment secrets,
+// i.e. channel updates (NOT the 2^48 index space, which is never derived). So at
+// kSsp = 40 the safe operating limit for one channel/seed is about:
+//     <= ~1,000,000 updates (2^20)  -> residual <= 2^-20  (~1 in a million)
+//     <= ~1,000     updates (2^10)  -> residual <= 2^-30  (~1 in a billion)
+// This residual is the probability of a *single, undetected, ~1-bit* leak; a real
+// attempt aborts with prob ~1-2^-40 (so it is almost always caught), and stealing
+// funds needs far more than one bit -- so ~1M updates is comfortably safe and ~1k
+// is paranoid-safe.
+//
+// TO EXPAND BEYOND THE LIMIT (in priority order):
+//   1. Rotate the seed (open a fresh channel). The budget is PER SEED, so a new
+//      seed resets it for free -- no parameter change.
+//   2. Raise kSsp. Cost is ~linear: bucket size B ~ kSsp/log2(L), so triple-gen
+//      compute (~3B-2 COTs/AND), bandwidth, and round-trips/latency scale with it
+//      (memory is unaffected). E.g. kSsp = 64 buys ~2^24 (16M) updates at a 2^-40
+//      residual for ~1.3-1.6x triple-gen cost. BOTH parties MUST use the same
+//      value, so this is a coordinated change, not a per-run flag.
+// Full analysis: docs/shared-trunk-cache.md.
+constexpr int kSsp = 40;
+
 constexpr const char* kDefaultSha256CompressPath =
     ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt";
 
@@ -282,7 +309,7 @@ inline std::vector<protocol::Value> RunDerivationBatch(
 
   // ---- one-time setup: COT mesh (session ctor) + input authentication ----
   auto t0 = Clock::now();
-  emp::AG2PCSession sess(io, pool, party);
+  emp::AG2PCSession sess(io, pool, party, kSsp);
   io->flush();
   std::array<bool, protocol::kValueBits> bob_clear{};
   std::array<bool, protocol::kValueBits> alice_clear{};
@@ -443,7 +470,7 @@ inline protocol::Value RunDerivationChunked(emp::NetIO* io, ThreadPool* pool,
 
   // ---- one-time setup: COT mesh + input authentication ----
   auto t0 = Clock::now();
-  emp::AG2PCSession sess(io, pool, party);
+  emp::AG2PCSession sess(io, pool, party, kSsp);
   io->flush();
   std::array<bool, protocol::kValueBits> bob_clear{};
   std::array<bool, protocol::kValueBits> alice_clear{};
@@ -608,7 +635,7 @@ inline std::vector<protocol::Value> RunDerivationTree(
 
   // ---- one-time setup: COT mesh + input authentication ----
   auto t0 = Clock::now();
-  emp::AG2PCSession sess(io, pool, party);
+  emp::AG2PCSession sess(io, pool, party, kSsp);
   io->flush();
   std::array<bool, protocol::kValueBits> bob_clear{};
   std::array<bool, protocol::kValueBits> alice_clear{};

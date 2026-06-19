@@ -500,6 +500,184 @@ inline protocol::Value RunDerivationChunked(emp::NetIO* io, ThreadPool* pool,
   return protocol::BitsToValue(out_bits);
 }
 
+// ---------------------------------------------------------------------------
+// Shared-trunk derivation. shachain processes set bits high->low, so indices that
+// share a high-bit prefix share that whole sub-chain. We compute the shared prefix
+// ("trunk") ONCE into an authenticated value T, then derive each index's remaining
+// low-bit "branch" from T. Branches are all computed first (NOT revealed), then
+// revealed one-by-one. Throughput: the trunk is shared instead of recomputed per
+// index. Memory: trunk (optionally chunked) + one branch at a time + the carried
+// 256-bit outputs (tiny). Security is the same as the single circuit: T is carried
+// as an authenticated wire (reused, never re-input), branch flips are in-circuit
+// constants, and revealing one output never opens another (independent masks).
+
+// SetBitsDesc returns the set bit positions of x (0..47), high to low.
+inline std::vector<int> SetBitsDesc(uint64_t x) {
+  std::vector<int> bits;
+  for (int b = protocol::kIndexBits - 1; b >= 0; --b)
+    if ((x >> b) & 1) bits.push_back(b);
+  return bits;
+}
+
+struct TreeTiming {
+  double setup_s = 0.0;
+  double trunk_s = 0.0;
+  int trunk_chunks = 0;
+  int trunk_blocks = 0;
+  int split_bit = -1;
+  std::vector<double> branch_s;  // per-index branch compute
+  std::vector<double> reveal_s;  // per-index reveal
+  uint64_t rounds = 0, bytes_sent = 0, bytes_recv = 0;
+  double branch_total_s() const {
+    double t = 0.0; for (double x : branch_s) t += x; return t;
+  }
+  double reveal_total_s() const {
+    double t = 0.0; for (double x : reveal_s) t += x; return t;
+  }
+};
+
+inline std::array<uint8_t, 32> TreeDigest(const std::vector<uint64_t>& indices,
+                                          int trunk_chunk_blocks,
+                                          const protocol::Circuit& sha) {
+  std::array<uint8_t, 32> sha_dg = CircuitDigest(sha, ToEmpGateArray(sha));
+  std::array<uint8_t, 32> dg{};
+  unsigned int len = 0;
+  int tcb = trunk_chunk_blocks;
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) throw std::runtime_error("TreeDigest: EVP_MD_CTX_new failed");
+  auto cleanup = [&]() { EVP_MD_CTX_free(ctx); };
+  if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1 ||
+      EVP_DigestUpdate(ctx, indices.data(),
+                       indices.size() * sizeof(uint64_t)) != 1 ||
+      EVP_DigestUpdate(ctx, &tcb, sizeof(tcb)) != 1 ||
+      EVP_DigestUpdate(ctx, sha_dg.data(), sha_dg.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx, dg.data(), &len) != 1 || len != dg.size()) {
+    cleanup();
+    throw std::runtime_error("TreeDigest: EVP digest failed");
+  }
+  cleanup();
+  return dg;
+}
+
+// tamper_branch >= 0 (TEST ONLY): garble a steered flip in that branch to confirm
+// authenticated garbling aborts even with the shared/reused trunk. -1 = normal.
+inline std::vector<protocol::Value> RunDerivationTree(
+    emp::NetIO* io, ThreadPool* pool, int party,
+    const std::vector<uint64_t>& indices, const protocol::Value& my_share,
+    int trunk_chunk_blocks, TreeTiming& timing, int tamper_branch = -1) {
+  using Ctx = emp::AG2PCSession::DirectCtx;
+  using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;
+  using Clock = std::chrono::steady_clock;
+  auto secs = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
+
+  if (indices.empty()) throw std::runtime_error("shachain2pc: empty index set");
+  for (uint64_t I : indices)
+    if (I > protocol::kMaxIndex)
+      throw std::runtime_error("shachain2pc: index exceeds 48 bits");
+
+  // Common high-bit prefix: split = highest bit where the indices differ; bits
+  // above split are shared by all (the trunk), bits <= split are per-index (the
+  // branch). split == -1 means all indices are equal (trunk = the whole chain).
+  uint64_t diff = 0;
+  for (uint64_t I : indices) diff |= (I ^ indices[0]);
+  int split = -1;
+  for (int b = protocol::kIndexBits - 1; b >= 0; --b)
+    if ((diff >> b) & 1) { split = b; break; }
+  const uint64_t low_mask =
+      (split < 0) ? 0ULL : (((uint64_t)1 << (split + 1)) - 1);
+  const uint64_t high_mask = protocol::kMaxIndex & ~low_mask;
+  timing.split_bit = split;
+
+  protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
+  ExchangeCircuitDigest(io, party, TreeDigest(indices, trunk_chunk_blocks, sha));
+
+  // ---- one-time setup: COT mesh + input authentication ----
+  auto t0 = Clock::now();
+  emp::AG2PCSession sess(io, pool, party);
+  io->flush();
+  std::array<bool, protocol::kValueBits> bob_clear{};
+  std::array<bool, protocol::kValueBits> alice_clear{};
+  {
+    std::vector<uint8_t> share_bits = protocol::ValueToBits(my_share);
+    std::array<bool, protocol::kValueBits>& mine =
+        (party == kBob) ? bob_clear : alice_clear;
+    for (int i = 0; i < protocol::kValueBits; ++i) mine[i] = share_bits[i] != 0;
+  }
+  BV bob_in = sess.input<BV>(kBob, bob_clear);
+  BV alice_in = sess.input<BV>(kAlice, alice_clear);
+  timing.setup_s = secs(t0, Clock::now());
+
+  // ---- trunk: chain over the shared high set bits (optionally chunked) ----
+  const int cb =
+      (trunk_chunk_blocks > 0) ? trunk_chunk_blocks : protocol::kIndexBits;
+  std::vector<std::vector<int>> tgroups =
+      protocol::SplitChainBits(indices[0] & high_mask, cb);
+  for (const auto& g : tgroups) timing.trunk_blocks += (int)g.size();
+  timing.trunk_chunks = (int)tgroups.size();
+
+  // The trunk must contain >=1 hash so T carries a fresh AND-output mask. With an
+  // empty trunk T would be a pure linear function of the session inputs, and
+  // fanning that out to many branches is input reuse -- emp's c_gamma check
+  // rejects it (it would also be the selective-failure case). No shared hashes
+  // also means no sharing benefit; use batch mode for such ranges.
+  if (timing.trunk_blocks == 0) {
+    throw std::runtime_error(
+        "shachain2pc: shared-trunk needs >=1 common high set bit (no shared "
+        "hash in this range); use batch mode");
+  }
+
+  auto ttrunk = Clock::now();
+  protocol::Circuit tc0 = protocol::BuildChunkCircuit(sha, tgroups[0], true);
+  CheckChunkCircuit(tc0);
+  BV T = sess.run_artifact<BV>(ToBooleanProgram(tc0), bob_in, alice_in);
+  for (std::size_t k = 1; k < tgroups.size(); ++k) {
+    protocol::Circuit tc = protocol::BuildChunkCircuit(sha, tgroups[k], false);
+    CheckChunkCircuit(tc);
+    T = sess.run_artifact<BV>(ToBooleanProgram(tc), T);
+  }
+  timing.trunk_s = secs(ttrunk, Clock::now());
+  sess.checkpoint(T);  // free the seed inputs + trunk intermediates; keep T
+
+  // ---- branches: one circuit per index from the carried trunk, NOT revealed ----
+  std::vector<BV> outs;
+  outs.reserve(indices.size());
+  timing.branch_s.reserve(indices.size());
+  for (std::size_t bi = 0; bi < indices.size(); ++bi) {
+    std::vector<int> branch_bits = SetBitsDesc(indices[bi] & low_mask);
+    protocol::Circuit bc = protocol::BuildChunkCircuit(sha, branch_bits, false);
+    if (static_cast<int>(bi) == tamper_branch) TamperFirstFlip(bc);  // TEST ONLY
+    CheckChunkCircuit(bc);
+    emp::circuit::BooleanProgram prog = ToBooleanProgram(bc);
+    ReleaseVector(bc.gates);
+    auto tb = Clock::now();
+    outs.push_back(sess.run_artifact<BV>(prog, T));  // reuse T (fan-out)
+    timing.branch_s.push_back(secs(tb, Clock::now()));
+  }
+
+  // ---- reveal every branch output, one-by-one (materialized outs survive) ----
+  std::vector<protocol::Value> results;
+  results.reserve(indices.size());
+  timing.reveal_s.reserve(indices.size());
+  for (std::size_t k = 0; k < outs.size(); ++k) {
+    auto trv = Clock::now();
+    std::optional<std::array<bool, protocol::kValueBits>> rev =
+        sess.reveal(outs[k], emp::PUBLIC);
+    timing.reveal_s.push_back(secs(trv, Clock::now()));
+    if (!rev.has_value())
+      throw std::runtime_error("shachain2pc: reveal produced no value");
+    std::vector<uint8_t> ob(protocol::kValueBits);
+    for (int i = 0; i < protocol::kValueBits; ++i) ob[i] = (*rev)[i] ? 1 : 0;
+    results.push_back(protocol::BitsToValue(ob));
+  }
+  io->flush();
+  timing.rounds = io->rounds;
+  timing.bytes_sent = io->send_counter;
+  timing.bytes_recv = io->recv_counter;
+  return results;
+}
+
 }  // namespace shachain2pc::run
 
 #endif  // SHACHAIN2PC_RUN_DERIVE_H

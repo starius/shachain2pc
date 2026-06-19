@@ -131,4 +131,64 @@ Circuit BuildDerivationCircuit(const Circuit& sha, uint64_t I) {
   return b.Finish(kValueBits, kValueBits, kValueBits);
 }
 
+std::vector<std::vector<int>> SplitChainBits(uint64_t I, int blocks_per_chunk) {
+  if (blocks_per_chunk < 1) {
+    throw std::runtime_error("SplitChainBits: blocks_per_chunk must be >= 1");
+  }
+  if (I > kMaxIndex) {
+    throw std::runtime_error("SplitChainBits: index exceeds 48 bits");
+  }
+  // Flat list of set chain-bits, high to low (the reference processing order).
+  std::vector<int> bits;
+  for (int bit = kIndexBits - 1; bit >= 0; --bit) {
+    if ((I >> bit) & 1) bits.push_back(bit);
+  }
+  std::vector<std::vector<int>> groups;
+  groups.emplace_back();  // chunk 0 always exists (does the seed XOR)
+  for (size_t i = 0; i < bits.size(); ++i) {
+    if (!groups.back().empty() &&
+        static_cast<int>(groups.back().size()) == blocks_per_chunk) {
+      groups.emplace_back();
+    }
+    groups.back().push_back(bits[i]);
+  }
+  return groups;
+}
+
+Circuit BuildChunkCircuit(const Circuit& sha, const std::vector<int>& chain_bits,
+                          bool first) {
+  if (sha.n1 + sha.n2 != 512 || sha.n3 != kValueBits) {
+    throw std::runtime_error("BuildChunkCircuit: gadget is not 512->256");
+  }
+  const int num_inputs = first ? 2 * kValueBits : kValueBits;
+  Builder b(num_inputs);
+
+  const int c0 = b.XorW(0, 0);
+  const int c1 = b.InvW(c0);
+  const std::vector<uint8_t> pad = PaddingBits();
+
+  // Starting value: chunk 0 recombines the two shares; later chunks take the
+  // carried value directly on their input wires (no re-input -> not steerable).
+  std::vector<int> p(kValueBits);
+  if (first) {
+    for (int i = 0; i < kValueBits; ++i) p[i] = b.XorW(i, kValueBits + i);
+  } else {
+    for (int i = 0; i < kValueBits; ++i) p[i] = i;
+  }
+
+  for (int bit : chain_bits) {  // already high-to-low within the chunk
+    const int idx = FlipBitIndex(bit);
+    p[idx] = b.InvW(p[idx]);  // public constant flip
+    std::vector<int> block(512);
+    for (int i = 0; i < kValueBits; ++i) block[i] = p[i];
+    for (int i = 0; i < kValueBits; ++i) block[kValueBits + i] = pad[i] ? c1 : c0;
+    p = b.ApplyGadget(sha, block);
+  }
+
+  std::vector<int> out(kValueBits);
+  for (int i = 0; i < kValueBits; ++i) out[i] = b.XorW(p[i], c0);
+
+  return b.Finish(kValueBits, first ? kValueBits : 0, kValueBits);
+}
+
 }  // namespace shachain2pc::protocol

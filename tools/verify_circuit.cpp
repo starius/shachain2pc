@@ -45,6 +45,26 @@ static proto::Value RunCircuit(const proto::Circuit& c, const proto::Value& seed
   return proto::BitsToValue(proto::EvalBristol(c, in));
 }
 
+// Evaluate the block-chunked chain (blocks_per_chunk = N) in plaintext: chunk 0
+// takes a||b and recombines the seed; each later chunk takes the prior 256-bit
+// value directly (the same value the MPC carries as an authenticated wire).
+static proto::Value RunChunked(const proto::Circuit& sha, const proto::Value& seed,
+                               const proto::Value& share, uint64_t I, int N) {
+  proto::Value a = share;
+  proto::Value b{};
+  for (int i = 0; i < 32; ++i) b[i] = seed[i] ^ a[i];
+  std::vector<std::vector<int>> groups = proto::SplitChainBits(I, N);
+  std::vector<uint8_t> in = proto::ValueToBits(a);
+  std::vector<uint8_t> bb = proto::ValueToBits(b);
+  in.insert(in.end(), bb.begin(), bb.end());
+  std::vector<uint8_t> v =
+      proto::EvalBristol(proto::BuildChunkCircuit(sha, groups[0], true), in);
+  for (size_t k = 1; k < groups.size(); ++k) {
+    v = proto::EvalBristol(proto::BuildChunkCircuit(sha, groups[k], false), v);
+  }
+  return proto::BitsToValue(v);
+}
+
 int main() {
   proto::Circuit sha = proto::LoadBristol(
       ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt");
@@ -102,6 +122,30 @@ int main() {
     proto::Value seed = ref::FillSeed(0x01);
     bool ok = RunCircuit(r, seed, split1) == ref::GenerateFromSeed(seed, 1ULL);
     std::printf("serializer round-trip (I=1): %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // Block-chunking: the chained chunks must equal the reference for every chunk
+  // size, for each split. This pins that splitting the chain (and carrying the
+  // intermediate) is functionally identical to the one big circuit.
+  {
+    const uint64_t idxs[] = {0ULL, 1ULL, 3ULL, 0x123456789abcULL, 0xffffffffffffULL};
+    const int ns[] = {1, 2, 5, 48};
+    bool ok = true;
+    for (uint64_t I : idxs) {
+      proto::Value want = ref::GenerateFromSeed(ref::FillSeed(0xab), I);
+      for (int N : ns) {
+        for (const proto::Value* sh : {&split0, &split1, &split2}) {
+          proto::Value got = RunChunked(sha, ref::FillSeed(0xab), *sh, I, N);
+          if (got != want) {
+            ok = false;
+            std::printf("  chunk mismatch I=%012llx N=%d: got %s\n",
+                        static_cast<unsigned long long>(I), N, Hex(got).c_str());
+          }
+        }
+      }
+    }
+    std::printf("block-chunking (all I x N x splits): %s\n", ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 

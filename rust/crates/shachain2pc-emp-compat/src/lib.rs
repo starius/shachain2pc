@@ -1589,6 +1589,29 @@ impl Ag2pcSecureWires {
             },
         })
     }
+
+    pub fn concat(parts: &[Self]) -> Self {
+        let total = parts.iter().map(Self::len).sum();
+        let mut out = Self {
+            lambda: Vec::with_capacity(total),
+            wire_bundle: Vec::with_capacity(total),
+            label0: Vec::new(),
+            eval_label: Vec::new(),
+        };
+        if parts.iter().any(|part| !part.label0.is_empty()) {
+            out.label0 = Vec::with_capacity(total);
+        }
+        if parts.iter().any(|part| !part.eval_label.is_empty()) {
+            out.eval_label = Vec::with_capacity(total);
+        }
+        for part in parts {
+            out.lambda.extend_from_slice(&part.lambda);
+            out.wire_bundle.extend_from_slice(&part.wire_bundle);
+            out.label0.extend_from_slice(&part.label0);
+            out.eval_label.extend_from_slice(&part.eval_label);
+        }
+        out
+    }
 }
 
 impl Drop for Ag2pcSecureWires {
@@ -1713,6 +1736,669 @@ struct Ag2pcLayerView<'a> {
     mac: &'a [Block],
     key: &'a [Block],
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ag2pcProgram {
+    num_inputs: usize,
+    num_wires: usize,
+    outputs: Vec<usize>,
+    gates: Vec<Ag2pcProgramGate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ag2pcProgramGate {
+    typ: C2pcGateType,
+    in0: usize,
+    in1: usize,
+    out: usize,
+}
+
+impl Ag2pcProgram {
+    pub fn from_circuit(circuit: &Circuit) -> Result<Self> {
+        let num_wire = checked_nonnegative("num_wire", circuit.num_wire)?;
+        let n1 = checked_nonnegative("n1", circuit.n1)?;
+        let n2 = checked_nonnegative("n2", circuit.n2)?;
+        let n3 = checked_nonnegative("n3", circuit.n3)?;
+        if num_wire == 0 || n1 + n2 > num_wire || n3 > num_wire {
+            return Err(CompatError::BadC2pcCircuit(
+                "inconsistent circuit header".to_owned(),
+            ));
+        }
+        let num_inputs = n1 + n2;
+        let mut remap = vec![None; num_wire];
+        for (wire, slot) in remap.iter_mut().take(num_inputs).enumerate() {
+            *slot = Some(wire);
+        }
+        for (i, gate) in circuit.gates.iter().enumerate() {
+            let out = checked_wire("out", gate.out, num_wire)?;
+            remap[out] = Some(num_inputs + i);
+        }
+
+        let mut gates = Vec::with_capacity(circuit.gates.len());
+        for (i, gate) in circuit.gates.iter().enumerate() {
+            let typ = match gate.typ {
+                GateType::And => C2pcGateType::And,
+                GateType::Xor => C2pcGateType::Xor,
+                GateType::Inv => C2pcGateType::Inv,
+            };
+            let in0_old = checked_wire("in0", gate.in0, num_wire)?;
+            let in1_old = if typ == C2pcGateType::Inv {
+                0
+            } else {
+                checked_wire("in1", gate.in1, num_wire)?
+            };
+            let in0 = remap[in0_old].ok_or_else(|| {
+                CompatError::BadC2pcCircuit("gate input is not defined".to_owned())
+            })?;
+            let in1 = if typ == C2pcGateType::Inv {
+                0
+            } else {
+                remap[in1_old].ok_or_else(|| {
+                    CompatError::BadC2pcCircuit("gate input is not defined".to_owned())
+                })?
+            };
+            gates.push(Ag2pcProgramGate {
+                typ,
+                in0,
+                in1,
+                out: num_inputs + i,
+            });
+        }
+
+        let mut outputs = Vec::with_capacity(n3);
+        for i in 0..n3 {
+            let old = num_wire - n3 + i;
+            outputs.push(remap[old].ok_or_else(|| {
+                CompatError::BadC2pcCircuit("output wire is not defined".to_owned())
+            })?);
+        }
+
+        Ok(Self {
+            num_inputs,
+            num_wires: num_inputs + gates.len(),
+            outputs,
+            gates,
+        })
+    }
+
+    pub fn num_inputs(&self) -> usize {
+        self.num_inputs
+    }
+
+    pub fn output_len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    pub fn num_ands(&self) -> usize {
+        self.gates
+            .iter()
+            .filter(|gate| gate.typ == C2pcGateType::And)
+            .count()
+    }
+}
+
+struct Ag2pcRunState {
+    party: Role,
+    delta: Block,
+    num_inputs: usize,
+    num_ands: usize,
+    num_wires: usize,
+    num_slots: usize,
+    phys: Vec<usize>,
+    last_use: Vec<isize>,
+    persist: Vec<bool>,
+    wire_slot: Vec<AShareBundle>,
+    mask_input: Vec<u8>,
+    label_slot: Vec<Block>,
+    eval_slot: Vec<Block>,
+    rep_a: Vec<AShareBundle>,
+    rep_b: Vec<AShareBundle>,
+    sigma: Vec<AShareBundle>,
+    m1_t: Vec<Block>,
+    lambda_and: Vec<u8>,
+    mitc: Mitccrh8,
+}
+
+impl Ag2pcRunState {
+    fn new(party: Role, delta: Block, inputs: &Ag2pcSecureWires) -> Self {
+        Self {
+            party,
+            delta,
+            num_inputs: inputs.len(),
+            num_ands: 0,
+            num_wires: 0,
+            num_slots: inputs.len(),
+            phys: Vec::new(),
+            last_use: Vec::new(),
+            persist: Vec::new(),
+            wire_slot: inputs.wire_bundle.clone(),
+            mask_input: inputs.lambda.clone(),
+            label_slot: inputs.label0.clone(),
+            eval_slot: inputs.eval_label.clone(),
+            rep_a: Vec::new(),
+            rep_b: Vec::new(),
+            sigma: Vec::new(),
+            m1_t: Vec::new(),
+            lambda_and: Vec::new(),
+            mitc: Mitccrh8::new(Block::zero()),
+        }
+    }
+
+    fn slot(&self, wire: usize) -> usize {
+        self.phys[wire]
+    }
+
+    fn wslot(&self, wire: usize) -> AShareBundle {
+        self.wire_slot[self.slot(wire)]
+    }
+
+    fn set_wslot(&mut self, wire: usize, value: AShareBundle) {
+        let slot = self.slot(wire);
+        self.wire_slot[slot] = value;
+    }
+
+    fn minp(&self, wire: usize) -> u8 {
+        self.mask_input[self.slot(wire)]
+    }
+
+    fn set_minp(&mut self, wire: usize, value: u8) {
+        let slot = self.slot(wire);
+        self.mask_input[slot] = value & 1;
+    }
+
+    fn lbl(&self, wire: usize) -> Block {
+        self.label_slot[self.slot(wire)]
+    }
+
+    fn set_lbl(&mut self, wire: usize, value: Block) {
+        let slot = self.slot(wire);
+        self.label_slot[slot] = value;
+    }
+
+    fn evl(&self, wire: usize) -> Block {
+        self.eval_slot[self.slot(wire)]
+    }
+
+    fn set_evl(&mut self, wire: usize, value: Block) {
+        let slot = self.slot(wire);
+        self.eval_slot[slot] = value;
+    }
+}
+
+pub struct Ag2pcSession {
+    protocol: Ag2pcProtocol,
+}
+
+impl Ag2pcSession {
+    pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
+        Ok(Self {
+            protocol: Ag2pcProtocol::setup(streams, party, ssp).await?,
+        })
+    }
+
+    pub fn party(&self) -> Role {
+        self.protocol.party()
+    }
+
+    pub fn process_input_calls(&self) -> usize {
+        self.protocol.process_input_calls()
+    }
+
+    pub async fn process_inputs(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        owners: &[Role],
+        bits_per_owner: &[Vec<u8>],
+    ) -> Result<Vec<Ag2pcSecureWires>> {
+        self.protocol
+            .process_inputs(streams, owners, bits_per_owner)
+            .await
+    }
+
+    pub fn public_wires(&self, bits: &[u8]) -> Ag2pcSecureWires {
+        self.protocol.public_wires(bits)
+    }
+
+    pub async fn run_program(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        program: &Ag2pcProgram,
+        inputs: &Ag2pcSecureWires,
+    ) -> Result<Ag2pcSecureWires> {
+        self.protocol.check_secure_wires(inputs)?;
+        if inputs.len() != program.num_inputs {
+            return Err(CompatError::BadC2pcInputLength {
+                expected: program.num_inputs,
+                actual: inputs.len(),
+            });
+        }
+        let mut state = Ag2pcRunState::new(self.party(), self.protocol.delta(), inputs);
+        ag2pc_liveness_pass(&mut state, program);
+        ag2pc_slot_mask_pass(&mut state, program, &mut self.protocol.fpre, streams).await?;
+        state.sigma = self
+            .protocol
+            .fpre
+            .compute_inplace(streams, &state.rep_a, &state.rep_b)
+            .await?;
+        state.m1_t = vec![Block::zero(); state.num_ands.max(1)];
+        state.lambda_and = vec![0; state.num_ands.max(1)];
+        let seed = EmpRo::new("AG2PC half-gate", Block::zero())
+            .absorb_block(streams.main.get_digest()?)
+            .absorb_block(streams.sibling.get_digest()?)
+            .squeeze_block();
+        state.mitc = Mitccrh8::new(seed);
+        match self.party() {
+            Role::Alice => ag2pc_garbler_path(&mut state, program, streams).await?,
+            Role::Bob => ag2pc_evaluator_path(&mut state, program, streams).await?,
+        }
+        self.protocol.flush_cot_check(streams).await?;
+        ag2pc_gather_outputs(&state, program)
+    }
+
+    pub async fn reveal_public(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        wires: &Ag2pcSecureWires,
+    ) -> Result<Vec<u8>> {
+        self.protocol
+            .decode(streams, wires, Ag2pcRevealRecipient::Public)
+            .await
+    }
+
+    pub async fn end(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        self.protocol.end(streams).await
+    }
+}
+
+fn ag2pc_liveness_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
+    state.num_wires = program.num_wires;
+    state.num_ands = 0;
+    state.last_use = vec![-1; program.num_wires];
+    state.persist = vec![false; program.num_wires];
+    for i in 0..state.num_inputs {
+        state.persist[i] = true;
+    }
+    for (gate_index, gate) in program.gates.iter().enumerate() {
+        state.persist[gate.out] = gate.typ == C2pcGateType::And;
+        state.last_use[gate.in0] = gate_index as isize;
+        if gate.typ != C2pcGateType::Inv {
+            state.last_use[gate.in1] = gate_index as isize;
+        }
+        if gate.typ == C2pcGateType::And {
+            state.num_ands += 1;
+        }
+    }
+    for &out in &program.outputs {
+        state.persist[out] = true;
+    }
+}
+
+async fn ag2pc_slot_mask_pass(
+    state: &mut Ag2pcRunState,
+    program: &Ag2pcProgram,
+    fpre: &mut Ag2pcTriplePool,
+    streams: &mut Ag2pcStreams,
+) -> Result<()> {
+    state.phys = vec![usize::MAX; program.num_wires];
+    for i in 0..state.num_inputs {
+        state.phys[i] = i;
+    }
+    state.rep_a.clear();
+    state.rep_b.clear();
+    state.rep_a.reserve(state.num_ands);
+    state.rep_b.reserve(state.num_ands);
+
+    let mut freelist = Vec::new();
+    let mut lg_buf = Vec::new();
+    let mut lg_off = 0usize;
+
+    for (gate_index, gate) in program.gates.iter().enumerate() {
+        match gate.typ {
+            C2pcGateType::And => {
+                state.rep_a.push(state.wslot(gate.in0));
+                state.rep_b.push(state.wslot(gate.in1));
+                if lg_off >= lg_buf.len() {
+                    lg_buf = fpre.draw(streams, 1 << 14).await?;
+                    lg_off = 0;
+                }
+                let slot = ag2pc_alloc_slot(state, gate.out, &mut freelist);
+                state.wire_slot[slot] = lg_buf[lg_off];
+                state.mask_input[slot] = 0;
+                lg_off += 1;
+            }
+            C2pcGateType::Xor => {
+                let lhs = state.wslot(gate.in0);
+                let rhs = state.wslot(gate.in1);
+                let slot = ag2pc_alloc_slot(state, gate.out, &mut freelist);
+                state.wire_slot[slot] = AShareBundle {
+                    mac: lhs.mac.xor(rhs.mac),
+                    key: lhs.key.xor(rhs.key),
+                };
+                state.mask_input[slot] = 0;
+            }
+            C2pcGateType::Inv => {
+                let value = state.wslot(gate.in0);
+                let slot = ag2pc_alloc_slot(state, gate.out, &mut freelist);
+                state.wire_slot[slot] = value;
+                state.mask_input[slot] = 0;
+            }
+        }
+        ag2pc_free_if_dead(state, gate.in0, gate_index, &mut freelist);
+        if gate.typ != C2pcGateType::Inv && gate.in1 != gate.in0 {
+            ag2pc_free_if_dead(state, gate.in1, gate_index, &mut freelist);
+        }
+    }
+
+    state.sigma = vec![AShareBundle::default(); state.num_ands.max(1)];
+    match state.party {
+        Role::Alice => state.label_slot.resize(state.num_slots, Block::zero()),
+        Role::Bob => state.eval_slot.resize(state.num_slots, Block::zero()),
+    }
+    Ok(())
+}
+
+fn ag2pc_alloc_slot(state: &mut Ag2pcRunState, wire: usize, freelist: &mut Vec<usize>) -> usize {
+    let slot = if !state.persist[wire] {
+        freelist.pop().unwrap_or_else(|| ag2pc_push_slot(state))
+    } else {
+        ag2pc_push_slot(state)
+    };
+    state.phys[wire] = slot;
+    slot
+}
+
+fn ag2pc_push_slot(state: &mut Ag2pcRunState) -> usize {
+    let slot = state.num_slots;
+    state.num_slots += 1;
+    state.wire_slot.push(AShareBundle::default());
+    state.mask_input.push(0);
+    slot
+}
+
+fn ag2pc_free_if_dead(
+    state: &Ag2pcRunState,
+    wire: usize,
+    gate_index: usize,
+    freelist: &mut Vec<usize>,
+) {
+    if !state.persist[wire] && state.last_use[wire] == gate_index as isize {
+        freelist.push(state.slot(wire));
+    }
+}
+
+async fn ag2pc_garbler_path(
+    state: &mut Ag2pcRunState,
+    program: &Ag2pcProgram,
+    streams: &mut Ag2pcStreams,
+) -> Result<()> {
+    let mut chunk_g = Vec::new();
+    let mut chunk_b = Vec::new();
+    let mut and_index = 0usize;
+    for gate in &program.gates {
+        match gate.typ {
+            C2pcGateType::Xor => {
+                let lhs = state.wslot(gate.in0);
+                let rhs = state.wslot(gate.in1);
+                state.set_wslot(
+                    gate.out,
+                    AShareBundle {
+                        mac: lhs.mac.xor(rhs.mac),
+                        key: lhs.key.xor(rhs.key),
+                    },
+                );
+                state.set_lbl(gate.out, state.lbl(gate.in0).xor(state.lbl(gate.in1)));
+            }
+            C2pcGateType::Inv => {
+                state.set_wslot(gate.out, state.wslot(gate.in0));
+                state.set_lbl(gate.out, state.lbl(gate.in0).xor(state.delta));
+            }
+            C2pcGateType::And => {
+                let (g0, g1, b) = ag2pc_garbler_and_gate(state, gate, and_index);
+                chunk_g.push(g0);
+                chunk_g.push(g1);
+                chunk_b.push(b);
+                and_index += 1;
+                if chunk_b.len() == AG2PC_GARBLE_CHUNK_ANDS {
+                    ag2pc_send_garble_chunk(&mut streams.main, &chunk_g, &chunk_b).await?;
+                    chunk_g.clear();
+                    chunk_b.clear();
+                }
+            }
+        }
+    }
+    if !chunk_b.is_empty() {
+        ag2pc_send_garble_chunk(&mut streams.main, &chunk_g, &chunk_b).await?;
+    }
+    if state.num_ands > 0 {
+        state.lambda_and = ag2pc_recv_bool_vector(&mut streams.main, state.num_ands).await?;
+        ag2pc_gamma_check_pass(state, program);
+        let digest = hash_once(&blocks_to_bytes(&state.m1_t));
+        streams.main.send_data(&digest).await?;
+        streams.main.flush().await?;
+    }
+    Ok(())
+}
+
+fn ag2pc_garbler_and_gate(
+    state: &mut Ag2pcRunState,
+    gate: &Ag2pcProgramGate,
+    and_index: usize,
+) -> (Block, Block, u8) {
+    let ml_a0 = state.lbl(gate.in0);
+    let ml_a1 = ml_a0.xor(state.delta);
+    let ml_b0 = state.lbl(gate.in1);
+    let ml_b1 = ml_b0.xor(state.delta);
+    let mut buf = [ml_a0, ml_a1, ml_b0, ml_b1];
+    state.mitc.hash_cir(&mut buf, 1, 4);
+
+    let wb_in0 = state.wslot(gate.in0);
+    let wb_in1 = state.wslot(gate.in1);
+    let wb_out = state.wslot(gate.out);
+    let sigma = state.sigma[and_index];
+    let h_a0 = buf[0];
+    let h_a1 = buf[1];
+    let h_b0 = buf[2];
+    let h_b1 = buf[3];
+
+    let la_dot = select_block(block_lsb(wb_in0.mac)).and(state.delta);
+    let lb_dot = select_block(block_lsb(wb_in1.mac)).and(state.delta);
+    let lab_dot = select_block(block_lsb(sigma.mac)).and(state.delta);
+    let lg_dot = select_block(block_lsb(wb_out.mac)).and(state.delta);
+
+    let g0 = h_a0.xor(h_a1).xor(wb_in1.key).xor(lb_dot);
+    let g1 = h_b0.xor(h_b1).xor(ml_a0).xor(wb_in0.key).xor(la_dot);
+    let ml_g0 = h_a0
+        .xor(h_b0)
+        .xor(sigma.key)
+        .xor(lab_dot)
+        .xor(wb_out.key)
+        .xor(lg_dot);
+    state.set_lbl(gate.out, ml_g0);
+    (g0, g1, block_lsb1(ml_g0))
+}
+
+async fn ag2pc_evaluator_path(
+    state: &mut Ag2pcRunState,
+    program: &Ag2pcProgram,
+    streams: &mut Ag2pcStreams,
+) -> Result<()> {
+    let mut chunk_g = Vec::new();
+    let mut chunk_b = Vec::new();
+    let mut chunk_pos = 0usize;
+    let mut and_index = 0usize;
+    for gate in &program.gates {
+        match gate.typ {
+            C2pcGateType::Xor => {
+                let lhs = state.wslot(gate.in0);
+                let rhs = state.wslot(gate.in1);
+                state.set_wslot(
+                    gate.out,
+                    AShareBundle {
+                        mac: lhs.mac.xor(rhs.mac),
+                        key: lhs.key.xor(rhs.key),
+                    },
+                );
+                state.set_evl(gate.out, state.evl(gate.in0).xor(state.evl(gate.in1)));
+                state.set_minp(gate.out, state.minp(gate.in0) ^ state.minp(gate.in1));
+            }
+            C2pcGateType::Inv => {
+                state.set_wslot(gate.out, state.wslot(gate.in0));
+                state.set_evl(gate.out, state.evl(gate.in0));
+                state.set_minp(gate.out, state.minp(gate.in0) ^ 1);
+            }
+            C2pcGateType::And => {
+                if chunk_pos == chunk_b.len() {
+                    let remaining = state.num_ands - and_index;
+                    let n = remaining.min(AG2PC_GARBLE_CHUNK_ANDS);
+                    let (g, b) = ag2pc_recv_garble_chunk(&mut streams.main, n).await?;
+                    chunk_g = g;
+                    chunk_b = b;
+                    chunk_pos = 0;
+                }
+                ag2pc_evaluator_and_gate(
+                    state,
+                    gate,
+                    and_index,
+                    chunk_g[2 * chunk_pos],
+                    chunk_g[2 * chunk_pos + 1],
+                    chunk_b[chunk_pos],
+                );
+                and_index += 1;
+                chunk_pos += 1;
+            }
+        }
+    }
+    if state.num_ands > 0 {
+        ag2pc_send_bool_vector(&mut streams.main, &state.lambda_and).await?;
+        let local = hash_once(&blocks_to_bytes(&state.m1_t));
+        let peer: [u8; HASH_DIGEST_BYTES] = streams
+            .main
+            .recv_data(HASH_DIGEST_BYTES)
+            .await?
+            .try_into()
+            .expect("digest length");
+        if local != peer {
+            return Err(CompatError::FeqMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn ag2pc_evaluator_and_gate(
+    state: &mut Ag2pcRunState,
+    gate: &Ag2pcProgramGate,
+    and_index: usize,
+    g0: Block,
+    g1: Block,
+    b: u8,
+) {
+    let la = state.minp(gate.in0);
+    let lb = state.minp(gate.in1);
+    let wb_in0 = state.wslot(gate.in0);
+    let wb_in1 = state.wslot(gate.in1);
+    let wb_out = state.wslot(gate.out);
+    let sigma = state.sigma[and_index];
+
+    let mut mr = sigma.mac.xor(wb_out.mac);
+    mr = mr.xor(select_block(la).and(wb_in1.mac));
+    mr = mr.xor(select_block(lb).and(wb_in0.mac));
+
+    let mut buf = [state.evl(gate.in0), state.evl(gate.in1)];
+    state.mitc.hash_cir(&mut buf, 1, 2);
+    let mut t = buf[0].xor(buf[1]);
+    t = t.xor(select_block(la).and(g0));
+    t = t.xor(select_block(lb).and(g1.xor(state.evl(gate.in0))));
+    t = t.xor(mr);
+    state.set_evl(gate.out, t);
+    let lg = b ^ block_lsb1(t);
+    state.set_minp(gate.out, lg);
+    state.lambda_and[and_index] = lg;
+
+    let v_in0 = block_lsb(wb_in0.mac);
+    let v_in1 = block_lsb(wb_in1.mac);
+    let v_out = block_lsb(wb_out.mac);
+    let v_sig = block_lsb(sigma.mac);
+    let t1 = (la & lb) ^ lg ^ (la & v_in1) ^ (lb & v_in0) ^ v_sig ^ v_out;
+    let mut m = select_block(t1).and(state.delta);
+    m = m.xor(select_block(la).and(wb_in1.key));
+    m = m.xor(select_block(lb).and(wb_in0.key));
+    m = m.xor(sigma.key).xor(wb_out.key);
+    state.m1_t[and_index] = m;
+}
+
+fn ag2pc_gamma_check_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
+    let mut and_index = 0usize;
+    for gate in &program.gates {
+        match gate.typ {
+            C2pcGateType::Xor => {
+                let lhs = state.wslot(gate.in0);
+                let rhs = state.wslot(gate.in1);
+                state.set_wslot(
+                    gate.out,
+                    AShareBundle {
+                        mac: lhs.mac.xor(rhs.mac),
+                        key: lhs.key.xor(rhs.key),
+                    },
+                );
+                state.set_minp(gate.out, state.minp(gate.in0) ^ state.minp(gate.in1));
+            }
+            C2pcGateType::Inv => {
+                state.set_wslot(gate.out, state.wslot(gate.in0));
+                state.set_minp(gate.out, state.minp(gate.in0) ^ 1);
+            }
+            C2pcGateType::And => {
+                state.set_minp(gate.out, state.lambda_and[and_index]);
+                let la = state.minp(gate.in0);
+                let lb = state.minp(gate.in1);
+                let mut m = state.sigma[and_index].mac.xor(state.wslot(gate.out).mac);
+                m = m.xor(select_block(la).and(state.wslot(gate.in1).mac));
+                m = m.xor(select_block(lb).and(state.wslot(gate.in0).mac));
+                state.m1_t[and_index] = m;
+                and_index += 1;
+            }
+        }
+    }
+}
+
+fn ag2pc_gather_outputs(state: &Ag2pcRunState, program: &Ag2pcProgram) -> Result<Ag2pcSecureWires> {
+    let mut out = Ag2pcSecureWires {
+        lambda: Vec::with_capacity(program.outputs.len()),
+        wire_bundle: Vec::with_capacity(program.outputs.len()),
+        label0: Vec::new(),
+        eval_label: Vec::new(),
+    };
+    match state.party {
+        Role::Alice => out.label0 = Vec::with_capacity(program.outputs.len()),
+        Role::Bob => out.eval_label = Vec::with_capacity(program.outputs.len()),
+    }
+    for &wire in &program.outputs {
+        out.lambda.push(state.minp(wire));
+        out.wire_bundle.push(state.wslot(wire));
+        match state.party {
+            Role::Alice => out.label0.push(state.lbl(wire)),
+            Role::Bob => out.eval_label.push(state.evl(wire)),
+        }
+    }
+    Ok(out)
+}
+
+async fn ag2pc_send_garble_chunk(stream: &mut EmpStream, g: &[Block], b: &[u8]) -> Result<()> {
+    stream.send_block(g).await?;
+    stream.send_data(b).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn ag2pc_recv_garble_chunk(
+    stream: &mut EmpStream,
+    n: usize,
+) -> Result<(Vec<Block>, Vec<u8>)> {
+    let g = stream.recv_block(2 * n).await?;
+    let b = stream.recv_data(n).await?;
+    Ok((g, b))
+}
+
+const AG2PC_GARBLE_CHUNK_ANDS: usize = 1 << 16;
 
 impl Ag2pcProtocol {
     pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
@@ -6118,6 +6804,36 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rust_ag2pc_program_roundtrip() {
+        let port = free_port();
+        let alice = tokio::spawn(async move {
+            let mut streams =
+                Ag2pcStreams::open(Role::Alice, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    .await
+                    .unwrap();
+            run_rust_ag2pc_program_script(&mut streams, Role::Alice)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(async move {
+            let mut streams = Ag2pcStreams::open(Role::Bob, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .await
+                .unwrap();
+            run_rust_ag2pc_program_script(&mut streams, Role::Bob)
+                .await
+                .unwrap()
+        });
+        let (alice_out, bob_out) = timeout(LIVE_INTEROP_TIMEOUT, async {
+            (alice.await.unwrap(), bob.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(alice_out, c2pc_expected_output());
+        assert_eq!(bob_out, c2pc_expected_output());
+    }
+
     #[cfg(feature = "cpp-probes")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_csw_base_ot_interop() {
@@ -7617,6 +8333,29 @@ mod tests {
         }
         pool.end(streams).await?;
         Ok(())
+    }
+
+    async fn run_rust_ag2pc_program_script(
+        streams: &mut Ag2pcStreams,
+        role: Role,
+    ) -> Result<Vec<u8>> {
+        let program = Ag2pcProgram::from_circuit(&c2pc_test_circuit())?;
+        assert_eq!(program.num_inputs(), 5);
+        assert_eq!(program.output_len(), 1);
+        assert_eq!(program.num_ands(), 2);
+
+        let input = c2pc_test_input();
+        let bob_bits = input[0..3].to_vec();
+        let alice_bits = input[3..5].to_vec();
+        let mut session = Ag2pcSession::setup(streams, role, 40).await?;
+        let inputs = session
+            .process_inputs(streams, &[Role::Bob, Role::Alice], &[bob_bits, alice_bits])
+            .await?;
+        let all_inputs = Ag2pcSecureWires::concat(&inputs);
+        let output = session.run_program(streams, &program, &all_inputs).await?;
+        let bits = session.reveal_public(streams, &output).await?;
+        session.end(streams).await?;
+        Ok(bits)
     }
 
     #[cfg(feature = "cpp-probes")]

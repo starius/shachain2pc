@@ -17,6 +17,7 @@
 #define SHACHAIN2PC_PROTOCOL_CIRCUIT_GEN_H
 
 #include <cstdint>
+#include <vector>
 
 #include "bristol.h"
 
@@ -52,10 +53,28 @@ std::vector<std::vector<int>> SplitChainBits(uint64_t I, int blocks_per_chunk);
 Circuit BuildChunkCircuit(const Circuit& sha256_compress,
                           const std::vector<int>& chain_bits, bool first);
 
-// BuildTileCircuit builds a full low-bit subtree tile. Input is one carried
-// 256-bit tile root; output is every leaf in ascending suffix order. For
-// tile_height=4 this outputs 16 * 256 bits and uses 15 SHA-256 blocks internally.
-Circuit BuildTileCircuit(const Circuit& sha256_compress, int tile_height);
+// BuildTileCircuit builds one subtree tile over the bit window
+// [bit_offset, bit_offset + tile_height - 1]. Input is one carried 256-bit root;
+// output is every arm in ascending suffix order, where arm `suffix` applies the
+// set bits of `suffix` at positions `bit_offset + j` (high to low). For
+// bit_offset == 0 the outputs are final leaves; for bit_offset > 0 they are
+// intermediate roots that feed the next lower tile level. A height-h tile outputs
+// 2^h * 256 bits and uses 2^h - 1 SHA-256 blocks internally.
+Circuit BuildTileCircuit(const Circuit& sha256_compress, int bit_offset,
+                         int tile_height);
+
+// One level of a recursive tile cover: a tile over [bit_offset, bit_offset+height).
+struct TileLevel {
+  int bit_offset;
+  int height;
+};
+
+// PlanTileLevels decomposes an aligned subtree of `depth` bits into tile levels,
+// top (most significant bits) to bottom (bits [0, height)). The bottom level
+// always sits at bit_offset 0 and has height `tile_height`; if `depth` is not a
+// multiple of `tile_height`, the top level is a smaller partial of height
+// `depth % tile_height`. Requires depth >= tile_height >= 1.
+std::vector<TileLevel> PlanTileLevels(int depth, int tile_height);
 
 }  // namespace shachain2pc::protocol
 

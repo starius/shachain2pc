@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Adaptive-cache mode over a range: wall, wall/secret, peak RSS (max of both
 # parties), the CACHE timing breakdown, and correctness vs ref_cli. Usage:
-#   measure_cache.sh <lo-hi> [portbase] [trunk_chunk_size]
+#   measure_cache.sh <lo-hi> [portbase] [trunk_chunk_size] [tile_fanout]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SPEC="${1:-ffffffffff00-ffffffffffff}"; PORT="${2:-28400}"; TCB="${3:-16}"
+TF="${4:-16}"
 AS=$(printf 'aa%.0s' {1..32}); BS=$(printf 'ab%.0s' {1..32})
 
 if [[ "$SPEC" != *-* ]]; then
@@ -44,12 +45,12 @@ AH=$(mktemp); BH=$(mktemp); AR=$(mktemp); BR=$(mktemp)
 cleanup(){ rm -f "$AO" "$AE" "$BO" "$BE" "$AH" "$BH" "$AR" "$BR"; }
 trap cleanup EXIT
 
-SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" \
+SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
   ./.build/party 1 "$PORT" "$SPEC" "$AS" >"$AO" 2>"$AE" & AP=$!
 poll_hwm "$AP" "$AH" & APOLL=$!
 sleep 0.4
 t0=$(date +%s.%N)
-SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" \
+SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
   ./.build/party 2 "$PORT" "$SPEC" "$BS" 127.0.0.1 >"$BO" 2>"$BE" & BP=$!
 poll_hwm "$BP" "$BH" & BPOLL=$!
 set +e

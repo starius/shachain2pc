@@ -67,10 +67,10 @@ static proto::Value RunChunked(const proto::Circuit& sha, const proto::Value& se
 
 static std::vector<proto::Value> RunTilePlain(const proto::Circuit& sha,
                                               const proto::Value& root,
-                                              int height) {
+                                              int bit_offset, int height) {
   std::vector<uint8_t> in = proto::ValueToBits(root);
   std::vector<uint8_t> out =
-      proto::EvalBristol(proto::BuildTileCircuit(sha, height), in);
+      proto::EvalBristol(proto::BuildTileCircuit(sha, bit_offset, height), in);
   const int leaves = 1 << height;
   std::vector<proto::Value> values;
   values.reserve(leaves);
@@ -148,6 +148,63 @@ static bool VerifyCachePlain(const proto::Circuit& sha, const proto::Value& seed
     if (proto::BitsToValue(svals.back()) != ref::GenerateFromSeed(seed, I))
       return false;
     if (I == lo) break;
+  }
+  return true;
+}
+
+// Plaintext mirror of the recursive tiled cache (RunDerivationCache's recursive
+// path) for an ALIGNED subtree: trunk once, then PlanTileLevels recursion via
+// offset tiles, level by level. The bottom level's tiles are indexed exactly as
+// the MPC driver indexes them (tile = s >> tile_height, slot = low tile_height
+// bits). Verifies every leaf H(I) equals the reference. Returns true iff the
+// range is a usable aligned subtree (depth >= tile_height) AND all leaves match.
+static bool VerifyRecursiveCachePlain(const proto::Circuit& sha,
+                                      const proto::Value& seed,
+                                      const proto::Value& share, uint64_t lo,
+                                      uint64_t hi, int tile_height) {
+  uint64_t diff = lo ^ hi;
+  int split = -1;
+  for (int b = 47; b >= 0; --b)
+    if ((diff >> b) & 1) { split = b; break; }
+  if (split < 0) return false;
+  uint64_t low_mask = (((uint64_t)1 << (split + 1)) - 1);
+  uint64_t high_mask = (((uint64_t)1 << 48) - 1) & ~low_mask;
+  if ((lo & low_mask) != 0 || (hi & low_mask) != low_mask) return false;  // aligned only
+  const int depth = split + 1;
+  if (depth < tile_height) return false;
+
+  proto::Value a = share;
+  proto::Value b{};
+  for (int i = 0; i < 32; ++i) b[i] = seed[i] ^ a[i];
+  std::vector<uint8_t> in = proto::ValueToBits(a);
+  std::vector<uint8_t> bb = proto::ValueToBits(b);
+  in.insert(in.end(), bb.begin(), bb.end());
+  std::vector<std::vector<int>> tg = proto::SplitChainBits(lo & high_mask, 48);
+  proto::Value T = proto::BitsToValue(
+      proto::EvalBristol(proto::BuildChunkCircuit(sha, tg[0], true), in));
+
+  std::vector<proto::TileLevel> levels = proto::PlanTileLevels(depth, tile_height);
+  std::vector<proto::Value> roots = {T};
+  for (std::size_t L = 0; L + 1 < levels.size(); ++L) {
+    std::vector<proto::Value> next;
+    for (const proto::Value& r : roots) {
+      std::vector<proto::Value> kids =
+          RunTilePlain(sha, r, levels[L].bit_offset, levels[L].height);
+      for (proto::Value& k : kids) next.push_back(k);
+    }
+    roots = std::move(next);
+  }
+  const proto::TileLevel& bl = levels.back();
+  const int th = bl.height;
+  std::vector<std::vector<proto::Value>> bottoms;
+  for (const proto::Value& r : roots)
+    bottoms.push_back(RunTilePlain(sha, r, bl.bit_offset, th));
+
+  const uint64_t leaves = (uint64_t)1 << th;
+  for (uint64_t I = lo; I <= hi; ++I) {
+    uint64_t s = I & low_mask;
+    proto::Value got = bottoms[s >> th][s & (leaves - 1)];
+    if (got != ref::GenerateFromSeed(seed, I)) return false;
   }
   return true;
 }
@@ -240,7 +297,7 @@ int main() {
   // independent reference derivations for every suffix, in ascending output order.
   {
     proto::Value root = ref::FillSeed(0x42);
-    std::vector<proto::Value> got = RunTilePlain(sha, root, 4);
+    std::vector<proto::Value> got = RunTilePlain(sha, root, 0, 4);
     bool ok = got.size() == 16;
     for (int s = 0; s < 16 && ok; ++s) {
       proto::Value want = ref::GenerateFromSeed(root, static_cast<uint64_t>(s));
@@ -250,6 +307,33 @@ int main() {
       }
     }
     std::printf("tile circuit (height=4, 16 leaves): %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // Offset tiles: arm `suffix` of a tile over [bit_offset, bit_offset+height)
+  // must equal generate_from_seed(root, suffix << bit_offset). This pins that the
+  // intermediate roots feeding lower tile levels are the right ancestor values.
+  {
+    proto::Value root = ref::FillSeed(0x42);
+    const int offsets[] = {0, 1, 4, 8, 20, 44};
+    const int heights[] = {1, 2, 3, 4};
+    bool ok = true;
+    for (int off : offsets) {
+      for (int h : heights) {
+        if (off + h > 48) continue;
+        std::vector<proto::Value> got = RunTilePlain(sha, root, off, h);
+        if (static_cast<int>(got.size()) != (1 << h)) { ok = false; continue; }
+        for (int s = 0; s < (1 << h) && ok; ++s) {
+          uint64_t I = static_cast<uint64_t>(s) << off;
+          if (got[s] != ref::GenerateFromSeed(root, I)) {
+            ok = false;
+            std::printf("  offset-tile mismatch off=%d h=%d s=%x\n", off, h, s);
+          }
+        }
+      }
+    }
+    std::printf("offset tile circuits (bit_offset x height): %s\n",
+                ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 
@@ -300,6 +384,42 @@ int main() {
       }
     }
     std::printf("adaptive-cache (ranges x splits): %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // Recursive tiled cache: aligned subtrees decomposed by PlanTileLevels into a
+  // tree of offset tiles must reproduce the reference for every leaf, for each
+  // tile height (validates level planning + bottom-tile indexing the MPC uses).
+  {
+    struct R { uint64_t lo, hi; };
+    const R ranges[] = {
+        {0xffffffffff00ULL, 0xffffffffffffULL},  // 256,  depth 8
+        {0xfffffffffc00ULL, 0xffffffffffffULL},  // 1024, depth 10
+        {0xffffffffe000ULL, 0xffffffffffffULL},  // 8192, depth 13
+        {0xfffffffffff0ULL, 0xffffffffffffULL},  // 16,   depth 4
+    };
+    const int heights[] = {1, 2, 3, 4};
+    bool ok = true;
+    for (const R& r : ranges) {
+      uint64_t diff = r.lo ^ r.hi;
+      int split = -1;
+      for (int bpos = 47; bpos >= 0; --bpos)
+        if ((diff >> bpos) & 1) { split = bpos; break; }
+      for (int th : heights) {
+        if (split < 0 || split + 1 < th) continue;
+        for (const proto::Value* sh : {&split0, &split1}) {
+          if (!VerifyRecursiveCachePlain(sha, ref::FillSeed(0xab), *sh, r.lo, r.hi,
+                                         th)) {
+            ok = false;
+            std::printf("  recursive-cache mismatch range[%llx,%llx] th=%d\n",
+                        static_cast<unsigned long long>(r.lo),
+                        static_cast<unsigned long long>(r.hi), th);
+          }
+        }
+      }
+    }
+    std::printf("recursive tiled cache (ranges x heights x splits): %s\n",
+                ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 

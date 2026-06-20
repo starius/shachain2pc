@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "emp-ag2pc/emp-ag2pc.h"
@@ -50,6 +51,7 @@ constexpr int kAlice = emp::ALICE;  // 1, garbler, listens
 constexpr int kBob = emp::BOB;      // 2, evaluator, connects
 constexpr int kThreads = 4;         // session ThreadPool size (local compute only)
 constexpr int kDefaultCacheTrunkChunkBlocks = 16;
+constexpr int kDefaultCacheTileFanout = 16;  // recursive branch tile arity (2^4)
 constexpr int kCacheTileHeight = 4;
 constexpr int kCacheTileLeaves = 1 << kCacheTileHeight;
 constexpr int kCacheTileBits = protocol::kValueBits * kCacheTileLeaves;
@@ -763,13 +765,13 @@ struct CacheTiming {
 };
 
 inline std::array<uint8_t, 32> CacheDigest(uint64_t lo, uint64_t hi,
-                                           int trunk_chunk_blocks,
+                                           int trunk_chunk_blocks, int tile_fanout,
                                            const protocol::Circuit& sha) {
   std::array<uint8_t, 32> sha_dg = CircuitDigest(sha, ToEmpGateArray(sha));
   std::array<uint8_t, 32> dg{};
   unsigned int len = 0;
   int tcb = trunk_chunk_blocks;
-  int tile_height = kCacheTileHeight;
+  int tf = tile_fanout;  // binds the tile arity (and thus the whole cover shape)
   EVP_MD_CTX* ctx = EVP_MD_CTX_new();
   if (ctx == nullptr) throw std::runtime_error("CacheDigest: EVP_MD_CTX_new failed");
   auto cleanup = [&]() { EVP_MD_CTX_free(ctx); };
@@ -777,7 +779,7 @@ inline std::array<uint8_t, 32> CacheDigest(uint64_t lo, uint64_t hi,
       EVP_DigestUpdate(ctx, &lo, sizeof(lo)) != 1 ||
       EVP_DigestUpdate(ctx, &hi, sizeof(hi)) != 1 ||
       EVP_DigestUpdate(ctx, &tcb, sizeof(tcb)) != 1 ||
-      EVP_DigestUpdate(ctx, &tile_height, sizeof(tile_height)) != 1 ||
+      EVP_DigestUpdate(ctx, &tf, sizeof(tf)) != 1 ||
       EVP_DigestUpdate(ctx, sha_dg.data(), sha_dg.size()) != 1 ||
       EVP_DigestFinal_ex(ctx, dg.data(), &len) != 1 || len != dg.size()) {
     cleanup();
@@ -830,12 +832,169 @@ inline std::optional<std::array<bool, protocol::kValueBits>> RevealTileSlotRaw(
   }
 }
 
+// ---- recursive tiling helpers (height-generic) ----------------------------
+// The cache session uses one fixed wire context, so the tile value types are
+// concrete (no per-call Ctx templating). A height-H tile carries 2^H * 256 bits.
+using CacheCtx = emp::AG2PCSession::DirectCtx;
+using CacheBV = emp::BitVec_T<CacheCtx, protocol::kValueBits>;
+template <int H>
+using CacheTileBV = emp::BitVec_T<CacheCtx, (1 << H) * protocol::kValueBits>;
+
+template <int H>
+inline void CheckTileShape(const protocol::Circuit& c) {
+  if (c.n1 != protocol::kValueBits || c.n2 != 0 ||
+      c.n3 != (1 << H) * protocol::kValueBits) {
+    throw std::runtime_error("shachain2pc: tile circuit has wrong shape");
+  }
+}
+
+// Split a height-H tile output into its 2^H authenticated 256-bit arms (no
+// reveal). Slices are compile-time, unrolled over the arm indices.
+template <int H, std::size_t... Is>
+inline std::array<CacheBV, sizeof...(Is)> SplitTileImpl(
+    const CacheTileBV<H>& t, std::index_sequence<Is...>) {
+  return {t.template slice<Is * protocol::kValueBits,
+                           (Is + 1) * protocol::kValueBits>()...};
+}
+template <int H>
+inline std::array<CacheBV, (1 << H)> SplitTile(const CacheTileBV<H>& t) {
+  return SplitTileImpl<H>(t, std::make_index_sequence<(1 << H)>{});
+}
+
+// Reveal one arm of a height-H tile (used for bottom-level leaves).
+template <int H>
+inline std::optional<std::array<bool, protocol::kValueBits>> RevealTileSlot(
+    emp::AG2PCSession& sess, const CacheTileBV<H>& t, int slot) {
+  std::array<CacheBV, (1 << H)> arms = SplitTile<H>(t);
+  return sess.reveal(arms[slot], emp::PUBLIC);
+}
+
+// Run one inner (non-leaf) tile level of height H over the window starting at
+// `bit_offset`: for every input root, run a tile and append its 2^H child roots
+// to `out`. Children stay authenticated wires that feed the next lower level.
+template <int H>
+inline void RunInnerTileLevel(emp::AG2PCSession& sess,
+                              const protocol::Circuit& sha, int bit_offset,
+                              const std::vector<CacheBV>& roots,
+                              std::vector<CacheBV>& out, CacheTiming& timing,
+                              long& step, long tamper_step) {
+  using Clock = std::chrono::steady_clock;
+  protocol::Circuit tc = protocol::BuildTileCircuit(sha, bit_offset, H);
+  CheckTileShape<H>(tc);
+  emp::circuit::BooleanProgram prog = ToBooleanProgram(tc);
+  ReleaseVector(tc.gates);
+  out.reserve(out.size() + roots.size() * (std::size_t(1) << H));
+  for (const CacheBV& root : roots) {
+    const emp::circuit::BooleanProgram* p = &prog;
+    emp::circuit::BooleanProgram tampered;
+    if (step == tamper_step) {  // TEST ONLY: garble this tile
+      protocol::Circuit tt = protocol::BuildTileCircuit(sha, bit_offset, H);
+      TamperFirstFlip(tt);
+      CheckTileShape<H>(tt);
+      tampered = ToBooleanProgram(tt);
+      ReleaseVector(tt.gates);
+      p = &tampered;
+    }
+    auto tb = Clock::now();
+    CacheTileBV<H> t = sess.run_artifact<CacheTileBV<H>>(*p, root);
+    timing.branch_total_s +=
+        std::chrono::duration<double>(Clock::now() - tb).count();
+    timing.new_hashes += (1 << H) - 1;
+    ++timing.branch_instances;
+    ++timing.tile_count;
+    ++step;
+    std::array<CacheBV, (1 << H)> kids = SplitTile<H>(t);
+    for (CacheBV& k : kids) out.push_back(k);
+  }
+}
+
+inline void RunInnerTileLevelDyn(emp::AG2PCSession& sess,
+                                 const protocol::Circuit& sha, int bit_offset,
+                                 int height, const std::vector<CacheBV>& roots,
+                                 std::vector<CacheBV>& out, CacheTiming& timing,
+                                 long& step, long tamper_step) {
+  switch (height) {
+    case 1: RunInnerTileLevel<1>(sess, sha, bit_offset, roots, out, timing, step, tamper_step); break;
+    case 2: RunInnerTileLevel<2>(sess, sha, bit_offset, roots, out, timing, step, tamper_step); break;
+    case 3: RunInnerTileLevel<3>(sess, sha, bit_offset, roots, out, timing, step, tamper_step); break;
+    case 4: RunInnerTileLevel<4>(sess, sha, bit_offset, roots, out, timing, step, tamper_step); break;
+    default: throw std::runtime_error("shachain2pc: unsupported tile height (1..4)");
+  }
+}
+
+// Run the bottom (leaf) tile level of height H at bit_offset 0: precompute every
+// leaf tile (held authenticated), then reveal each requested index one-by-one in
+// decreasing order. Bottom tile j holds subtree indices [j<<H, j<<H | mask], so
+// index I -> tile (s>>H), slot (s & (2^H-1)) with s = I & low_mask.
+template <int H>
+inline void RunBottomTileLevel(emp::AG2PCSession& sess,
+                               const protocol::Circuit& sha,
+                               const std::vector<CacheBV>& roots, uint64_t lo,
+                               uint64_t hi, uint64_t low_mask,
+                               std::vector<protocol::Value>& results,
+                               CacheTiming& timing, long& step,
+                               long tamper_step) {
+  using Clock = std::chrono::steady_clock;
+  protocol::Circuit tc = protocol::BuildTileCircuit(sha, 0, H);
+  CheckTileShape<H>(tc);
+  emp::circuit::BooleanProgram prog = ToBooleanProgram(tc);
+  ReleaseVector(tc.gates);
+  std::vector<CacheTileBV<H>> bottoms;
+  bottoms.reserve(roots.size());
+  for (const CacheBV& root : roots) {
+    const emp::circuit::BooleanProgram* p = &prog;
+    emp::circuit::BooleanProgram tampered;
+    if (step == tamper_step) {  // TEST ONLY: garble this leaf tile
+      protocol::Circuit tt = protocol::BuildTileCircuit(sha, 0, H);
+      TamperFirstFlip(tt);
+      CheckTileShape<H>(tt);
+      tampered = ToBooleanProgram(tt);
+      ReleaseVector(tt.gates);
+      p = &tampered;
+    }
+    auto tb = Clock::now();
+    bottoms.push_back(sess.run_artifact<CacheTileBV<H>>(*p, root));
+    timing.branch_total_s +=
+        std::chrono::duration<double>(Clock::now() - tb).count();
+    timing.new_hashes += (1 << H) - 1;
+    ++timing.branch_instances;
+    ++timing.tile_count;
+    ++step;
+  }
+  const uint64_t leaves = (uint64_t(1) << H);
+  for (uint64_t I = hi;; --I) {
+    const uint64_t s = I & low_mask;
+    auto trv = Clock::now();
+    results[(std::size_t)(I - lo)] = DecodeRevealedValue(RevealTileSlot<H>(
+        sess, bottoms[(std::size_t)(s >> H)], (int)(s & (leaves - 1))));
+    timing.reveal_total_s +=
+        std::chrono::duration<double>(Clock::now() - trv).count();
+    if (I == lo) break;
+  }
+}
+
+inline void RunBottomTileLevelDyn(emp::AG2PCSession& sess,
+                                  const protocol::Circuit& sha, int height,
+                                  const std::vector<CacheBV>& roots, uint64_t lo,
+                                  uint64_t hi, uint64_t low_mask,
+                                  std::vector<protocol::Value>& results,
+                                  CacheTiming& timing, long& step,
+                                  long tamper_step) {
+  switch (height) {
+    case 1: RunBottomTileLevel<1>(sess, sha, roots, lo, hi, low_mask, results, timing, step, tamper_step); break;
+    case 2: RunBottomTileLevel<2>(sess, sha, roots, lo, hi, low_mask, results, timing, step, tamper_step); break;
+    case 3: RunBottomTileLevel<3>(sess, sha, roots, lo, hi, low_mask, results, timing, step, tamper_step); break;
+    case 4: RunBottomTileLevel<4>(sess, sha, roots, lo, hi, low_mask, results, timing, step, tamper_step); break;
+    default: throw std::runtime_error("shachain2pc: unsupported tile height (1..4)");
+  }
+}
+
 // tamper_step >= 0 (TEST ONLY): garble a steered flip on that branch push to
 // confirm authenticated garbling aborts even with the reused cached trunk/nodes.
 inline std::vector<protocol::Value> RunDerivationCache(
     emp::NetIO* io, ThreadPool* pool, int party, uint64_t lo, uint64_t hi,
-    const protocol::Value& my_share, int trunk_chunk_blocks, CacheTiming& timing,
-    long tamper_step = -1) {
+    const protocol::Value& my_share, int trunk_chunk_blocks, int tile_fanout,
+    CacheTiming& timing, long tamper_step = -1) {
   using Ctx = emp::AG2PCSession::DirectCtx;
   using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;
   using TileBV = emp::BitVec_T<Ctx, kCacheTileBits>;
@@ -848,6 +1007,16 @@ inline std::vector<protocol::Value> RunDerivationCache(
   if (hi > protocol::kMaxIndex)
     throw std::runtime_error("shachain2pc: index exceeds 48 bits");
 
+  // Tile fanout knob: power of two. fanout = 1 -> no recursive tiling (the
+  // fallback stack-cache runs pure one-SHA edges); fanout >= 2 -> tile_height =
+  // log2(fanout), used for the recursive aligned cover and the fallback tiles.
+  if (tile_fanout < 1 || (tile_fanout & (tile_fanout - 1)) != 0)
+    throw std::runtime_error("shachain2pc: tile_fanout must be a power of two");
+  int tile_height = 0;
+  while ((1 << tile_height) < tile_fanout) ++tile_height;
+  if (tile_height > 4)
+    throw std::runtime_error("shachain2pc: tile_fanout > 16 not supported");
+
   const uint64_t diff = lo ^ hi;
   int split = -1;
   for (int b = protocol::kIndexBits - 1; b >= 0; --b)
@@ -858,7 +1027,8 @@ inline std::vector<protocol::Value> RunDerivationCache(
   timing.num_indices = (int)(hi - lo + 1);
 
   protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
-  ExchangeCircuitDigest(io, party, CacheDigest(lo, hi, trunk_chunk_blocks, sha));
+  ExchangeCircuitDigest(io, party,
+                        CacheDigest(lo, hi, trunk_chunk_blocks, tile_fanout, sha));
 
   // ---- setup ----
   auto t0 = Clock::now();
@@ -901,12 +1071,45 @@ inline std::vector<protocol::Value> RunDerivationCache(
     timing.trunk_s = secs(ttrunk, Clock::now());
     sess.checkpoint(T);  // free inputs + trunk internals; keep only the tip
 
+    // ---- recursive tiled cover (aligned full subtree only) ----
+    // When [lo,hi] is exactly a 2^(split+1) block and fanout >= 2, derive every
+    // leaf through a tree of multi-output tiles: an upper tile fans the high
+    // window into intermediate roots, lower tiles expand them, the bottom tiles
+    // hold the leaves. Far fewer MPC instances (round groups) than one-SHA
+    // prefixes; intermediate roots stay authenticated wires, never revealed.
+    const int depth = split + 1;
+    const bool aligned =
+        ((lo & low_mask) == 0) && ((hi & low_mask) == low_mask);
+    if (tile_height >= 1 && split >= 0 && aligned && depth >= tile_height) {
+      std::vector<protocol::Value> results((std::size_t)(hi - lo + 1));
+      timing.tile_leaves = (1 << tile_height);
+      long step = 0;
+      std::vector<CacheBV> roots;
+      roots.push_back(T);
+      std::vector<protocol::TileLevel> levels =
+          protocol::PlanTileLevels(depth, tile_height);
+      for (std::size_t L = 0; L + 1 < levels.size(); ++L) {
+        std::vector<CacheBV> next;
+        RunInnerTileLevelDyn(sess, sha, levels[L].bit_offset, levels[L].height,
+                             roots, next, timing, step, tamper_step);
+        roots = std::move(next);
+      }
+      const protocol::TileLevel& bottom = levels.back();
+      RunBottomTileLevelDyn(sess, sha, bottom.height, roots, lo, hi, low_mask,
+                            results, timing, step, tamper_step);
+      io->flush();
+      timing.rounds = io->rounds;
+      timing.bytes_sent = io->send_counter;
+      timing.bytes_recv = io->recv_counter;
+      return results;
+    }
+
 	    // ---- subtree stack-cache, DECREASING index order ----
 	    std::vector<int> stack_bits;     // set-bit prefix currently on the stack
 	    std::vector<BV> stack_vals;      // stack_vals[0]=T; [k]=value after bits[0..k-1]
 	    stack_vals.push_back(T);
 	    protocol::Circuit tile_circuit =
-	        protocol::BuildTileCircuit(sha, kCacheTileHeight);
+	        protocol::BuildTileCircuit(sha, 0, kCacheTileHeight);
 	    CheckTileCircuit(tile_circuit);
 	    emp::circuit::BooleanProgram tile_prog = ToBooleanProgram(tile_circuit);
 	    ReleaseVector(tile_circuit.gates);
@@ -925,7 +1128,7 @@ inline std::vector<protocol::Value> RunDerivationCache(
 	    std::unordered_map<uint64_t, std::size_t> single_pos;
 	    std::vector<protocol::Value> results((std::size_t)(hi - lo + 1));
 	    const uint64_t tile_mask = static_cast<uint64_t>(kCacheTileLeaves - 1);
-	    const bool can_tile = split >= kCacheTileHeight - 1;
+	    const bool can_tile = tile_fanout >= 2 && split >= kCacheTileHeight - 1;
 	    long step = 0;
 
 	    auto align_stack = [&](const std::vector<int>& target) {
@@ -964,7 +1167,7 @@ inline std::vector<protocol::Value> RunDerivationCache(
 	        emp::circuit::BooleanProgram tampered_prog;
 	        if (step == tamper_step) {
 	          protocol::Circuit tampered =
-	              protocol::BuildTileCircuit(sha, kCacheTileHeight);
+	              protocol::BuildTileCircuit(sha, 0, kCacheTileHeight);
 	          TamperFirstFlip(tampered);  // TEST ONLY
 	          CheckTileCircuit(tampered);
 	          tampered_prog = ToBooleanProgram(tampered);

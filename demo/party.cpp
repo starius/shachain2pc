@@ -147,8 +147,10 @@ int main(int argc, char** argv) {
   try {
     // Adaptive-cache mode (range only): SHACHAIN2PC_CACHE=1 computes the shared
     // trunk once (chunked by SHACHAIN2PC_CHUNK_BLOCKS, default 16), then derives the
-    // range in decreasing index order through a stack-cache of the low-bit subtree,
-    // reusing the shared prefix and revealing each. This is the in-session cache.
+    // low-bit subtree. For an aligned full subtree the subtree is covered by a
+    // recursive tree of multi-output tiles (SHACHAIN2PC_TILE_FANOUT, default 16);
+    // otherwise a decreasing-order stack-cache reuses the shared prefix. Outputs
+    // are revealed one-by-one after precomputation. This is the in-session cache.
     if (is_range) {
       const char* cache_env = std::getenv("SHACHAIN2PC_CACHE");
       if (cache_env != nullptr && std::atoi(cache_env) != 0) {
@@ -156,14 +158,18 @@ int main(int argc, char** argv) {
         if (const char* ce = std::getenv("SHACHAIN2PC_CHUNK_BLOCKS")) {
           tcb = std::atoi(ce);
         }
+        int tile_fanout = run::kDefaultCacheTileFanout;
+        if (const char* fe = std::getenv("SHACHAIN2PC_TILE_FANOUT")) {
+          tile_fanout = std::atoi(fe);
+        }
         long tamper_step = -1;
         if (const char* te = std::getenv("SHACHAIN2PC_TAMPER")) {
           tamper_step = std::atol(te);  // TEST ONLY
         }
         run::CacheTiming ct;
         std::vector<protocol::Value> outs = run::RunDerivationCache(
-            io, &pool, party, indices.front(), indices.back(), share, tcb, ct,
-            tamper_step);
+            io, &pool, party, indices.front(), indices.back(), share, tcb,
+            tile_fanout, ct, tamper_step);
         delete io;
         for (std::size_t k = 0; k < indices.size(); ++k) {
           std::printf("RESULT %012llx %s\n",

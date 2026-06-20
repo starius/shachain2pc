@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Safety test for adaptive-cache mode: a malicious party that garbles a steered
-# branch step from a reused authenticated cache node must abort with no output.
-# Usage: cache_tamper_test.sh <lo-hi> [tamper_step] [portbase] [trunk_chunk_size]
+# tile step from a reused authenticated cache node must abort with no output. The
+# default range is an aligned 256-leaf subtree, which the cache covers with a
+# recursive tile tree (1 upper tile + 16 bottom tiles); we tamper both an upper
+# (intermediate-root) tile and a bottom (leaf) tile and require both to abort.
+# Usage: cache_tamper_test.sh <lo-hi> [upper_step] [bottom_step] [portbase] [trunk_chunk] [tile_fanout]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SPEC="${1:-fffffffffff0-ffffffffffff}"
-STEP="${2:-0}"
-PORT="${3:-28680}"
-TCB="${4:-16}"
+SPEC="${1:-ffffffffff00-ffffffffffff}"
+UPPER_STEP="${2:-0}"    # branch instance 0 = the top tile (intermediate roots)
+BOTTOM_STEP="${3:-1}"   # branch instance 1 = the first bottom (leaf) tile
+PORT="${4:-28680}"
+TCB="${5:-16}"
+TF="${6:-16}"
 AS=$(printf 'aa%.0s' {1..32})
 BS=$(printf 'ab%.0s' {1..32})
 
@@ -30,23 +35,26 @@ if [ ! -x ./.build/party ] || [ ! -x ./.build/ref_cli ]; then
   make .build/party .build/ref_cli >/dev/null
 fi
 
+# run_pair <mode> <port> <tamper_step>  (mode: control|tamper; step ignored if control)
 run_pair() {
-  local mode=$1 port=$2
+  local mode=$1 port=$2 step=$3
   local AO AE BO BE AR BR
   AO=$(mktemp); AE=$(mktemp); BO=$(mktemp); BE=$(mktemp)
   AR=$(mktemp); BR=$(mktemp)
 
   local -a alice_extra=()
   if [ "$mode" = tamper ]; then
-    alice_extra=(SHACHAIN2PC_TAMPER="$STEP")
+    alice_extra=(SHACHAIN2PC_TAMPER="$step")
   fi
 
-  env SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" "${alice_extra[@]}" \
+  env SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" \
+    SHACHAIN2PC_TILE_FANOUT="$TF" "${alice_extra[@]}" \
     ./.build/party 1 "$port" "$SPEC" "$AS" >"$AO" 2>"$AE" &
   local ap=$!
   sleep 0.3
   set +e
   env SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" \
+    SHACHAIN2PC_TILE_FANOUT="$TF" \
     ./.build/party 2 "$port" "$SPEC" "$BS" 127.0.0.1 >"$BO" 2>"$BE"
   local brc=$?
   wait "$ap"; local arc=$?
@@ -57,7 +65,9 @@ run_pair() {
   local an bn
   an=$(wc -l <"$AR")
   bn=$(wc -l <"$BR")
-  echo "$mode: ALICE rc=$arc results=$an; BOB rc=$brc results=$bn"
+  local label="$mode"
+  [ "$mode" = tamper ] && label="tamper@$step"
+  echo "$label: ALICE rc=$arc results=$an; BOB rc=$brc results=$bn"
 
   if [ "$mode" = control ]; then
     local bad=0
@@ -86,7 +96,8 @@ run_pair() {
   [ "$ok" -eq 1 ]
 }
 
-echo "cache tamper test: range=$SPEC step=$STEP chunk=$TCB"
-run_pair control "$PORT"
-run_pair tamper "$((PORT + 1))"
-echo "CACHE TAMPER: aborted with no output -> SAFE"
+echo "cache tamper test: range=$SPEC chunk=$TCB fanout=$TF (upper step=$UPPER_STEP, bottom step=$BOTTOM_STEP)"
+run_pair control "$PORT" -1
+run_pair tamper "$((PORT + 1))" "$UPPER_STEP"
+run_pair tamper "$((PORT + 2))" "$BOTTOM_STEP"
+echo "CACHE TAMPER: upper + bottom tile tamper both aborted with no output -> SAFE"

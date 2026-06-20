@@ -207,9 +207,12 @@ Circuit BuildChunkCircuit(const Circuit& sha, const std::vector<int>& chain_bits
   return b.Finish(kValueBits, first ? kValueBits : 0, kValueBits);
 }
 
-Circuit BuildTileCircuit(const Circuit& sha, int tile_height) {
+Circuit BuildTileCircuit(const Circuit& sha, int bit_offset, int tile_height) {
   if (tile_height < 1 || tile_height > kIndexBits) {
     throw std::runtime_error("BuildTileCircuit: invalid tile height");
+  }
+  if (bit_offset < 0 || bit_offset + tile_height > kIndexBits) {
+    throw std::runtime_error("BuildTileCircuit: bit window out of range");
   }
   if (sha.n1 + sha.n2 != 512 || sha.n3 != kValueBits) {
     throw std::runtime_error("BuildTileCircuit: gadget is not 512->256");
@@ -228,7 +231,9 @@ Circuit BuildTileCircuit(const Circuit& sha, int tile_height) {
   for (int depth = 1; depth <= tile_height; ++depth) {
     for (int suffix = 1; suffix < leaves; ++suffix) {
       if (PopCountInt(suffix) != depth) continue;
-      const int bit = LowestSetBit(suffix);
+      // suffix bit j maps to chain bit (bit_offset + j); process high to low,
+      // so the lowest set bit (added last) becomes the final hash from parent.
+      const int bit = bit_offset + LowestSetBit(suffix);
       const int parent = suffix & (suffix - 1);
       std::vector<int> p = node[parent];
       p[FlipBitIndex(bit)] = b.InvW(p[FlipBitIndex(bit)]);
@@ -247,6 +252,27 @@ Circuit BuildTileCircuit(const Circuit& sha, int tile_height) {
   }
 
   return b.Finish(kValueBits, 0, kValueBits * leaves);
+}
+
+std::vector<TileLevel> PlanTileLevels(int depth, int tile_height) {
+  if (tile_height < 1) {
+    throw std::runtime_error("PlanTileLevels: tile_height must be >= 1");
+  }
+  if (depth < tile_height) {
+    throw std::runtime_error("PlanTileLevels: depth must be >= tile_height");
+  }
+  std::vector<TileLevel> levels;
+  int remaining = depth;
+  const int r = depth % tile_height;
+  if (r != 0) {
+    levels.push_back({depth - r, r});  // partial top level (most significant bits)
+    remaining = depth - r;
+  }
+  // Full-height levels, top to bottom; the last sits at bit_offset 0 (leaves).
+  for (int off = remaining - tile_height; off >= 0; off -= tile_height) {
+    levels.push_back({off, tile_height});
+  }
+  return levels;
 }
 
 }  // namespace shachain2pc::protocol

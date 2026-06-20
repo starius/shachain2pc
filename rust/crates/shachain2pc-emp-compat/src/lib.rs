@@ -34,6 +34,7 @@ pub enum CompatError {
         data0: usize,
         data1: usize,
     },
+    BadCswLength(usize),
     BadFpreCheckIndex(usize),
     BadFpreGeneratedLength {
         expected: usize,
@@ -62,6 +63,8 @@ pub enum CompatError {
     CoinTossMismatch,
     FeqMismatch,
     HashToCurve,
+    CswProofMismatch,
+    CswReceiverMismatch,
     LengthOverflow(&'static str),
     MissingDelta(&'static str),
     BadIknpSetupLength {
@@ -88,6 +91,9 @@ impl fmt::Display for CompatError {
             }
             Self::BadOtLength { data0, data1 } => {
                 write!(f, "OTCO data length mismatch: data0={data0}, data1={data1}")
+            }
+            Self::BadCswLength(len) => {
+                write!(f, "CSW base OT length must be at least 80, got {len}")
             }
             Self::BadFpreCheckIndex(index) => {
                 write!(f, "Fpre check index must be 0 or 1, got {index}")
@@ -126,6 +132,10 @@ impl fmt::Display for CompatError {
             Self::CoinTossMismatch => write!(f, "Fpre coin-toss commitment mismatch"),
             Self::FeqMismatch => write!(f, "Fpre equality check mismatch"),
             Self::HashToCurve => write!(f, "P-256 hash-to-curve failed"),
+            Self::CswProofMismatch => write!(f, "CSW base OT proof verification failed"),
+            Self::CswReceiverMismatch => {
+                write!(f, "CSW base OT receiver response verification failed")
+            }
             Self::LengthOverflow(name) => write!(f, "{name} length overflow"),
             Self::MissingDelta(name) => write!(f, "{name} setup did not produce Delta"),
             Self::BadIknpSetupLength { name, len } => {
@@ -798,6 +808,167 @@ async fn recv_point(stream: &mut EmpStream) -> Result<Vec<u8>> {
         return Err(CompatError::BadPointWireLength(len));
     }
     Ok(stream.recv_data(POINT_BYTES).await?)
+}
+
+pub async fn csw_send(stream: &mut EmpStream, data0: &[Block], data1: &[Block]) -> Result<()> {
+    if data0.len() != data1.len() {
+        return Err(CompatError::BadOtLength {
+            data0: data0.len(),
+            data1: data1.len(),
+        });
+    }
+    if data0.len() < 80 {
+        return Err(CompatError::BadCswLength(data0.len()));
+    }
+
+    let group = P256::new()?;
+    let sid = Block::zero();
+
+    let seed = stream.recv_block(1).await?[0];
+    let mut b_points = Vec::with_capacity(data0.len());
+    for _ in 0..data0.len() {
+        b_points.push(recv_point(stream).await?);
+    }
+
+    let t = EmpRo::new("emp-ot:csw-base-ot:to-curve", sid)
+        .absorb_block(seed)
+        .squeeze_p256_point()?;
+    let r = group.random_scalar()?;
+    let z = {
+        let mut ctx = BigNumContext::new()?;
+        group.mul_gen_bn(&r, &mut ctx)?
+    };
+    let t_r = group.point_mul_bn(&t, &r)?;
+    let t_r_neg = group.point_inv(&t_r)?;
+
+    let mut p0 = Vec::with_capacity(data0.len());
+    let mut p1 = Vec::with_capacity(data0.len());
+    let mut h0 = Vec::with_capacity(data0.len());
+    for (i, b_point) in b_points.iter().enumerate() {
+        let rho0 = group.point_mul_bn(b_point, &r)?;
+        let rho1 = group.point_add(&rho0, &t_r_neg)?;
+        let pad0 = csw_pad_block(sid, i, &rho0);
+        let pad1 = csw_pad_block(sid, i, &rho1);
+        h0.push(csw_short_block(sid, pad0));
+        p0.push(pad0);
+        p1.push(pad1);
+    }
+
+    let otans = EmpRo::new("emp-ot:csw-base-ot:agg", sid)
+        .absorb_bytes(&blocks_to_bytes(&h0))
+        .squeeze_block();
+    let proof = csw_short_block(sid, otans);
+    let mut chi = Vec::with_capacity(data0.len());
+    let mut c0 = Vec::with_capacity(data0.len());
+    let mut c1 = Vec::with_capacity(data0.len());
+    for i in 0..data0.len() {
+        chi.push(h0[i].xor(csw_short_block(sid, p1[i])));
+        c0.push(p0[i].xor(data0[i]));
+        c1.push(p1[i].xor(data1[i]));
+    }
+
+    send_point(stream, &z).await?;
+    stream.send_block(&chi).await?;
+    stream.send_block(&[proof]).await?;
+    stream.send_block(&c0).await?;
+    stream.send_block(&c1).await?;
+    stream.flush().await?;
+
+    let otans_prime = stream.recv_block(1).await?[0];
+    if otans_prime != otans {
+        return Err(CompatError::CswReceiverMismatch);
+    }
+    Ok(())
+}
+
+pub async fn csw_recv(stream: &mut EmpStream, choices: &[bool]) -> Result<Vec<Block>> {
+    if choices.len() < 80 {
+        return Err(CompatError::BadCswLength(choices.len()));
+    }
+
+    let group = P256::new()?;
+    let sid = Block::zero();
+    let seed = random_block()?;
+    let t = EmpRo::new("emp-ot:csw-base-ot:to-curve", sid)
+        .absorb_block(seed)
+        .squeeze_p256_point()?;
+
+    stream.send_block(&[seed]).await?;
+    let mut alphas = Vec::with_capacity(choices.len());
+    for choice in choices {
+        let alpha = group.random_scalar()?;
+        let b_point = {
+            let mut ctx = BigNumContext::new()?;
+            group.mul_gen_bn(&alpha, &mut ctx)?
+        };
+        let b_point = if *choice {
+            group.point_add(&b_point, &t)?
+        } else {
+            b_point
+        };
+        send_point(stream, &b_point).await?;
+        alphas.push(alpha);
+    }
+    stream.flush().await?;
+
+    let z = recv_point(stream).await?;
+    let mut p_bi = Vec::with_capacity(choices.len());
+    let mut h_bi = Vec::with_capacity(choices.len());
+    for (i, alpha) in alphas.iter().enumerate() {
+        let z_alpha = group.point_mul_bn(&z, alpha)?;
+        let pad = csw_pad_block(sid, i, &z_alpha);
+        h_bi.push(csw_short_block(sid, pad));
+        p_bi.push(pad);
+    }
+
+    let chi = stream.recv_block(choices.len()).await?;
+    let proof = stream.recv_block(1).await?[0];
+    let c0 = stream.recv_block(choices.len()).await?;
+    let c1 = stream.recv_block(choices.len()).await?;
+
+    let mut otresp = Vec::with_capacity(choices.len());
+    for i in 0..choices.len() {
+        otresp.push(if choices[i] {
+            h_bi[i].xor(chi[i])
+        } else {
+            h_bi[i]
+        });
+    }
+    let otans_prime = EmpRo::new("emp-ot:csw-base-ot:agg", sid)
+        .absorb_bytes(&blocks_to_bytes(&otresp))
+        .squeeze_block();
+    if csw_short_block(sid, otans_prime) != proof {
+        return Err(CompatError::CswProofMismatch);
+    }
+
+    let mut out = Vec::with_capacity(choices.len());
+    for i in 0..choices.len() {
+        out.push(p_bi[i].xor(if choices[i] { c1[i] } else { c0[i] }));
+    }
+    stream.send_block(&[otans_prime]).await?;
+    stream.flush().await?;
+    Ok(out)
+}
+
+fn csw_pad_block(sid: Block, i: usize, point: &[u8]) -> Block {
+    EmpRo::new("emp-ot:csw-base-ot:pad", sid)
+        .absorb_u64(i as u64)
+        .absorb_point(point)
+        .squeeze_block()
+}
+
+fn csw_short_block(sid: Block, block: Block) -> Block {
+    EmpRo::new("emp-ot:csw-base-ot:short", sid)
+        .absorb_block(block)
+        .squeeze_block()
+}
+
+fn blocks_to_bytes(blocks: &[Block]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(blocks.len() * BLOCK_BYTES);
+    for block in blocks {
+        out.extend_from_slice(block.as_bytes());
+    }
+    out
 }
 
 struct IknpSendState {
@@ -3985,6 +4156,46 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_csw_base_ot_roundtrip() {
+        let port = free_port();
+        let choices: Vec<bool> = (0..80).map(csw_choice).collect();
+        let expected: Vec<Block> = choices
+            .iter()
+            .enumerate()
+            .map(|(i, choice)| if *choice { csw_data1(i) } else { csw_data0(i) })
+            .collect();
+        let receiver_choices = choices.clone();
+        let receiver = tokio::spawn(async move {
+            let mut stream = EmpStream::listen(port).await.unwrap();
+            csw_recv(&mut stream, &receiver_choices).await.unwrap()
+        });
+
+        let data0: Vec<Block> = (0..80).map(csw_data0).collect();
+        let data1: Vec<Block> = (0..80).map(csw_data1).collect();
+        let mut sender = EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            .await
+            .unwrap();
+        csw_send(&mut sender, &data0, &data1).await.unwrap();
+
+        let out = timeout(LIVE_INTEROP_TIMEOUT, receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, expected);
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_csw_base_ot_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_csw_probe();
+        for transport in [TestTransport::Listen, TestTransport::Connect] {
+            run_live_csw_case(&bin, transport, TestOtRole::Send).await;
+            run_live_csw_case(&bin, transport, TestOtRole::Recv).await;
+        }
+    }
+
     async fn run_live_otco_case(bin: &Path, rust_transport: TestTransport, rust_role: TestOtRole) {
         let port = free_port();
         let cpp_transport = match rust_transport {
@@ -4965,12 +5176,80 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cpp-probes")]
+    async fn run_live_csw_case(bin: &Path, rust_transport: TestTransport, rust_role: TestOtRole) {
+        let port = free_port();
+        let cpp_transport = match rust_transport {
+            TestTransport::Listen => "connect",
+            TestTransport::Connect => "listen",
+        };
+        let cpp_role = match rust_role {
+            TestOtRole::Send => "recv",
+            TestOtRole::Recv => "send",
+        };
+        let child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_transport)
+            .arg(port.to_string())
+            .arg(cpp_role)
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if matches!(rust_transport, TestTransport::Connect) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut stream = open_stream(rust_transport, port).await.unwrap();
+        let result = timeout(LIVE_INTEROP_TIMEOUT, run_rust_csw(&mut stream, rust_role)).await;
+        let output = child.wait_with_output().unwrap();
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!(
+                "Rust CSW failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(_) => panic!(
+                "Rust CSW timed out\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+        assert!(
+            output.status.success(),
+            "C++ CSW probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
             TestTransport::Connect => EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
                 .await
                 .map_err(Into::into),
+        }
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn run_rust_csw(stream: &mut EmpStream, role: TestOtRole) -> Result<()> {
+        let data0: Vec<Block> = (0..80).map(csw_data0).collect();
+        let data1: Vec<Block> = (0..80).map(csw_data1).collect();
+        match role {
+            TestOtRole::Send => csw_send(stream, &data0, &data1).await,
+            TestOtRole::Recv => {
+                let choices: Vec<bool> = (0..80).map(csw_choice).collect();
+                let out = csw_recv(stream, &choices).await?;
+                let expected: Vec<Block> = choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, choice)| if *choice { data1[i] } else { data0[i] })
+                    .collect();
+                assert_eq!(out, expected);
+                Ok(())
+            }
         }
     }
 
@@ -5716,6 +5995,25 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/otco_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    fn cpp_csw_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/csw_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/csw_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/csw_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/csw_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

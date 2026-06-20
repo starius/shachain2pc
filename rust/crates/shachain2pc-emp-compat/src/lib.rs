@@ -5,6 +5,8 @@ use openssl::ec::{EcGroup, EcPoint, EcPointRef, PointConversionForm};
 use openssl::error::ErrorStack;
 use openssl::nid::Nid;
 use openssl::rand::rand_bytes;
+use p256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
@@ -59,6 +61,7 @@ pub enum CompatError {
     C2pcLambdaMismatch(usize),
     CoinTossMismatch,
     FeqMismatch,
+    HashToCurve,
     LengthOverflow(&'static str),
     MissingDelta(&'static str),
     BadIknpSetupLength {
@@ -122,6 +125,7 @@ impl fmt::Display for CompatError {
             }
             Self::CoinTossMismatch => write!(f, "Fpre coin-toss commitment mismatch"),
             Self::FeqMismatch => write!(f, "Fpre equality check mismatch"),
+            Self::HashToCurve => write!(f, "P-256 hash-to-curve failed"),
             Self::LengthOverflow(name) => write!(f, "{name} length overflow"),
             Self::MissingDelta(name) => write!(f, "{name} setup did not produce Delta"),
             Self::BadIknpSetupLength { name, len } => {
@@ -162,6 +166,71 @@ pub type Result<T> = std::result::Result<T, CompatError>;
 
 pub fn hash_once(data: &[u8]) -> [u8; HASH_DIGEST_BYTES] {
     Sha256::digest(data).into()
+}
+
+pub struct EmpRo {
+    domain: Vec<u8>,
+    buf: Vec<u8>,
+}
+
+impl EmpRo {
+    pub fn new(domain: &str, sid: Block) -> Self {
+        let mut out = Self {
+            domain: domain.as_bytes().to_vec(),
+            buf: Vec::new(),
+        };
+        out.frame(1, domain.as_bytes());
+        out.frame(3, sid.as_bytes());
+        out
+    }
+
+    pub fn absorb_bytes(mut self, data: &[u8]) -> Self {
+        self.frame(2, data);
+        self
+    }
+
+    pub fn absorb_block(mut self, block: Block) -> Self {
+        self.frame(3, block.as_bytes());
+        self
+    }
+
+    pub fn absorb_u64(mut self, value: u64) -> Self {
+        self.frame(4, &value.to_le_bytes());
+        self
+    }
+
+    pub fn absorb_point(mut self, point: &[u8]) -> Self {
+        self.frame(5, point);
+        self
+    }
+
+    pub fn squeeze_block(&self) -> Block {
+        let digest = hash_once(&self.buf);
+        let mut bytes = [0u8; BLOCK_BYTES];
+        bytes.copy_from_slice(&digest[..BLOCK_BYTES]);
+        Block::from_bytes(bytes)
+    }
+
+    pub fn squeeze_p256_point(&self) -> Result<Vec<u8>> {
+        let point =
+            p256::NistP256::hash_from_bytes::<ExpandMsgXmd<Sha256>>(&[&self.buf], &[&self.domain])
+                .map_err(|_| CompatError::HashToCurve)?;
+        Ok(point
+            .to_affine()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec())
+    }
+
+    fn frame(&mut self, typ: u32, data: &[u8]) {
+        let len: u32 = data
+            .len()
+            .try_into()
+            .expect("EMP RO frame length exceeds u32");
+        self.buf.extend_from_slice(&typ.to_le_bytes());
+        self.buf.extend_from_slice(&len.to_le_bytes());
+        self.buf.extend_from_slice(data);
+    }
 }
 
 pub struct Prp {
@@ -626,6 +695,18 @@ impl P256 {
         let mut block = [0u8; 16];
         block.copy_from_slice(&digest[..16]);
         Ok(Block::from_bytes(block))
+    }
+
+    pub fn hash_to_point(&self, msg: &[u8], dst: &str) -> Result<Vec<u8>> {
+        let _ = &self.group;
+        let point =
+            p256::NistP256::hash_from_bytes::<ExpandMsgXmd<Sha256>>(&[msg], &[dst.as_bytes()])
+                .map_err(|_| CompatError::HashToCurve)?;
+        Ok(point
+            .to_affine()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec())
     }
 }
 
@@ -3116,6 +3197,14 @@ mod tests {
         hex_encode(block.as_bytes())
     }
 
+    fn blocks_digest_json(blocks: &[Block]) -> String {
+        let mut hasher = Sha256::new();
+        for block in blocks {
+            hasher.update(block.as_bytes());
+        }
+        hex_encode(&hasher.finalize())
+    }
+
     fn assert_block_json_array(fixture: &Value, name: &str, blocks: &[Block]) {
         let expected = fixture[name].as_array().unwrap();
         assert_eq!(expected.len(), blocks.len(), "{name} length mismatch");
@@ -3126,6 +3215,39 @@ mod tests {
                 "{name}[{i}]"
             );
         }
+    }
+
+    fn blocks_bytes(blocks: &[Block]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(blocks.len() * BLOCK_BYTES);
+        for block in blocks {
+            out.extend_from_slice(block.as_bytes());
+        }
+        out
+    }
+
+    fn csw_pad(sid: Block, i: usize, point: &[u8]) -> Block {
+        EmpRo::new("emp-ot:csw-base-ot:pad", sid)
+            .absorb_u64(i as u64)
+            .absorb_point(point)
+            .squeeze_block()
+    }
+
+    fn csw_short(sid: Block, block: Block) -> Block {
+        EmpRo::new("emp-ot:csw-base-ot:short", sid)
+            .absorb_block(block)
+            .squeeze_block()
+    }
+
+    fn csw_data0(i: usize) -> Block {
+        Block::make(0x1000_0000_0000_0000 | i as u64, 0x100 | i as u64)
+    }
+
+    fn csw_data1(i: usize) -> Block {
+        Block::make(0x2000_0000_0000_0000 | i as u64, 0x200 | i as u64)
+    }
+
+    fn csw_choice(i: usize) -> bool {
+        ((i * 7 + 3) % 11) < 5
     }
 
     fn otco_data() -> ([Block; 8], [Block; 8]) {
@@ -3380,6 +3502,129 @@ mod tests {
         assert_block_json_array(&fixture, "sfvole_u", &sfvole_u);
         assert_block_json_array(&fixture, "sfvole_v", &sfvole_v);
         assert_block_json_array(&fixture, "sfvole_w", &sfvole_w);
+    }
+
+    #[test]
+    fn csw_helper_transcript_matches_cpp_fixture() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../../compat/ag2pc/csw-helper-v1.json"))
+                .unwrap();
+        let group = P256::new().unwrap();
+        let sid = Block::zero();
+        let seed = Block::make(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
+        let t = EmpRo::new("emp-ot:csw-base-ot:to-curve", sid)
+            .absorb_block(seed)
+            .squeeze_p256_point()
+            .unwrap();
+        assert_eq!(hex_encode(&t), fixture["T"].as_str().unwrap());
+
+        let r = 0x12345;
+        let z = group.mul_gen(r).unwrap();
+        assert_eq!(hex_encode(&z), fixture["z"].as_str().unwrap());
+        let t_r_neg = group.point_inv(&group.point_mul(&t, r).unwrap()).unwrap();
+
+        let length = fixture["length"].as_u64().unwrap() as usize;
+        let mut b_points = Vec::with_capacity(length);
+        let mut p0 = Vec::with_capacity(length);
+        let mut p1 = Vec::with_capacity(length);
+        let mut h0 = Vec::with_capacity(length);
+        let mut chi = Vec::with_capacity(length);
+        let mut c0 = Vec::with_capacity(length);
+        let mut c1 = Vec::with_capacity(length);
+        let mut recovered = Vec::with_capacity(length);
+
+        for i in 0..length {
+            let alpha = 0x2000 + i as u64 * 17;
+            let mut b = group.mul_gen(alpha).unwrap();
+            if csw_choice(i) {
+                b = group.point_add(&b, &t).unwrap();
+            }
+            let rho0 = group.point_mul(&b, r).unwrap();
+            let rho1 = group.point_add(&rho0, &t_r_neg).unwrap();
+            let pad0 = csw_pad(sid, i, &rho0);
+            let pad1 = csw_pad(sid, i, &rho1);
+            p0.push(pad0);
+            p1.push(pad1);
+            h0.push(csw_short(sid, pad0));
+            b_points.push(b);
+        }
+
+        let otans = EmpRo::new("emp-ot:csw-base-ot:agg", sid)
+            .absorb_bytes(&blocks_bytes(&h0))
+            .squeeze_block();
+        let proof = csw_short(sid, otans);
+        assert_eq!(block_json(otans), fixture["otans"].as_str().unwrap());
+        assert_eq!(block_json(proof), fixture["proof"].as_str().unwrap());
+
+        for i in 0..length {
+            let h1 = csw_short(sid, p1[i]);
+            chi.push(h0[i].xor(h1));
+            c0.push(p0[i].xor(csw_data0(i)));
+            c1.push(p1[i].xor(csw_data1(i)));
+
+            let alpha = 0x2000 + i as u64 * 17;
+            let z_alpha = group.point_mul(&z, alpha).unwrap();
+            let p_bi = csw_pad(sid, i, &z_alpha);
+            recovered.push(p_bi.xor(if csw_choice(i) { c1[i] } else { c0[i] }));
+        }
+
+        assert_eq!(
+            hex_encode(&b_points[0]),
+            fixture["B_first"].as_str().unwrap()
+        );
+        assert_eq!(
+            hex_encode(b_points.last().unwrap()),
+            fixture["B_last"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&p0),
+            fixture["p0_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&p1),
+            fixture["p1_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&h0),
+            fixture["h0_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&chi),
+            fixture["chi_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&c0),
+            fixture["c0_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&c1),
+            fixture["c1_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&recovered),
+            fixture["recovered_digest"].as_str().unwrap()
+        );
+        assert_eq!(block_json(p0[0]), fixture["p0_first"].as_str().unwrap());
+        assert_eq!(block_json(p1[0]), fixture["p1_first"].as_str().unwrap());
+        assert_eq!(block_json(chi[0]), fixture["chi_first"].as_str().unwrap());
+        assert_eq!(block_json(c0[0]), fixture["c0_first"].as_str().unwrap());
+        assert_eq!(block_json(c1[0]), fixture["c1_first"].as_str().unwrap());
+        assert_eq!(
+            block_json(recovered[0]),
+            fixture["recovered_first"].as_str().unwrap()
+        );
+        assert_eq!(
+            block_json(*recovered.last().unwrap()),
+            fixture["recovered_last"].as_str().unwrap()
+        );
+        for (i, block) in recovered.iter().enumerate() {
+            let expected = if csw_choice(i) {
+                csw_data1(i)
+            } else {
+                csw_data0(i)
+            };
+            assert_eq!(*block, expected, "CSW recovered[{i}]");
+        }
     }
 
     #[test]

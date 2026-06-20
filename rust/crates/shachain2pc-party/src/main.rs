@@ -1,7 +1,8 @@
 use shachain2pc_circuit::{
     batch_digest, build_chunk_circuit, build_circuit_for_index, build_tile_circuit, cache_digest,
-    check_chunk_circuit, check_tile_circuit, chunk_spec_digest, load_bristol, plan_tile_levels,
-    split_chain_bits, tree_digest, Circuit, GateType, CACHE_TILE_HEIGHT, CACHE_TILE_LEAVES,
+    check_chunk_circuit, check_tile_circuit, chunk_spec_digest, plan_tile_levels,
+    sha256_compress_gadget, split_chain_bits, tree_digest, Circuit, GateType, CACHE_TILE_HEIGHT,
+    CACHE_TILE_LEAVES,
 };
 use shachain2pc_emp_compat::{Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError};
 use shachain2pc_emp_wire::{Ag2pcStreams, EmpStream, WireError};
@@ -10,7 +11,6 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
@@ -233,7 +233,7 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
     }
 
     let mut timing = PhaseTiming::new(args.role, index);
-    let sha = load_bristol(default_sha256_compress_path())?;
+    let sha = sha256_compress_gadget()?;
     let circuit = build_circuit_for_index(index, &sha)?;
     let digest = batch_digest(&[index.get()], &sha);
     let program = Ag2pcProgram::from_circuit(&circuit)?;
@@ -271,7 +271,7 @@ async fn run_derivation_batch(
         .first()
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
     let mut timing = PhaseTiming::new(role, first_index);
-    let sha = load_bristol(default_sha256_compress_path())?;
+    let sha = sha256_compress_gadget()?;
     let mut programs = Vec::with_capacity(indices.len());
     for &index in indices {
         let circuit = build_circuit_for_index(index, &sha)?;
@@ -317,7 +317,7 @@ async fn run_derivation_tree(
         .first()
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
     let mut timing = PhaseTiming::new(role, first_index);
-    let sha = load_bristol(default_sha256_compress_path())?;
+    let sha = sha256_compress_gadget()?;
     let (_, low_mask, high_mask) = range_split_masks(indices)?;
     let trunk_groups = split_chain_bits(
         first_index.get() & high_mask,
@@ -403,7 +403,7 @@ async fn run_derivation_cache(
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?
         .get();
     let mut timing = PhaseTiming::new(role, Index48::new(lo).expect("parser checked index"));
-    let sha = load_bristol(default_sha256_compress_path())?;
+    let sha = sha256_compress_gadget()?;
     let tile_height = tile_height_for_fanout(tile_fanout)?;
     let (split, low_mask, high_mask) = range_split_masks(&[
         Index48::new(lo).expect("parser checked index"),
@@ -766,7 +766,7 @@ async fn run_derivation_chunked(
     blocks_per_chunk: usize,
 ) -> Result<Value32, PartyError> {
     let mut timing = PhaseTiming::new(role, index);
-    let sha = load_bristol(default_sha256_compress_path())?;
+    let sha = sha256_compress_gadget()?;
     let groups = split_chain_bits(index.get(), blocks_per_chunk)?;
     let tamper_chunk = tamper_step_from_env();
     let mut programs = Vec::with_capacity(groups.len());
@@ -1099,20 +1099,6 @@ fn ensure_mode_supported_for_now(
         (false, RequestedMode::Cache) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_CACHE mode requires a range",
         )),
-    }
-}
-
-fn default_sha256_compress_path() -> PathBuf {
-    // EMP_PREFIX (set by the nix dev shell) yields an absolute /nix/store path used
-    // as-is; the legacy .deps/emp fallback is relative, so resolve it against the
-    // cwd or, failing that, the repo root.
-    let p = shachain2pc_circuit::default_sha256_compress_path();
-    if p.is_absolute() || p.exists() {
-        p
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..")
-            .join(p)
     }
 }
 

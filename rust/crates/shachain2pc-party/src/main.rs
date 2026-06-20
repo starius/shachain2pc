@@ -1,7 +1,7 @@
 use shachain2pc_circuit::{
     batch_digest, build_chunk_circuit, build_circuit_for_index, build_tile_circuit, cache_digest,
     check_chunk_circuit, check_tile_circuit, chunk_spec_digest, load_bristol, plan_tile_levels,
-    split_chain_bits, tree_digest, Circuit, CACHE_TILE_HEIGHT, CACHE_TILE_LEAVES,
+    split_chain_bits, tree_digest, Circuit, GateType, CACHE_TILE_HEIGHT, CACHE_TILE_LEAVES,
     DEFAULT_SHA256_COMPRESS_PATH,
 };
 use shachain2pc_emp_compat::{Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError};
@@ -329,19 +329,21 @@ async fn run_derivation_tree(
             "shachain2pc: shared-trunk needs >=1 common high set bit (no shared hash in this range); use batch mode",
         ));
     }
+    let tamper_branch = tamper_step_from_env();
 
     let mut trunk_programs = Vec::with_capacity(trunk_groups.len());
     let mut branch_programs = Vec::with_capacity(indices.len());
     for (chunk, bits) in trunk_groups.iter().enumerate() {
-        let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
-        check_chunk_circuit(&circuit)?;
-        trunk_programs.push(Ag2pcProgram::from_circuit(&circuit)?);
+        trunk_programs.push(chunk_program(&sha, bits, chunk == 0, false)?);
     }
-    for &index in indices {
+    for (branch, &index) in indices.iter().enumerate() {
         let bits = set_bits_desc(index.get() & low_mask);
-        let circuit = build_chunk_circuit(&sha, &bits, false)?;
-        check_chunk_circuit(&circuit)?;
-        branch_programs.push(Ag2pcProgram::from_circuit(&circuit)?);
+        branch_programs.push(chunk_program(
+            &sha,
+            &bits,
+            false,
+            branch as i64 == tamper_branch,
+        )?);
     }
     let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
     let digest = tree_digest(&index_values, trunk_chunk_blocks, &sha);
@@ -414,12 +416,11 @@ async fn run_derivation_cache(
             "shachain2pc: cache needs >=1 common high set bit (no shared trunk hash); use batch mode for this range",
         ));
     }
+    let mut tamper = TamperCursor::from_env();
 
     let mut trunk_programs = Vec::with_capacity(trunk_groups.len());
     for (chunk, bits) in trunk_groups.iter().enumerate() {
-        let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
-        check_chunk_circuit(&circuit)?;
-        trunk_programs.push(Ag2pcProgram::from_circuit(&circuit)?);
+        trunk_programs.push(chunk_program(&sha, bits, chunk == 0, false)?);
     }
 
     let depth = if split < 0 {
@@ -437,23 +438,20 @@ async fn run_derivation_cache(
     if let Some(levels) = &recursive_levels {
         recursive_programs.reserve(levels.len());
         for &level in levels {
-            let raw = build_tile_circuit(&sha, level.bit_offset, level.height)?;
-            check_tile_circuit(&raw, level.height)?;
-            recursive_programs.push((level, Ag2pcProgram::from_circuit(&raw)?));
+            recursive_programs.push((
+                level,
+                build_tile_program(&sha, level.bit_offset, level.height, false)?,
+            ));
         }
     }
 
     let tile_program = if tile_fanout >= 2 {
-        let raw = build_tile_circuit(&sha, 0, CACHE_TILE_HEIGHT)?;
-        check_tile_circuit(&raw, CACHE_TILE_HEIGHT)?;
-        Some(Ag2pcProgram::from_circuit(&raw)?)
+        Some(build_tile_program(&sha, 0, CACHE_TILE_HEIGHT, false)?)
     } else {
         None
     };
 
-    let one_step_raw = build_chunk_circuit(&sha, &[0], false)?;
-    check_chunk_circuit(&one_step_raw)?;
-    let one_step_program = Ag2pcProgram::from_circuit(&one_step_raw)?;
+    let one_step_program = chunk_program(&sha, &[0], false, false)?;
 
     let digest = cache_digest(
         lo,
@@ -496,9 +494,24 @@ async fn run_derivation_cache(
             if is_bottom {
                 let mut tiles = Vec::with_capacity(roots.len());
                 for root in roots {
-                    let tile = session.run_program(&mut streams, program, &root).await?;
+                    let tampered_program;
+                    let program_ref = if tamper.matches_current() {
+                        tampered_program = Some(build_tile_program(
+                            &sha,
+                            level.bit_offset,
+                            level.height,
+                            true,
+                        )?);
+                        tampered_program.as_ref().expect("tampered program set")
+                    } else {
+                        program
+                    };
+                    let tile = session
+                        .run_program(&mut streams, program_ref, &root)
+                        .await?;
                     tiles.push(tile);
                     timing.mark("cache_tile");
+                    tamper.advance();
                 }
 
                 let leaf_mask = (1u64 << level.height) - 1;
@@ -540,18 +553,32 @@ async fn run_derivation_cache(
 
             let mut next = Vec::with_capacity(roots.len() * (1usize << level.height));
             for root in roots {
-                let tile = session.run_program(&mut streams, program, &root).await?;
+                let tampered_program;
+                let program_ref = if tamper.matches_current() {
+                    tampered_program = Some(build_tile_program(
+                        &sha,
+                        level.bit_offset,
+                        level.height,
+                        true,
+                    )?);
+                    tampered_program.as_ref().expect("tampered program set")
+                } else {
+                    program
+                };
+                let tile = session
+                    .run_program(&mut streams, program_ref, &root)
+                    .await?;
                 for slot in 0..(1usize << level.height) {
                     next.push(tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?);
                 }
                 timing.mark("cache_tile");
+                tamper.advance();
             }
             roots = next;
         }
     }
 
-    let mut stack_bits = Vec::new();
-    let mut stack_vals = vec![trunk];
+    let mut stack = CacheStack::new(trunk);
     let mut tile_outs: HashMap<u64, Ag2pcSecureWires> = HashMap::new();
     let mut single_outs: HashMap<u64, Ag2pcSecureWires> = HashMap::new();
     let tile_mask = (CACHE_TILE_LEAVES as u64) - 1;
@@ -571,22 +598,26 @@ async fn run_derivation_cache(
                 &mut streams,
                 &sha,
                 &one_step_program,
-                &mut stack_bits,
-                &mut stack_vals,
+                &mut stack,
                 &prefix,
+                &mut tamper,
             )
             .await?;
+            let tampered_program;
+            let tile_program_ref = if tamper.matches_current() {
+                tampered_program = Some(build_tile_program(&sha, 0, CACHE_TILE_HEIGHT, true)?);
+                tampered_program.as_ref().expect("tampered program set")
+            } else {
+                tile_program
+                    .as_ref()
+                    .expect("full_tile requires tile_program")
+            };
             let tile = session
-                .run_program(
-                    &mut streams,
-                    tile_program
-                        .as_ref()
-                        .expect("full_tile requires tile_program"),
-                    stack_vals.last().expect("stack has trunk"),
-                )
+                .run_program(&mut streams, tile_program_ref, stack.last())
                 .await?;
             tile_outs.insert(tile_base, tile);
             timing.mark("cache_tile");
+            tamper.advance();
 
             if tile_base == lo {
                 break;
@@ -601,12 +632,12 @@ async fn run_derivation_cache(
             &mut streams,
             &sha,
             &one_step_program,
-            &mut stack_bits,
-            &mut stack_vals,
+            &mut stack,
             &low,
+            &mut tamper,
         )
         .await?;
-        single_outs.insert(index, stack_vals.last().expect("stack has trunk").clone());
+        single_outs.insert(index, stack.last().clone());
         timing.mark("cache_single");
         if index == lo {
             break;
@@ -656,39 +687,73 @@ async fn run_derivation_cache(
     outputs
 }
 
+struct CacheStack {
+    bits: Vec<usize>,
+    vals: Vec<Ag2pcSecureWires>,
+}
+
+impl CacheStack {
+    fn new(root: Ag2pcSecureWires) -> Self {
+        Self {
+            bits: Vec::new(),
+            vals: vec![root],
+        }
+    }
+
+    fn last(&self) -> &Ag2pcSecureWires {
+        self.vals.last().expect("stack has trunk")
+    }
+}
+
+struct TamperCursor {
+    target: i64,
+    current: i64,
+}
+
+impl TamperCursor {
+    fn from_env() -> Self {
+        Self {
+            target: tamper_step_from_env(),
+            current: 0,
+        }
+    }
+
+    fn matches_current(&self) -> bool {
+        self.current == self.target
+    }
+
+    fn advance(&mut self) {
+        self.current += 1;
+    }
+}
+
 async fn align_cache_stack(
     session: &mut Ag2pcSession,
     streams: &mut Ag2pcStreams,
     sha: &Circuit,
     one_step_template: &Ag2pcProgram,
-    stack_bits: &mut Vec<usize>,
-    stack_vals: &mut Vec<Ag2pcSecureWires>,
+    stack: &mut CacheStack,
     target: &[usize],
+    tamper: &mut TamperCursor,
 ) -> Result<(), PartyError> {
     let mut prefix = 0usize;
-    while prefix < stack_bits.len() && prefix < target.len() && stack_bits[prefix] == target[prefix]
+    while prefix < stack.bits.len() && prefix < target.len() && stack.bits[prefix] == target[prefix]
     {
         prefix += 1;
     }
-    stack_bits.truncate(prefix);
-    stack_vals.truncate(prefix + 1);
+    stack.bits.truncate(prefix);
+    stack.vals.truncate(prefix + 1);
     for &bit in &target[prefix..] {
-        let program = if bit == 0 {
+        let should_tamper = tamper.matches_current();
+        let program = if bit == 0 && !should_tamper {
             one_step_template.clone()
         } else {
-            let raw = build_chunk_circuit(sha, &[bit], false)?;
-            check_chunk_circuit(&raw)?;
-            Ag2pcProgram::from_circuit(&raw)?
+            chunk_program(sha, &[bit], false, should_tamper)?
         };
-        let next = session
-            .run_program(
-                streams,
-                &program,
-                stack_vals.last().expect("stack has trunk"),
-            )
-            .await?;
-        stack_vals.push(next);
-        stack_bits.push(bit);
+        let next = session.run_program(streams, &program, stack.last()).await?;
+        stack.vals.push(next);
+        stack.bits.push(bit);
+        tamper.advance();
     }
     Ok(())
 }
@@ -704,11 +769,15 @@ async fn run_derivation_chunked(
     let mut timing = PhaseTiming::new(role, index);
     let sha = load_bristol(default_sha256_compress_path())?;
     let groups = split_chain_bits(index.get(), blocks_per_chunk)?;
+    let tamper_chunk = tamper_step_from_env();
     let mut programs = Vec::with_capacity(groups.len());
     for (chunk, bits) in groups.iter().enumerate() {
-        let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
-        check_chunk_circuit(&circuit)?;
-        programs.push(Ag2pcProgram::from_circuit(&circuit)?);
+        programs.push(chunk_program(
+            &sha,
+            bits,
+            chunk == 0,
+            chunk as i64 == tamper_chunk,
+        )?);
     }
     let digest = chunk_spec_digest(index.get(), blocks_per_chunk as i32, &sha);
     timing.mark("build_chunk_circuits");
@@ -927,6 +996,54 @@ fn effective_chunk_size(trunk_chunk_blocks: i32) -> Result<usize, PartyError> {
     } else {
         Ok(INDEX_BITS as usize)
     }
+}
+
+fn tamper_step_from_env() -> i64 {
+    env::var("SHACHAIN2PC_TAMPER")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(-1)
+}
+
+// TEST ONLY: mirror C++ TamperFirstFlip. This keeps the circuit shape and digest
+// unchanged but redirects the first real bit-flip INV gate to input wire 0,
+// simulating a malicious garbler trying to steer the chain to a different index.
+fn tamper_first_flip(circuit: &mut Circuit) {
+    let c0_wire = circuit.gates.first().map(|gate| gate.out).unwrap_or(-1);
+    for gate in &mut circuit.gates {
+        if gate.typ == GateType::Inv && gate.in0 != c0_wire {
+            gate.in0 = 0;
+            return;
+        }
+    }
+}
+
+fn chunk_program(
+    sha: &Circuit,
+    bits: &[usize],
+    first: bool,
+    tamper: bool,
+) -> Result<Ag2pcProgram, PartyError> {
+    let mut circuit = build_chunk_circuit(sha, bits, first)?;
+    if tamper {
+        tamper_first_flip(&mut circuit);
+    }
+    check_chunk_circuit(&circuit)?;
+    Ag2pcProgram::from_circuit(&circuit).map_err(PartyError::from)
+}
+
+fn build_tile_program(
+    sha: &Circuit,
+    bit_offset: usize,
+    tile_height: usize,
+    tamper: bool,
+) -> Result<Ag2pcProgram, PartyError> {
+    let mut circuit = build_tile_circuit(sha, bit_offset, tile_height)?;
+    if tamper {
+        tamper_first_flip(&mut circuit);
+    }
+    check_tile_circuit(&circuit, tile_height)?;
+    Ag2pcProgram::from_circuit(&circuit).map_err(PartyError::from)
 }
 
 fn range_split_masks(indices: &[Index48]) -> Result<(i32, u64, u64), PartyError> {

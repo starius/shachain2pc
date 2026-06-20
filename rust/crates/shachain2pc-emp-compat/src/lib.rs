@@ -547,6 +547,82 @@ fn aes_dm(key: &Prp, counter: u64, tweak: Block) -> Block {
     key.permute_one(pt).xor(pt)
 }
 
+fn block_to_u128(block: Block) -> u128 {
+    u128::from_le_bytes(block.into_bytes())
+}
+
+fn u128_to_block(value: u128) -> Block {
+    Block::from_bytes(value.to_le_bytes())
+}
+
+fn gf_mul(a: Block, b: Block) -> Block {
+    let a = block_to_u128(a);
+    let b = block_to_u128(b);
+    let mut product = [0u64; 4];
+    for i in 0..128 {
+        if ((b >> i) & 1) != 0 {
+            xor_shifted_u128(&mut product, a, i);
+        }
+    }
+    gf_reduce(product)
+}
+
+fn xor_shifted_u128(dst: &mut [u64; 4], value: u128, shift: usize) {
+    let lo = value as u64;
+    let hi = (value >> 64) as u64;
+    let word = shift / 64;
+    let bits = shift % 64;
+    if bits == 0 {
+        dst[word] ^= lo;
+        dst[word + 1] ^= hi;
+    } else {
+        dst[word] ^= lo << bits;
+        dst[word + 1] ^= (lo >> (64 - bits)) ^ (hi << bits);
+        if word + 2 < dst.len() {
+            dst[word + 2] ^= hi >> (64 - bits);
+        }
+    }
+}
+
+fn gf_bit(words: &[u64; 4], bit: usize) -> bool {
+    ((words[bit / 64] >> (bit % 64)) & 1) != 0
+}
+
+fn gf_flip(words: &mut [u64; 4], bit: usize) {
+    words[bit / 64] ^= 1u64 << (bit % 64);
+}
+
+fn gf_reduce(mut product: [u64; 4]) -> Block {
+    for bit in (128..256).rev() {
+        if gf_bit(&product, bit) {
+            gf_flip(&mut product, bit);
+            let base = bit - 128;
+            gf_flip(&mut product, base);
+            gf_flip(&mut product, base + 1);
+            gf_flip(&mut product, base + 2);
+            gf_flip(&mut product, base + 7);
+        }
+    }
+    let value = (product[0] as u128) | ((product[1] as u128) << 64);
+    u128_to_block(value)
+}
+
+fn gf_inner_product(a: &[Block], b: &[Block]) -> Block {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .fold(Block::zero(), |acc, (lhs, rhs)| acc.xor(gf_mul(*lhs, *rhs)))
+}
+
+fn gf_pack_128(data: &[Block]) -> Block {
+    assert_eq!(data.len(), 128);
+    let mut product = [0u64; 4];
+    for (shift, block) in data.iter().enumerate() {
+        xor_shifted_u128(&mut product, block_to_u128(*block), shift);
+    }
+    gf_reduce(product)
+}
+
 pub fn sfvole_sender_butterfly(
     k: usize,
     leaves: &[Block],
@@ -969,6 +1045,424 @@ fn blocks_to_bytes(blocks: &[Block]) -> Vec<u8> {
         out.extend_from_slice(block.as_bytes());
     }
     out
+}
+
+const SOFTSPOKEN_K: usize = 4;
+const SOFTSPOKEN_N: usize = 128 / SOFTSPOKEN_K;
+const SOFTSPOKEN_Q: usize = 1 << SOFTSPOKEN_K;
+const SOFTSPOKEN_CHUNK_BLOCKS: usize = 64;
+const SOFTSPOKEN_CHUNK_OTS: usize = SOFTSPOKEN_CHUNK_BLOCKS * 128;
+const SOFTSPOKEN_PPRF_CHECK_HIGH: u64 = 0x7050_5246_434b_5f00;
+
+pub struct SoftSpoken4 {
+    role: Role,
+    malicious: bool,
+    setup_done: bool,
+    delta: Block,
+    delta_bool: [bool; 128],
+    choice_prg: Prg,
+    session: u64,
+    cur_send_session: u64,
+    cur_recv_session: u64,
+    cur_send_b0: u64,
+    cur_recv_b0: u64,
+    alphas: [usize; SOFTSPOKEN_N],
+    leaves_recv: Vec<Block>,
+    leaves_send: Vec<Block>,
+    check_q: Block,
+    check_t: Block,
+    check_x: Block,
+}
+
+impl SoftSpoken4 {
+    pub fn new(role: Role, malicious: bool) -> Result<Self> {
+        let mut delta = Block::zero();
+        let mut delta_bool = [false; 128];
+        if role == Role::Alice {
+            delta = random_block()?;
+            let mut bytes = delta.into_bytes();
+            bytes[0] |= 1;
+            delta = Block::from_bytes(bytes);
+            delta_bool = block_to_bools(delta);
+        }
+        Ok(Self {
+            role,
+            malicious,
+            setup_done: false,
+            delta,
+            delta_bool,
+            choice_prg: Prg::random()?,
+            session: 0,
+            cur_send_session: 0,
+            cur_recv_session: 0,
+            cur_send_b0: 0,
+            cur_recv_b0: 0,
+            alphas: [0; SOFTSPOKEN_N],
+            leaves_recv: Vec::new(),
+            leaves_send: Vec::new(),
+            check_q: Block::zero(),
+            check_t: Block::zero(),
+            check_x: Block::zero(),
+        })
+    }
+
+    pub fn delta(&self) -> Block {
+        self.delta
+    }
+
+    pub async fn run(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+        self.begin(stream).await?;
+        let out = self.next_n(stream, length).await?;
+        self.end(stream).await?;
+        Ok(out)
+    }
+
+    async fn begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+        if self.role == Role::Alice {
+            self.send_begin(stream).await
+        } else {
+            self.recv_begin(stream).await
+        }
+    }
+
+    async fn end(&mut self, stream: &mut EmpStream) -> Result<()> {
+        if self.role == Role::Alice {
+            self.send_end(stream).await
+        } else {
+            self.recv_end(stream).await
+        }
+    }
+
+    async fn next_n(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+        let mut out = Vec::with_capacity(length);
+        while out.len() + SOFTSPOKEN_CHUNK_OTS <= length {
+            out.extend(self.next_chunk(stream, SOFTSPOKEN_CHUNK_BLOCKS).await?);
+        }
+        if out.len() < length {
+            let chunk = self.next_chunk(stream, SOFTSPOKEN_CHUNK_BLOCKS).await?;
+            out.extend_from_slice(&chunk[..length - out.len()]);
+        }
+        Ok(out)
+    }
+
+    async fn next_chunk(&mut self, stream: &mut EmpStream, bs: usize) -> Result<Vec<Block>> {
+        if self.role == Role::Alice {
+            self.send_chunk_pipeline(stream, bs).await
+        } else {
+            self.recv_chunk_pipeline(stream, bs).await
+        }
+    }
+
+    async fn send_begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+        if !self.setup_done {
+            self.bootstrap_send(stream).await?;
+        }
+        self.cur_send_session = self.session;
+        self.session += 1;
+        self.cur_send_b0 = 0;
+        if self.malicious {
+            self.check_q = Block::zero();
+        }
+        Ok(())
+    }
+
+    async fn recv_begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+        if !self.setup_done {
+            self.bootstrap_recv(stream).await?;
+        }
+        self.cur_recv_session = self.session;
+        self.session += 1;
+        self.cur_recv_b0 = 0;
+        if self.malicious {
+            self.check_t = Block::zero();
+            self.check_x = Block::zero();
+        }
+        Ok(())
+    }
+
+    async fn send_end(&mut self, stream: &mut EmpStream) -> Result<()> {
+        if self.malicious {
+            let _scratch = self.send_chunk_pipeline(stream, 1).await?;
+            let x = stream.recv_block(1).await?[0];
+            let t = stream.recv_block(1).await?[0];
+            let lhs = self.check_q.xor(gf_mul(x, self.delta));
+            if lhs != t {
+                return Err(CompatError::FeqMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    async fn recv_end(&mut self, stream: &mut EmpStream) -> Result<()> {
+        if self.malicious {
+            let _scratch = self.recv_chunk_pipeline(stream, 1).await?;
+            stream.send_block(&[self.check_x]).await?;
+            stream.send_block(&[self.check_t]).await?;
+        }
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn bootstrap_send(&mut self, stream: &mut EmpStream) -> Result<()> {
+        let mut choices = Vec::with_capacity(128);
+        for i in 0..SOFTSPOKEN_N {
+            let mut alpha = 0usize;
+            for bit in 0..SOFTSPOKEN_K {
+                if self.delta_bool[i * SOFTSPOKEN_K + bit] {
+                    alpha |= 1 << bit;
+                }
+            }
+            self.alphas[i] = alpha;
+            for bit in 0..SOFTSPOKEN_K {
+                choices.push(((alpha >> bit) & 1) == 0);
+            }
+        }
+        let received = csw_recv(stream, &choices).await?;
+        self.leaves_recv = vec![Block::zero(); SOFTSPOKEN_N * SOFTSPOKEN_Q];
+        for i in 0..SOFTSPOKEN_N {
+            let path = cggm_bit_reverse(self.alphas[i] as u32, SOFTSPOKEN_K) as usize;
+            let leaves = cggm_eval_receiver(
+                SOFTSPOKEN_K,
+                path,
+                &received[i * SOFTSPOKEN_K..(i + 1) * SOFTSPOKEN_K],
+                false,
+            );
+            self.leaves_recv[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q].copy_from_slice(&leaves);
+        }
+        if self.malicious {
+            self.pprf_check_recv(stream).await?;
+            if !stream.fs_enabled() {
+                stream.enable_fs(true)?;
+            }
+        }
+        self.setup_done = true;
+        Ok(())
+    }
+
+    async fn bootstrap_recv(&mut self, stream: &mut EmpStream) -> Result<()> {
+        self.leaves_send = vec![Block::zero(); SOFTSPOKEN_N * SOFTSPOKEN_Q];
+        let mut k0 = Vec::with_capacity(128);
+        let mut k1 = Vec::with_capacity(128);
+        for i in 0..SOFTSPOKEN_N {
+            let pair = self.choice_prg.random_block(2);
+            let (leaves, k0_i) = cggm_build_sender(SOFTSPOKEN_K, pair[0], pair[1], false);
+            self.leaves_send[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q].copy_from_slice(&leaves);
+            for key in k0_i {
+                k0.push(key);
+                k1.push(key.xor(pair[0]));
+            }
+        }
+        csw_send(stream, &k0, &k1).await?;
+        if self.malicious {
+            self.pprf_check_send(stream).await?;
+            if !stream.fs_enabled() {
+                stream.enable_fs(false)?;
+            }
+        }
+        self.setup_done = true;
+        Ok(())
+    }
+
+    async fn pprf_check_send(&mut self, stream: &mut EmpStream) -> Result<()> {
+        let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
+        let mut t_buf = vec![Block::zero(); SOFTSPOKEN_N * 2];
+        let mut hash = Sha256::new();
+        for i in 0..SOFTSPOKEN_N {
+            let base = i * SOFTSPOKEN_Q;
+            let mut tx = Block::zero();
+            let mut ty = Block::zero();
+            for y in 0..SOFTSPOKEN_Q {
+                let exp = aes_dm_3(&check_key, self.leaves_send[base + y]);
+                self.leaves_send[base + y] = exp[0];
+                tx = tx.xor(exp[1]);
+                ty = ty.xor(exp[2]);
+                hash.update(exp[1].as_bytes());
+                hash.update(exp[2].as_bytes());
+            }
+            t_buf[i * 2] = tx;
+            t_buf[i * 2 + 1] = ty;
+        }
+        stream.send_block(&t_buf).await?;
+        stream.send_data(&hash.finalize()).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn pprf_check_recv(&mut self, stream: &mut EmpStream) -> Result<()> {
+        let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
+        let t_buf = stream.recv_block(SOFTSPOKEN_N * 2).await?;
+        let their_digest = stream.recv_data(HASH_DIGEST_BYTES).await?;
+        let mut hash = Sha256::new();
+        let mut s_buf = vec![Block::zero(); SOFTSPOKEN_Q * 2];
+        for i in 0..SOFTSPOKEN_N {
+            let base = i * SOFTSPOKEN_Q;
+            let mut tx = Block::zero();
+            let mut ty = Block::zero();
+            for y in 0..SOFTSPOKEN_Q {
+                if y == self.alphas[i] {
+                    continue;
+                }
+                let exp = aes_dm_3(&check_key, self.leaves_recv[base + y]);
+                self.leaves_recv[base + y] = exp[0];
+                s_buf[y * 2] = exp[1];
+                s_buf[y * 2 + 1] = exp[2];
+                tx = tx.xor(exp[1]);
+                ty = ty.xor(exp[2]);
+            }
+            s_buf[self.alphas[i] * 2] = t_buf[i * 2].xor(tx);
+            s_buf[self.alphas[i] * 2 + 1] = t_buf[i * 2 + 1].xor(ty);
+            for block in &s_buf {
+                hash.update(block.as_bytes());
+            }
+        }
+        if hash.finalize().as_slice() != their_digest.as_slice() {
+            return Err(CompatError::FeqMismatch);
+        }
+        Ok(())
+    }
+
+    async fn send_chunk_pipeline(
+        &mut self,
+        stream: &mut EmpStream,
+        bs: usize,
+    ) -> Result<Vec<Block>> {
+        let mut planes = vec![Block::zero(); 128 * bs];
+        for i in 0..SOFTSPOKEN_N {
+            let w = sfvole_receiver_butterfly(
+                SOFTSPOKEN_K,
+                self.alphas[i],
+                &self.leaves_recv[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q],
+                self.cur_send_b0,
+                bs,
+                self.cur_send_session,
+            );
+            for bit in 0..SOFTSPOKEN_K {
+                let dst = (i * SOFTSPOKEN_K + bit) * bs;
+                planes[dst..dst + bs].copy_from_slice(&w[bit * bs..(bit + 1) * bs]);
+            }
+        }
+        let d_bufs = stream.recv_block((SOFTSPOKEN_N - 1) * bs).await?;
+        for i in 1..SOFTSPOKEN_N {
+            let d_i = &d_bufs[(i - 1) * bs..i * bs];
+            for bit in 0..SOFTSPOKEN_K {
+                if ((self.alphas[i] >> bit) & 1) != 0 {
+                    let offset = (i * SOFTSPOKEN_K + bit) * bs;
+                    for j in 0..bs {
+                        planes[offset + j] = planes[offset + j].xor(d_i[j]);
+                    }
+                }
+            }
+        }
+        planes[..bs].fill(Block::zero());
+        let out = transpose_softspoken_planes(&planes, bs);
+        if self.malicious {
+            self.combine_send_chunk(stream, &out, bs)?;
+        }
+        self.cur_send_b0 += bs as u64;
+        Ok(out)
+    }
+
+    async fn recv_chunk_pipeline(
+        &mut self,
+        stream: &mut EmpStream,
+        bs: usize,
+    ) -> Result<Vec<Block>> {
+        let mut planes = vec![Block::zero(); 128 * bs];
+        let (u_canonical, v0) = sfvole_sender_butterfly(
+            SOFTSPOKEN_K,
+            &self.leaves_send[..SOFTSPOKEN_Q],
+            self.cur_recv_b0,
+            bs,
+            self.cur_recv_session,
+        );
+        for bit in 0..SOFTSPOKEN_K {
+            planes[bit * bs..(bit + 1) * bs].copy_from_slice(&v0[bit * bs..(bit + 1) * bs]);
+        }
+        let mut d_bufs = vec![Block::zero(); (SOFTSPOKEN_N - 1) * bs];
+        for i in 1..SOFTSPOKEN_N {
+            let (u_temp, v_i) = sfvole_sender_butterfly(
+                SOFTSPOKEN_K,
+                &self.leaves_send[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q],
+                self.cur_recv_b0,
+                bs,
+                self.cur_recv_session,
+            );
+            for j in 0..bs {
+                d_bufs[(i - 1) * bs + j] = u_canonical[j].xor(u_temp[j]);
+            }
+            for bit in 0..SOFTSPOKEN_K {
+                let dst = (i * SOFTSPOKEN_K + bit) * bs;
+                planes[dst..dst + bs].copy_from_slice(&v_i[bit * bs..(bit + 1) * bs]);
+            }
+        }
+        stream.send_block(&d_bufs).await?;
+        planes[..bs].copy_from_slice(&u_canonical);
+        let out = transpose_softspoken_planes(&planes, bs);
+        if self.malicious {
+            self.combine_recv_chunk(stream, &out, &u_canonical, bs)?;
+        }
+        self.cur_recv_b0 += bs as u64;
+        Ok(out)
+    }
+
+    fn combine_send_chunk(
+        &mut self,
+        stream: &mut EmpStream,
+        out: &[Block],
+        bs: usize,
+    ) -> Result<()> {
+        let seed = stream.get_digest()?;
+        let mut chi_prg = Prg::new(seed, 0);
+        let chi = chi_prg.random_block(bs);
+        let packed: Vec<Block> = (0..bs)
+            .map(|i| gf_pack_128(&out[i * 128..(i + 1) * 128]))
+            .collect();
+        self.check_q = self.check_q.xor(gf_inner_product(&chi, &packed));
+        Ok(())
+    }
+
+    fn combine_recv_chunk(
+        &mut self,
+        stream: &mut EmpStream,
+        out: &[Block],
+        u_canonical: &[Block],
+        bs: usize,
+    ) -> Result<()> {
+        let seed = stream.get_digest()?;
+        let mut chi_prg = Prg::new(seed, 0);
+        let chi = chi_prg.random_block(bs);
+        let packed: Vec<Block> = (0..bs)
+            .map(|i| gf_pack_128(&out[i * 128..(i + 1) * 128]))
+            .collect();
+        self.check_t = self.check_t.xor(gf_inner_product(&chi, &packed));
+        self.check_x = self.check_x.xor(gf_inner_product(&chi, u_canonical));
+        Ok(())
+    }
+}
+
+fn aes_dm_3(key: &Prp, tweak: Block) -> [Block; 3] {
+    [
+        aes_dm(key, 0, tweak),
+        aes_dm(key, 1, tweak),
+        aes_dm(key, 2, tweak),
+    ]
+}
+
+fn block_to_bools(block: Block) -> [bool; 128] {
+    let bytes = block.into_bytes();
+    let mut out = [false; 128];
+    for i in 0..128 {
+        out[i] = ((bytes[i / 8] >> (i % 8)) & 1) != 0;
+    }
+    out
+}
+
+fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {
+    let mut rows = Vec::with_capacity(planes.len() * BLOCK_BYTES);
+    for block in planes {
+        rows.extend_from_slice(block.as_bytes());
+    }
+    transpose_128_rows(&rows, bs * BLOCK_BYTES, bs * 128)
 }
 
 struct IknpSendState {
@@ -4185,6 +4679,31 @@ mod tests {
         assert_eq!(out, expected);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_softspoken4_roundtrip() {
+        let port = free_port();
+        let alice = tokio::spawn(async move {
+            let mut stream = EmpStream::listen(port).await.unwrap();
+            let mut soft = SoftSpoken4::new(Role::Alice, true).unwrap();
+            let out = soft.run(&mut stream, LIVE_IKNP_LENGTH).await.unwrap();
+            (soft.delta(), out)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(async move {
+            let mut stream = EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+                .await
+                .unwrap();
+            let mut soft = SoftSpoken4::new(Role::Bob, true).unwrap();
+            soft.run(&mut stream, LIVE_IKNP_LENGTH).await.unwrap()
+        });
+        let ((delta, sender), receiver) = timeout(LIVE_INTEROP_TIMEOUT, async {
+            (alice.await.unwrap(), bob.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_softspoken_relation(&receiver, delta, &sender);
+    }
+
     #[cfg(feature = "cpp-probes")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_csw_base_ot_interop() {
@@ -4194,6 +4713,15 @@ mod tests {
             run_live_csw_case(&bin, transport, TestOtRole::Send).await;
             run_live_csw_case(&bin, transport, TestOtRole::Recv).await;
         }
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_softspoken4_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_softspoken_probe();
+        run_live_softspoken_case(&bin, Role::Alice).await;
+        run_live_softspoken_case(&bin, Role::Bob).await;
     }
 
     async fn run_live_otco_case(bin: &Path, rust_transport: TestTransport, rust_role: TestOtRole) {
@@ -5224,12 +5752,102 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cpp-probes")]
+    async fn run_live_softspoken_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_role.party_id().to_string())
+            .arg(port.to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if rust_role == Role::Bob {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut stream = if rust_role == Role::Alice {
+            EmpStream::listen(port).await.unwrap()
+        } else {
+            EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+                .await
+                .unwrap()
+        };
+        let result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_softspoken_peer(&mut stream, rust_role),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust SoftSpoken failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust SoftSpoken timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ SoftSpoken probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
             TestTransport::Connect => EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
                 .await
                 .map_err(Into::into),
+        }
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn run_rust_softspoken_peer(stream: &mut EmpStream, role: Role) -> Result<()> {
+        let mut soft = SoftSpoken4::new(role, true)?;
+        let out = soft.run(stream, LIVE_IKNP_LENGTH).await?;
+        if role == Role::Alice {
+            stream.send_block(&[soft.delta()]).await?;
+            stream.send_block(&out).await?;
+            stream.flush().await?;
+            let ok = stream.recv_data(1).await?[0];
+            assert_eq!(ok, 1);
+        } else {
+            let delta = stream.recv_block(1).await?[0];
+            let sender = stream.recv_block(LIVE_IKNP_LENGTH).await?;
+            assert_softspoken_relation(&out, delta, &sender);
+            stream.send_data(&[1]).await?;
+            stream.flush().await?;
+        }
+        Ok(())
+    }
+
+    fn assert_softspoken_relation(receiver_data: &[Block], delta: Block, sender_data: &[Block]) {
+        assert_eq!(receiver_data.len(), sender_data.len());
+        for i in 0..receiver_data.len() {
+            let expected = if receiver_data[i].get_lsb() {
+                sender_data[i].xor(delta)
+            } else {
+                sender_data[i]
+            };
+            assert_eq!(receiver_data[i], expected, "SoftSpoken COT item {i}");
         }
     }
 
@@ -6014,6 +6632,25 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/csw_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    fn cpp_softspoken_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/softspoken_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/softspoken_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build .build/softspoken_probe");
+        }
+        assert!(
+            bin.exists(),
+            ".build/softspoken_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

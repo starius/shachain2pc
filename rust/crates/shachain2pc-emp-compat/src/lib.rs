@@ -1570,6 +1570,338 @@ pub struct Ag2pcTriplePool {
     cots_minted_since_check: bool,
 }
 
+pub struct Ag2pcProtocol {
+    party: Role,
+    fpre: Ag2pcTriplePool,
+    delta: Block,
+    prg: Prg,
+    process_input_calls: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ag2pcRevealRecipient {
+    Public,
+    Party(Role),
+}
+
+impl Ag2pcProtocol {
+    pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
+        let fpre = Ag2pcTriplePool::setup(streams, party, ssp).await?;
+        Ok(Self {
+            party,
+            delta: fpre.delta(),
+            fpre,
+            prg: Prg::random()?,
+            process_input_calls: 0,
+        })
+    }
+
+    pub fn party(&self) -> Role {
+        self.party
+    }
+
+    pub fn delta(&self) -> Block {
+        self.delta
+    }
+
+    pub fn process_input_calls(&self) -> usize {
+        self.process_input_calls
+    }
+
+    pub async fn flush_cot_check(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        self.fpre.maybe_flush_cot_check(streams).await
+    }
+
+    pub async fn end(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        self.fpre.end(streams).await
+    }
+
+    pub fn public_wires(&self, bits: &[u8]) -> Ag2pcSecureWires {
+        let mut wires = Ag2pcSecureWires {
+            lambda: bits.iter().map(|bit| bit & 1).collect(),
+            wire_bundle: vec![AShareBundle::default(); bits.len()],
+            label0: Vec::new(),
+            eval_label: Vec::new(),
+        };
+        match self.party {
+            Role::Alice => {
+                wires.label0 = bits
+                    .iter()
+                    .map(|bit| {
+                        if (bit & 1) == 0 {
+                            Block::zero()
+                        } else {
+                            self.delta
+                        }
+                    })
+                    .collect();
+            }
+            Role::Bob => {
+                wires.eval_label = vec![Block::zero(); bits.len()];
+            }
+        }
+        wires
+    }
+
+    pub async fn process_inputs(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        owners: &[Role],
+        bits_per_owner: &[Vec<u8>],
+    ) -> Result<Vec<Ag2pcSecureWires>> {
+        self.process_input_calls += 1;
+        if owners.len() != bits_per_owner.len() {
+            return Err(CompatError::BadAg2pcInputShape);
+        }
+        let mut offsets = Vec::with_capacity(owners.len());
+        let mut n_total = 0usize;
+        for bits in bits_per_owner {
+            offsets.push(n_total);
+            n_total = n_total
+                .checked_add(bits.len())
+                .ok_or(CompatError::LengthOverflow("AG2PC process_inputs"))?;
+        }
+        if n_total == 0 {
+            return Ok(vec![Ag2pcSecureWires::default(); owners.len()]);
+        }
+
+        let mut sw = Ag2pcSecureWires {
+            lambda: vec![0u8; n_total],
+            wire_bundle: self.fpre.draw(streams, n_total).await?,
+            label0: Vec::new(),
+            eval_label: Vec::new(),
+        };
+        if self.party == Role::Alice {
+            sw.label0 = self.prg.random_block(n_total);
+        } else {
+            sw.eval_label = vec![Block::zero(); n_total];
+        }
+
+        let mut owner_of_wire = Vec::with_capacity(n_total);
+        let mut own_x_bits = vec![0u8; n_total];
+        for (owner_index, owner) in owners.iter().enumerate() {
+            let offset = offsets[owner_index];
+            let bits = &bits_per_owner[owner_index];
+            for (i, bit) in bits.iter().enumerate() {
+                let idx = offset + i;
+                owner_of_wire.push(*owner);
+                if *owner == self.party {
+                    own_x_bits[idx] = bit & 1;
+                }
+            }
+        }
+
+        let share_msg: Vec<u8> = sw
+            .wire_bundle
+            .iter()
+            .map(|wire| block_lsb(wire.mac))
+            .collect();
+        let my_macs: Vec<Block> = sw.wire_bundle.iter().map(|wire| wire.mac).collect();
+        let d_me = hash_once(&blocks_to_bytes(&my_macs));
+
+        let mut own_x_packed = Vec::new();
+        let mut peer_idx_list = Vec::new();
+        for (i, owner) in owner_of_wire.iter().enumerate() {
+            if *owner == self.party {
+                own_x_packed.push(own_x_bits[i]);
+            } else {
+                peer_idx_list.push(i);
+            }
+        }
+        let (peer_share, d_peer, peer_x_packed) = self
+            .exchange_input_open(
+                streams,
+                &share_msg,
+                &d_me,
+                &own_x_packed,
+                n_total,
+                peer_idx_list.len(),
+            )
+            .await?;
+
+        let exp_macs: Vec<Block> = sw
+            .wire_bundle
+            .iter()
+            .zip(&peer_share)
+            .map(|(wire, share)| wire.key.xor(select_block(*share).and(self.delta)))
+            .collect();
+        if hash_once(&blocks_to_bytes(&exp_macs)) != d_peer {
+            return Err(CompatError::FeqMismatch);
+        }
+
+        for i in 0..n_total {
+            sw.lambda[i] = share_msg[i] ^ peer_share[i] ^ own_x_bits[i];
+        }
+        for (i, wire_index) in peer_idx_list.iter().enumerate() {
+            sw.lambda[*wire_index] ^= peer_x_packed[i] & 1;
+        }
+
+        if self.party == Role::Alice {
+            let labels: Vec<Block> = sw
+                .label0
+                .iter()
+                .zip(&sw.lambda)
+                .map(|(label0, lambda)| label0.xor(select_block(*lambda).and(self.delta)))
+                .collect();
+            streams.main.send_block(&labels).await?;
+            streams.main.flush().await?;
+        } else {
+            sw.eval_label = streams.main.recv_block(n_total).await?;
+        }
+
+        let mut out = Vec::with_capacity(owners.len());
+        for (owner_index, bits) in bits_per_owner.iter().enumerate() {
+            let start = offsets[owner_index];
+            out.push(sw.slice(start, start + bits.len())?);
+        }
+        Ok(out)
+    }
+
+    pub async fn decode(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        wires: &Ag2pcSecureWires,
+        recipient: Ag2pcRevealRecipient,
+    ) -> Result<Vec<u8>> {
+        self.check_secure_wires(wires)?;
+        match recipient {
+            Ag2pcRevealRecipient::Public => {
+                let local = self.decode_to_party(streams, wires, Role::Bob).await?;
+                if self.party == Role::Bob {
+                    streams.main.send_data(&local).await?;
+                    streams.main.flush().await?;
+                    Ok(local)
+                } else {
+                    Ok(streams
+                        .main
+                        .recv_data(wires.len())
+                        .await?
+                        .into_iter()
+                        .map(|bit| bit & 1)
+                        .collect())
+                }
+            }
+            Ag2pcRevealRecipient::Party(role) => self.decode_to_party(streams, wires, role).await,
+        }
+    }
+
+    async fn decode_to_party(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        wires: &Ag2pcSecureWires,
+        role: Role,
+    ) -> Result<Vec<u8>> {
+        let n = wires.len();
+        let my_share: Vec<u8> = wires
+            .wire_bundle
+            .iter()
+            .map(|wire| block_lsb(wire.mac))
+            .collect();
+        let my_macs: Vec<Block> = wires.wire_bundle.iter().map(|wire| wire.mac).collect();
+        if self.party != role {
+            let digest = hash_once(&blocks_to_bytes(&my_macs));
+            streams.main.send_data(&my_share).await?;
+            streams.main.send_data(&digest).await?;
+            streams.main.flush().await?;
+            Ok(Vec::new())
+        } else {
+            let peer_share = streams.main.recv_data(n).await?;
+            let peer_digest: [u8; HASH_DIGEST_BYTES] = streams
+                .main
+                .recv_data(HASH_DIGEST_BYTES)
+                .await?
+                .try_into()
+                .expect("digest length");
+            let exp_macs: Vec<Block> = wires
+                .wire_bundle
+                .iter()
+                .zip(&peer_share)
+                .map(|(wire, share)| wire.key.xor(select_block(*share).and(self.delta)))
+                .collect();
+            if hash_once(&blocks_to_bytes(&exp_macs)) != peer_digest {
+                return Err(CompatError::FeqMismatch);
+            }
+            Ok((0..n)
+                .map(|i| my_share[i] ^ wires.lambda[i] ^ (peer_share[i] & 1))
+                .map(|bit| bit & 1)
+                .collect())
+        }
+    }
+
+    async fn exchange_input_open(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        share_msg: &[u8],
+        d_me: &[u8; HASH_DIGEST_BYTES],
+        own_x_packed: &[u8],
+        n_total: usize,
+        peer_x_len: usize,
+    ) -> Result<(Vec<u8>, [u8; HASH_DIGEST_BYTES], Vec<u8>)> {
+        match self.party {
+            Role::Alice => {
+                let ((), received) = tokio::try_join!(
+                    ag2pc_send_input_open(&mut streams.main, share_msg, d_me, own_x_packed),
+                    ag2pc_recv_input_open(&mut streams.sibling, n_total, peer_x_len)
+                )?;
+                Ok(received)
+            }
+            Role::Bob => {
+                let ((), received) = tokio::try_join!(
+                    ag2pc_send_input_open(&mut streams.sibling, share_msg, d_me, own_x_packed),
+                    ag2pc_recv_input_open(&mut streams.main, n_total, peer_x_len)
+                )?;
+                Ok(received)
+            }
+        }
+    }
+
+    fn check_secure_wires(&self, wires: &Ag2pcSecureWires) -> Result<()> {
+        let n = wires.len();
+        if wires.wire_bundle.len() != n {
+            return Err(CompatError::BadAg2pcInputShape);
+        }
+        match self.party {
+            Role::Alice if wires.label0.len() != n => Err(CompatError::BadAg2pcInputShape),
+            Role::Bob if wires.eval_label.len() != n => Err(CompatError::BadAg2pcInputShape),
+            _ => Ok(()),
+        }
+    }
+}
+
+async fn ag2pc_send_input_open(
+    stream: &mut EmpStream,
+    share_msg: &[u8],
+    digest: &[u8; HASH_DIGEST_BYTES],
+    own_x_packed: &[u8],
+) -> Result<()> {
+    stream.send_data(share_msg).await?;
+    stream.send_data(digest).await?;
+    if !own_x_packed.is_empty() {
+        stream.send_data(own_x_packed).await?;
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn ag2pc_recv_input_open(
+    stream: &mut EmpStream,
+    n_total: usize,
+    peer_x_len: usize,
+) -> Result<(Vec<u8>, [u8; HASH_DIGEST_BYTES], Vec<u8>)> {
+    let peer_share = stream.recv_data(n_total).await?;
+    let d_peer = stream
+        .recv_data(HASH_DIGEST_BYTES)
+        .await?
+        .try_into()
+        .expect("digest length");
+    let peer_x = if peer_x_len == 0 {
+        Vec::new()
+    } else {
+        stream.recv_data(peer_x_len).await?
+    };
+    Ok((peer_share, d_peer, peer_x))
+}
+
 impl Ag2pcTriplePool {
     pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
         if !streams.main.fs_enabled() {
@@ -5062,6 +5394,36 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rust_ag2pc_protocol_process_inputs_and_decode_roundtrip() {
+        let port = free_port();
+        let alice = tokio::spawn(async move {
+            let mut streams =
+                Ag2pcStreams::open(Role::Alice, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    .await
+                    .unwrap();
+            run_rust_ag2pc_protocol_script(&mut streams, Role::Alice)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(async move {
+            let mut streams = Ag2pcStreams::open(Role::Bob, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .await
+                .unwrap();
+            run_rust_ag2pc_protocol_script(&mut streams, Role::Bob)
+                .await
+                .unwrap()
+        });
+        let (alice_out, bob_out) = timeout(LIVE_INTEROP_TIMEOUT, async {
+            (alice.await.unwrap(), bob.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(alice_out, bob_out);
+        assert_eq!(alice_out, vec![1, 0, 1, 1, 0, 1]);
+    }
+
     #[cfg(feature = "cpp-probes")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_csw_base_ot_interop() {
@@ -5089,6 +5451,15 @@ mod tests {
         let bin = cpp_ag2pc_triple_pool_probe();
         run_live_ag2pc_triple_pool_case(&bin, Role::Alice).await;
         run_live_ag2pc_triple_pool_case(&bin, Role::Bob).await;
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_cpp_ag2pc_protocol_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_ag2pc_protocol_probe();
+        run_live_ag2pc_protocol_case(&bin, Role::Alice).await;
+        run_live_ag2pc_protocol_case(&bin, Role::Bob).await;
     }
 
     async fn run_live_otco_case(bin: &Path, rust_transport: TestTransport, rust_role: TestOtRole) {
@@ -6254,6 +6625,83 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cpp-probes")]
+    async fn run_live_ag2pc_protocol_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_role.party_id().to_string())
+            .arg(port.to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if rust_role == Role::Bob {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            Ag2pcStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC protocol stream open failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC protocol stream open timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+        let result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_ag2pc_protocol_script(&mut streams, rust_role),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC protocol failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC protocol timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ AG2PC protocol probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -6305,6 +6753,44 @@ mod tests {
         ));
         pool.end(streams).await?;
         Ok(())
+    }
+
+    async fn run_rust_ag2pc_protocol_script(
+        streams: &mut Ag2pcStreams,
+        role: Role,
+    ) -> Result<Vec<u8>> {
+        let mut protocol = Ag2pcProtocol::setup(streams, role, 40).await?;
+        let alice_bits = if role == Role::Alice {
+            vec![1, 0]
+        } else {
+            vec![0, 0]
+        };
+        let bob_bits = if role == Role::Bob { vec![1] } else { vec![0] };
+        let inputs = protocol
+            .process_inputs(streams, &[Role::Alice, Role::Bob], &[alice_bits, bob_bits])
+            .await?;
+        protocol.flush_cot_check(streams).await?;
+
+        let mut out = Vec::new();
+        out.extend(
+            protocol
+                .decode(streams, &inputs[0], Ag2pcRevealRecipient::Public)
+                .await?,
+        );
+        out.extend(
+            protocol
+                .decode(streams, &inputs[1], Ag2pcRevealRecipient::Public)
+                .await?,
+        );
+        let public = protocol.public_wires(&[1, 0, 1]);
+        out.extend(
+            protocol
+                .decode(streams, &public, Ag2pcRevealRecipient::Public)
+                .await?,
+        );
+        assert_eq!(protocol.process_input_calls(), 1);
+        protocol.end(streams).await?;
+        Ok(out)
     }
 
     #[cfg(feature = "cpp-probes")]
@@ -7170,6 +7656,28 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/ag2pc_triple_pool_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    fn cpp_ag2pc_protocol_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/ag2pc_protocol_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/ag2pc_protocol_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "failed to build .build/ag2pc_protocol_probe"
+            );
+        }
+        assert!(
+            bin.exists(),
+            ".build/ag2pc_protocol_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

@@ -80,25 +80,17 @@ path.
 Be explicit about the target, because it decides whether this is the right lever.
 A cache run has three serial phases at the transport: trunk, branch (precompute),
 and reveal. Recursion shrinks only the **branch** phase -- it collapses one-SHA
-prefix steps into upper tiles, cutting branch instances roughly in half (31 -> 17
-for 256 leaves). It does not touch trunk or reveal.
+prefix steps into upper tiles, cutting branch instances from 255 to 17 for 256
+leaves versus the fanout-1 baseline. It does not touch trunk or reveal.
 
 Reveal is one `PUBLIC` reveal per secret and runs *after* precompute, with no
-overlap. At 50 ms RTT, 256 sequential reveals cost about 12.9 s (Section 1). So:
-
-- **End-to-end, back-to-back batch** (all leaves revealed in a burst): the
-  round-bearing steps are roughly trunk (~3) + branch + reveal (256). Recursion
-  removes ~14 of ~290 -- about 5%. Reveal dominates, and only the deferred reveal
-  optimization (Section 1) attacks it.
-- **Upfront precompute / cache refill** (reveal amortized at one RTT per channel
-  update over time): the cost you wait for is trunk + branch ~= 34 steps, and
-  recursion removes ~14 -- about 40%. This is the regime where recursion clearly
-  wins.
-
-So recursion is the right lever for refill/precompute latency and for budget
-(Section 6), not for steady-state per-update latency. If end-to-end burst latency
-is the goal, do the reveal optimization first. This plan assumes the
-precompute/refill regime.
+overlap. At 50 ms RTT, reveal costs about one RTT per secret. Measurements in
+Section 9 show that precompute still dominates for the tested aligned ranges:
+recursive branch cost is about 0.118 s/secret, while reveal is about
+0.050 s/secret. So recursion is the right lever for cache refill/precompute
+latency and for budget (Section 6). The deferred reveal idea in Section 1 remains
+useful, but it attacks the smaller measured term and has the integrity caveat
+described there.
 
 ## 3. High-level shape
 
@@ -297,7 +289,7 @@ plan should not assume eager storage is the final answer for 8k+ batches.
    fall back) for unaligned ranges, not just circuit shapes. `verify_circuit`'s
    `RunTilePlain` today only covers `bit_offset == 0`; extend it.
 4. Implement recursive range covering incrementally. Land the aligned
-   power-of-two case first -- it is the clean ~2x branch win and is simple to get
+   power-of-two case first -- it is the clean branch win and is simple to get
    right. For boundaries, fall back to the already-validated bottom-16-tile +
    one-SHA scheme rather than introducing variable-height boundary tiles; defer
    the latter until the aligned path is measured and trusted.
@@ -314,16 +306,10 @@ plan should not assume eager storage is the final answer for 8k+ batches.
 
 ## 9. Expected effect
 
-For remote peers, recursion cuts branch instances (31 -> 17 for 256 leaves), which
-reduces the precompute/refill latency and extends the per-seed budget by ~1.8x.
-The budget part is real and RTT-independent.
-
-Be honest about end-to-end burst latency, though. Reveal is unchanged at one RTT
-per secret and runs after precompute with no overlap, so for a back-to-back
-256-secret batch at 50 ms RTT (~12.9 s of reveal) recursion removes only ~5% of
-the round-bearing steps -- the reveal phase, not branches, dominates that case,
-and only the deferred reveal optimization (Section 1) attacks it. See Section 2,
-"Which latency this actually reduces."
+For remote peers, recursion cuts branch instances and therefore reduces
+precompute/refill latency. Versus the fanout-1 baseline, 256 leaves drop from 255
+branch instances to 17; versus the already-tiled hybrid shape, this is the smaller
+31 -> 17 improvement. The budget part is real and RTT-independent.
 
 The main implementation risk is the recursive covering for unaligned/boundary
 ranges (Section 5); mitigate by landing the aligned case first and falling back to
@@ -350,7 +336,7 @@ one-time trunk (5.5-8 s) amortizes, so preReveal/secret falls toward it as the
 batch grows. Branch instances match the cover formula (256->17, 1024->69,
 8192->547, the last with a height-1 top level).
 
-Two corrections to the expectations above, from the measurement:
+The measurements pin two useful points:
 
 1. **Recursion vs pure one-SHA is a ~5.4x per-secret precompute win** (0.64 ->
    0.118 s), not ~2x. The ~2x figure was recursion vs the already-tiled hybrid;
@@ -358,11 +344,10 @@ Two corrections to the expectations above, from the measurement:
    256 leaves) and tiling collapses them. Budget headroom vs one-SHA is likewise
    ~15x, not ~1.8x.
 2. **Precompute, not reveal, dominates at 50 ms.** Branch is ~0.118 s/secret vs
-   reveal ~0.050 s/secret (one RTT). The "reveal dominates" note above
-   under-counted per-instance round cost: a 15-edge tile costs ~1.8 s at 50 ms,
-   not the ~0.5 s assumed, so the branch phase is large in absolute terms. The
-   phase recursion optimizes is therefore the dominant one; the deferred reveal
-   optimization (Section 1) addresses the smaller ~0.05 s/secret term.
+   reveal ~0.050 s/secret (one RTT). A 15-edge tile costs ~1.8 s at 50 ms, so
+   the branch phase is large in absolute terms. The phase recursion optimizes is
+   therefore the dominant one; the deferred reveal optimization (Section 1)
+   addresses the smaller ~0.05 s/secret term.
 
 ## 10. Recommended sequencing
 

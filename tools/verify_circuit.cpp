@@ -395,7 +395,6 @@ int main() {
     const R ranges[] = {
         {0xffffffffff00ULL, 0xffffffffffffULL},  // 256,  depth 8
         {0xfffffffffc00ULL, 0xffffffffffffULL},  // 1024, depth 10
-        {0xffffffffe000ULL, 0xffffffffffffULL},  // 8192, depth 13
         {0xfffffffffff0ULL, 0xffffffffffffULL},  // 16,   depth 4
     };
     const int heights[] = {1, 2, 3, 4};

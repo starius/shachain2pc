@@ -42,9 +42,9 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
 # (emp-ag2pc/helper.h, fpre.h, 2pc.h, the old emp::C2PC) which the new emp install
 # no longer provides; their tools/*.cpp are kept for the eventual Rust re-port but
 # are NOT built. See docs/new-emp-ag2pc-notes.md.
-EMP_BINS := $(BUILD)/party
+EMP_BINS := $(BUILD)/party $(BUILD)/ag2pc_session_probe
 
-.PHONY: all plain mpc clean test test-cache-tamper demo cheat
+.PHONY: all plain mpc clean test test-cache-tamper test-ag2pc-probe demo cheat
 all: plain mpc
 plain: $(PLAIN_BINS)
 mpc: $(EMP_BINS)
@@ -71,11 +71,38 @@ $(BUILD)/party: demo/party.cpp $(PROTO_SRC) $(RUN_DEPS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) demo/party.cpp $(PROTO_SRC) \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
+$(BUILD)/ag2pc_session_probe: tools/ag2pc_session_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
 # `test` builds the new-emp party (compile gate) and runs the plain (no-MPC) KATs:
 # the BOLT-03 reference vectors and the plaintext circuit verifier.
 test: $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit $(BUILD)/party
 	./$(BUILD)/ref_kat
 	./$(BUILD)/verify_circuit
+
+test-ag2pc-probe: $(BUILD)/ag2pc_session_probe
+	set -e; \
+	port=$$(python3 -c 'import random; print(random.randrange(20000, 60000))'); \
+	SHACHAIN2PC_TIMEOUT_SECS=60 ./$(BUILD)/ag2pc_session_probe 1 $$port \
+	  >$(BUILD)/ag2pc_probe_alice.jsonl \
+	  2>$(BUILD)/ag2pc_probe_alice.err & \
+	alice=$$!; \
+	sleep 0.2; \
+	SHACHAIN2PC_TIMEOUT_SECS=60 ./$(BUILD)/ag2pc_session_probe 2 $$port \
+	  >$(BUILD)/ag2pc_probe_bob.jsonl \
+	  2>$(BUILD)/ag2pc_probe_bob.err; \
+	bob=$$?; \
+	wait $$alice; \
+	alice_status=$$?; \
+	test $$alice_status -eq 0; \
+	test $$bob -eq 0; \
+	test ! -s $(BUILD)/ag2pc_probe_alice.err; \
+	test ! -s $(BUILD)/ag2pc_probe_bob.err; \
+	test $$(wc -l <$(BUILD)/ag2pc_probe_alice.jsonl) -eq 9; \
+	test $$(wc -l <$(BUILD)/ag2pc_probe_bob.jsonl) -eq 9; \
+	python3 tools/check_ag2pc_probe.py \
+	  $(BUILD)/ag2pc_probe_alice.jsonl $(BUILD)/ag2pc_probe_bob.jsonl
 
 test-cache-tamper: $(BUILD)/party $(BUILD)/ref_cli
 	./demo/cache_tamper_test.sh

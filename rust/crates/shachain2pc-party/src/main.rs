@@ -773,14 +773,24 @@ async fn authenticate_seed_inputs(
         Role::Bob => bob_bits.copy_from_slice(&share_bits),
     }
     share_bits.zeroize();
-    let mut bits_per_owner = vec![bob_bits, alice_bits];
-    let inputs = session
-        .process_inputs(streams, &[Role::Bob, Role::Alice], &bits_per_owner)
+    let mut bob_owner_bits = vec![bob_bits];
+    let bob_inputs = session
+        .process_inputs(streams, &[Role::Bob], &bob_owner_bits)
         .await?;
-    for bits in &mut bits_per_owner {
+    for bits in &mut bob_owner_bits {
         bits.zeroize();
     }
-    Ok(Ag2pcSecureWires::concat(&inputs))
+    let mut alice_owner_bits = vec![alice_bits];
+    let alice_inputs = session
+        .process_inputs(streams, &[Role::Alice], &alice_owner_bits)
+        .await?;
+    for bits in &mut alice_owner_bits {
+        bits.zeroize();
+    }
+    Ok(Ag2pcSecureWires::concat(&[
+        bob_inputs[0].clone(),
+        alice_inputs[0].clone(),
+    ]))
 }
 
 fn value_from_bits(bits: &[u8]) -> Result<Value32, PartyError> {

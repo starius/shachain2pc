@@ -361,6 +361,178 @@ pub fn garble_hash_online(a: Block, b: Block, gate_index: u64, row: u64) -> [Blo
     blocks
 }
 
+const CGGM_LSB_CLEAR_MASK: Block = Block::from_bytes([
+    0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+]);
+
+fn ccrh_hash(block: Block) -> Block {
+    let sigma = block.sigma();
+    zero_key_prp().permute_one(sigma).xor(sigma)
+}
+
+pub fn cggm_bit_reverse(mut x: u32, depth: usize) -> u32 {
+    let mut out = 0;
+    for _ in 0..depth {
+        out = (out << 1) | (x & 1);
+        x >>= 1;
+    }
+    out
+}
+
+fn cggm_expand_level(
+    leaves: &mut [Block],
+    parents: usize,
+    want_right: bool,
+    clear_lsb: bool,
+) -> Block {
+    let mut sum = Block::zero();
+    for j in 0..parents {
+        let parent = leaves[j];
+        let mut left = ccrh_hash(parent);
+        let mut right = parent.xor(left);
+        if clear_lsb {
+            left = left.and(CGGM_LSB_CLEAR_MASK);
+            right = right.and(CGGM_LSB_CLEAR_MASK);
+        }
+        leaves[parents + j] = right;
+        leaves[j] = left;
+        sum = sum.xor(if want_right { right } else { left });
+    }
+    sum
+}
+
+pub fn cggm_build_sender(
+    depth: usize,
+    delta: Block,
+    root: Block,
+    clear_leaf_lsb: bool,
+) -> (Vec<Block>, Vec<Block>) {
+    assert!(depth >= 1);
+    let q = 1usize << depth;
+    let mut leaves = vec![Block::zero(); q];
+    let mut k0 = vec![Block::zero(); depth];
+
+    leaves[0] = root;
+    leaves[1] = delta.xor(root);
+    k0[0] = leaves[0];
+
+    for level in 2..depth {
+        let parents = 1usize << (level - 1);
+        k0[level - 1] = cggm_expand_level(&mut leaves, parents, false, false);
+    }
+    if depth >= 2 {
+        let parents = 1usize << (depth - 1);
+        k0[depth - 1] = cggm_expand_level(&mut leaves, parents, false, clear_leaf_lsb);
+    }
+    (leaves, k0)
+}
+
+pub fn cggm_eval_receiver(
+    depth: usize,
+    alpha: usize,
+    recv_keys: &[Block],
+    clear_leaf_lsb: bool,
+) -> Vec<Block> {
+    assert!(depth >= 1);
+    assert_eq!(recv_keys.len(), depth);
+    let q = 1usize << depth;
+    let mut leaves = vec![Block::zero(); q];
+
+    let alpha_1 = (alpha >> (depth - 1)) & 1;
+    let alpha_bar_1 = 1 - alpha_1;
+    leaves[alpha_bar_1] = recv_keys[0];
+    let mut pos = alpha_1;
+
+    for level in 2..=depth {
+        let half = 1usize << (level - 1);
+        let alpha_i = (alpha >> (depth - level)) & 1;
+        let alpha_bar_i = 1 - alpha_i;
+        let clear = clear_leaf_lsb && level == depth;
+
+        let sum_pre = cggm_expand_level(&mut leaves, half, alpha_bar_i != 0, clear);
+        let junk = leaves[pos];
+        leaves[pos] = Block::zero();
+        leaves[pos + half] = Block::zero();
+        let mut sibling = sum_pre.xor(junk).xor(recv_keys[level - 1]);
+        if clear {
+            sibling = sibling.and(CGGM_LSB_CLEAR_MASK);
+        }
+        leaves[pos + alpha_bar_i * half] = sibling;
+        pos += alpha_i * half;
+    }
+    leaves
+}
+
+fn aes_dm(key: &Prp, counter: u64, tweak: Block) -> Block {
+    let pt = Block::make(0, counter).xor(tweak);
+    key.permute_one(pt).xor(pt)
+}
+
+pub fn sfvole_sender_butterfly(
+    k: usize,
+    leaves: &[Block],
+    counter_base: u64,
+    bs: usize,
+    session_id: u64,
+) -> (Vec<Block>, Vec<Block>) {
+    assert!(k >= 2);
+    assert_eq!(leaves.len(), 1usize << k);
+    let q = 1usize << k;
+    let key = Prp::new(Block::make(0, session_id));
+    let mut u = vec![Block::zero(); bs];
+    let mut v = vec![Block::zero(); k * bs];
+
+    for j in 0..bs {
+        let mut r = vec![Block::zero(); q];
+        for x in 0..q {
+            r[x] = aes_dm(&key, counter_base + j as u64, leaves[x]);
+            u[j] = u[j].xor(r[x]);
+        }
+        for plane in 0..k {
+            let mut acc = Block::zero();
+            for (x, value) in r.iter().enumerate() {
+                if ((x >> plane) & 1) != 0 {
+                    acc = acc.xor(*value);
+                }
+            }
+            v[plane * bs + j] = acc;
+        }
+    }
+    (u, v)
+}
+
+pub fn sfvole_receiver_butterfly(
+    k: usize,
+    alpha: usize,
+    leaves: &[Block],
+    counter_base: u64,
+    bs: usize,
+    session_id: u64,
+) -> Vec<Block> {
+    assert!(k >= 2);
+    assert_eq!(leaves.len(), 1usize << k);
+    let q = 1usize << k;
+    let key = Prp::new(Block::make(0, session_id));
+    let mut w = vec![Block::zero(); k * bs];
+
+    for j in 0..bs {
+        let mut r = vec![Block::zero(); q];
+        for y in 0..q {
+            r[y] = aes_dm(&key, counter_base + j as u64, leaves[alpha ^ y]);
+        }
+        for plane in 0..k {
+            let mut acc = Block::zero();
+            for (y, value) in r.iter().enumerate() {
+                if ((y >> plane) & 1) != 0 {
+                    acc = acc.xor(*value);
+                }
+            }
+            w[plane * bs + j] = acc;
+        }
+    }
+    w
+}
+
 pub struct P256 {
     group: EcGroup,
 }
@@ -2944,6 +3116,18 @@ mod tests {
         hex_encode(block.as_bytes())
     }
 
+    fn assert_block_json_array(fixture: &Value, name: &str, blocks: &[Block]) {
+        let expected = fixture[name].as_array().unwrap();
+        assert_eq!(expected.len(), blocks.len(), "{name} length mismatch");
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(
+                block_json(*block),
+                expected[i].as_str().unwrap(),
+                "{name}[{i}]"
+            );
+        }
+    }
+
     fn otco_data() -> ([Block; 8], [Block; 8]) {
         let data0 = std::array::from_fn(|i| {
             Block::make(
@@ -3146,6 +3330,56 @@ mod tests {
                 end: 5
             })
         ));
+    }
+
+    #[test]
+    fn softspoken_helpers_match_cpp_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../compat/ag2pc/softspoken-helper-v1.json"
+        ))
+        .unwrap();
+        let k = fixture["k"].as_u64().unwrap() as usize;
+        let bs = fixture["bs"].as_u64().unwrap() as usize;
+        let alpha_field = fixture["alpha_field"].as_u64().unwrap() as usize;
+        let session_id = fixture["session_id"].as_u64().unwrap();
+        let counter_base = fixture["counter_base"].as_u64().unwrap();
+
+        let delta = Block::make(0x0112_2334_4556_6778, 0x899a_abbc_cdde_eff1);
+        let root = Block::make(0x0103_0507_090b_0d0f, 0x1113_1517_191b_1d1f);
+        let (sender_leaves, k0) = cggm_build_sender(k, delta, root, false);
+
+        let alpha_path = cggm_bit_reverse(alpha_field as u32, k) as usize;
+        assert_eq!(alpha_path, fixture["alpha_path"].as_u64().unwrap() as usize);
+        let recv_keys: Vec<Block> = (1..=k)
+            .map(|level| {
+                let alpha_i = ((alpha_path >> (k - level)) & 1) != 0;
+                let alpha_bar_i = !alpha_i;
+                if alpha_bar_i {
+                    k0[level - 1].xor(delta)
+                } else {
+                    k0[level - 1]
+                }
+            })
+            .collect();
+        let receiver_leaves = cggm_eval_receiver(k, alpha_path, &recv_keys, false);
+        let (sfvole_u, sfvole_v) =
+            sfvole_sender_butterfly(k, &sender_leaves, counter_base, bs, session_id);
+        let sfvole_w = sfvole_receiver_butterfly(
+            k,
+            alpha_field,
+            &receiver_leaves,
+            counter_base,
+            bs,
+            session_id,
+        );
+
+        assert_block_json_array(&fixture, "k0", &k0);
+        assert_block_json_array(&fixture, "recv_keys", &recv_keys);
+        assert_block_json_array(&fixture, "sender_leaves", &sender_leaves);
+        assert_block_json_array(&fixture, "receiver_leaves", &receiver_leaves);
+        assert_block_json_array(&fixture, "sfvole_u", &sfvole_u);
+        assert_block_json_array(&fixture, "sfvole_v", &sfvole_v);
+        assert_block_json_array(&fixture, "sfvole_w", &sfvole_w);
     }
 
     #[test]

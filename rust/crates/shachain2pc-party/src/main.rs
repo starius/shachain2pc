@@ -120,7 +120,7 @@ impl IndexSpec {
         match self {
             Self::Single(index) => Ok(*index),
             Self::Range { .. } => Err(PartyError::UnsupportedMode(
-                "Rust range execution is not implemented until the session/carry sync phase",
+                "this operation requires a single index, not a range",
             )),
         }
     }

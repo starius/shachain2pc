@@ -1,8 +1,8 @@
 use shachain2pc_circuit::{
     batch_digest, build_chunk_circuit, build_circuit_for_index, build_tile_circuit, cache_digest,
-    check_chunk_circuit, check_tile_circuit, chunk_spec_digest, circuit_digest, load_bristol,
-    split_chain_bits, to_emp_gate_array, tree_digest, Circuit, CACHE_TILE_HEIGHT,
-    CACHE_TILE_LEAVES, DEFAULT_SHA256_COMPRESS_PATH,
+    check_chunk_circuit, check_tile_circuit, chunk_spec_digest, load_bristol, plan_tile_levels,
+    split_chain_bits, tree_digest, Circuit, CACHE_TILE_HEIGHT, CACHE_TILE_LEAVES,
+    DEFAULT_SHA256_COMPRESS_PATH,
 };
 use shachain2pc_emp_compat::{AuthenticatedBits, C2pc, C2pcCircuit, CompatError};
 use shachain2pc_emp_wire::{EmpStream, EmpStreams, WireError};
@@ -197,6 +197,7 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
             }
             RequestedMode::Cache => {
                 let trunk_chunk_blocks = trunk_chunk_blocks_from_env(16);
+                let tile_fanout = tile_fanout_from_env()?;
                 run_derivation_cache(
                     args.role,
                     args.port,
@@ -204,6 +205,7 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
                     args.share,
                     args.peer_ip,
                     trunk_chunk_blocks,
+                    tile_fanout,
                 )
                 .await?
             }
@@ -232,10 +234,8 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
     let mut timing = PhaseTiming::new(args.role, index);
     let sha = load_bristol(default_sha256_compress_path())?;
     let circuit = build_circuit_for_index(index, &sha)?;
-    let gate_arr = to_emp_gate_array(&circuit);
-    let digest = circuit_digest(&circuit, &gate_arr);
+    let digest = batch_digest(&[index.get()], &sha);
     let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
-    drop(gate_arr);
     drop(circuit);
     timing.mark("build_circuit");
 
@@ -402,6 +402,7 @@ async fn run_derivation_cache(
     share: Value32,
     peer_ip: IpAddr,
     trunk_chunk_blocks: i32,
+    tile_fanout: usize,
 ) -> Result<Vec<(Index48, Value32)>, PartyError> {
     let lo = indices
         .first()
@@ -413,6 +414,7 @@ async fn run_derivation_cache(
         .get();
     let mut timing = PhaseTiming::new(role, Index48::new(lo).expect("parser checked index"));
     let sha = load_bristol(default_sha256_compress_path())?;
+    let tile_height = tile_height_for_fanout(tile_fanout)?;
     let (split, low_mask, high_mask) = range_split_masks(&[
         Index48::new(lo).expect("parser checked index"),
         Index48::new(hi).expect("parser checked index"),
@@ -434,17 +436,53 @@ async fn run_derivation_cache(
         trunk_circuits.push(c2pc_circuit);
     }
 
-    let tile_circuit_raw = build_tile_circuit(&sha, CACHE_TILE_HEIGHT)?;
-    check_tile_circuit(&tile_circuit_raw, CACHE_TILE_HEIGHT)?;
-    let tile_circuit = C2pcCircuit::from_circuit(&tile_circuit_raw)?;
-    max_ands = max_ands.max(tile_circuit.num_ands());
+    let depth = if split < 0 {
+        0usize
+    } else {
+        split as usize + 1
+    };
+    let aligned = split >= 0 && (lo & low_mask) == 0 && (hi & low_mask) == low_mask;
+    let recursive_levels = if tile_height >= 1 && aligned && depth >= tile_height {
+        Some(plan_tile_levels(depth, tile_height)?)
+    } else {
+        None
+    };
+    let mut recursive_circuits = Vec::new();
+    if let Some(levels) = &recursive_levels {
+        recursive_circuits.reserve(levels.len());
+        for &level in levels {
+            let raw = build_tile_circuit(&sha, level.bit_offset, level.height)?;
+            check_tile_circuit(&raw, level.height)?;
+            let c2pc_circuit = C2pcCircuit::from_circuit(&raw)?;
+            max_ands = max_ands.max(c2pc_circuit.num_ands());
+            recursive_circuits.push((level, c2pc_circuit));
+        }
+    }
+
+    let tile_circuit = if tile_fanout >= 2 {
+        let raw = build_tile_circuit(&sha, 0, CACHE_TILE_HEIGHT)?;
+        check_tile_circuit(&raw, CACHE_TILE_HEIGHT)?;
+        let c2pc_circuit = C2pcCircuit::from_circuit(&raw)?;
+        max_ands = max_ands.max(c2pc_circuit.num_ands());
+        Some(c2pc_circuit)
+    } else {
+        None
+    };
 
     let one_step_raw = build_chunk_circuit(&sha, &[0], false)?;
     check_chunk_circuit(&one_step_raw)?;
     let one_step_circuit = C2pcCircuit::from_circuit(&one_step_raw)?;
     max_ands = max_ands.max(one_step_circuit.num_ands());
 
-    let digest = cache_digest(lo, hi, trunk_chunk_blocks, CACHE_TILE_HEIGHT as i32, &sha);
+    let digest = cache_digest(
+        lo,
+        hi,
+        trunk_chunk_blocks,
+        i32::try_from(tile_fanout).map_err(|_| {
+            PartyError::UnsupportedMode("SHACHAIN2PC_TILE_FANOUT is too large for this platform")
+        })?,
+        &sha,
+    );
     timing.mark("build_cache_circuits");
 
     let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
@@ -470,12 +508,76 @@ async fn run_derivation_cache(
         });
     }
 
+    if !recursive_circuits.is_empty() {
+        let mut roots = vec![trunk.clone()];
+        for (level_index, (level, circuit)) in recursive_circuits.iter().enumerate() {
+            let is_bottom = level_index + 1 == recursive_circuits.len();
+            if is_bottom {
+                let mut tiles = Vec::with_capacity(roots.len());
+                for root in roots {
+                    c2pc.reset_circuit(circuit.clone());
+                    let tile =
+                        run_carried_authenticated_stage(&mut c2pc, &mut streams, &root).await?;
+                    tiles.push(tile);
+                    timing.mark("cache_tile");
+                }
+
+                let leaf_mask = (1u64 << level.height) - 1;
+                let mut results = vec![None; (hi - lo + 1) as usize];
+                let mut reveal_index = hi;
+                loop {
+                    let suffix = reveal_index & low_mask;
+                    let tile_index = (suffix >> level.height) as usize;
+                    let slot = (suffix & leaf_mask) as usize;
+                    let tile = tiles.get(tile_index).ok_or(PartyError::UnsupportedMode(
+                        "shachain2pc: missing recursive cached tile",
+                    ))?;
+                    let leaf = tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?;
+                    let bits = c2pc
+                        .reveal_authenticated_public(&mut streams, &leaf)
+                        .await?;
+                    results[(reveal_index - lo) as usize] = Some(value_from_bits(&bits)?);
+                    if reveal_index == lo {
+                        break;
+                    }
+                    reveal_index -= 1;
+                }
+                streams.main.flush().await?;
+                timing.mark("cache_reveal");
+
+                return indices
+                    .iter()
+                    .map(|index| {
+                        let offset = (index.get() - lo) as usize;
+                        Ok((
+                            *index,
+                            results[offset].ok_or(PartyError::UnsupportedMode(
+                                "shachain2pc: missing recursive cached result",
+                            ))?,
+                        ))
+                    })
+                    .collect();
+            }
+
+            let mut next = Vec::with_capacity(roots.len() * (1usize << level.height));
+            for root in roots {
+                c2pc.reset_circuit(circuit.clone());
+                let tile = run_carried_authenticated_stage(&mut c2pc, &mut streams, &root).await?;
+                for slot in 0..(1usize << level.height) {
+                    next.push(tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?);
+                }
+                timing.mark("cache_tile");
+            }
+            roots = next;
+        }
+    }
+
     let mut stack_bits = Vec::new();
     let mut stack_vals = vec![trunk];
     let mut tile_outs: HashMap<u64, AuthenticatedBits> = HashMap::new();
     let mut single_outs: HashMap<u64, AuthenticatedBits> = HashMap::new();
     let tile_mask = (CACHE_TILE_LEAVES as u64) - 1;
-    let can_tile = split >= (CACHE_TILE_HEIGHT as i32 - 1);
+    let can_tile = tile_fanout >= 2 && split >= (CACHE_TILE_HEIGHT as i32 - 1);
 
     let mut index = hi;
     loop {
@@ -496,7 +598,12 @@ async fn run_derivation_cache(
                 &prefix,
             )
             .await?;
-            c2pc.reset_circuit(tile_circuit.clone());
+            c2pc.reset_circuit(
+                tile_circuit
+                    .as_ref()
+                    .expect("full_tile requires tile_circuit")
+                    .clone(),
+            );
             let tile = run_carried_authenticated_stage(
                 &mut c2pc,
                 &mut streams,
@@ -810,6 +917,33 @@ fn trunk_chunk_blocks_from_env(default: i32) -> i32 {
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(default)
+}
+
+fn tile_fanout_from_env() -> Result<usize, PartyError> {
+    let value = env::var("SHACHAIN2PC_TILE_FANOUT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(CACHE_TILE_LEAVES);
+    validate_tile_fanout(value)
+}
+
+fn validate_tile_fanout(value: usize) -> Result<usize, PartyError> {
+    if value < 1 || !value.is_power_of_two() {
+        return Err(PartyError::UnsupportedMode(
+            "shachain2pc: tile_fanout must be a power of two",
+        ));
+    }
+    if value > CACHE_TILE_LEAVES {
+        return Err(PartyError::UnsupportedMode(
+            "shachain2pc: tile_fanout > 16 not supported",
+        ));
+    }
+    Ok(value)
+}
+
+fn tile_height_for_fanout(tile_fanout: usize) -> Result<usize, PartyError> {
+    validate_tile_fanout(tile_fanout)?;
+    Ok(tile_fanout.trailing_zeros() as usize)
 }
 
 fn effective_chunk_size(trunk_chunk_blocks: i32) -> Result<usize, PartyError> {
@@ -1238,7 +1372,7 @@ mod tests {
     async fn rust_cache_fallback_range_matches_reference() {
         let lo = Index48::from_hex("800000000000").unwrap();
         let hi = Index48::from_hex("800000000001").unwrap();
-        let (alice, bob) = run_pair_cache(lo, hi, 16, Duration::from_secs(900)).await;
+        let (alice, bob) = run_pair_cache(lo, hi, 16, 1, Duration::from_secs(900)).await;
         let expected = expected_range(lo, hi);
         assert_eq!(alice.unwrap(), expected);
         assert_eq!(bob.unwrap(), expected);
@@ -1249,7 +1383,18 @@ mod tests {
     async fn rust_cache_tile_range_matches_reference() {
         let lo = Index48::from_hex("800000000000").unwrap();
         let hi = Index48::from_hex("80000000000f").unwrap();
-        let (alice, bob) = run_pair_cache(lo, hi, 16, Duration::from_secs(7200)).await;
+        let (alice, bob) = run_pair_cache(lo, hi, 16, 16, Duration::from_secs(7200)).await;
+        let expected = expected_range(lo, hi);
+        assert_eq!(alice.unwrap(), expected);
+        assert_eq!(bob.unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "recursive cache tile tree is too slow for the default debug test run"]
+    async fn rust_cache_recursive_tile_range_matches_reference() {
+        let lo = Index48::from_hex("800000000000").unwrap();
+        let hi = Index48::from_hex("800000000003").unwrap();
+        let (alice, bob) = run_pair_cache(lo, hi, 16, 2, Duration::from_secs(7200)).await;
         let expected = expected_range(lo, hi);
         assert_eq!(alice.unwrap(), expected);
         assert_eq!(bob.unwrap(), expected);
@@ -1318,6 +1463,7 @@ mod tests {
             &[lo, hi],
             Value32::from_hex(SHARE_A).unwrap(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            16,
             16,
         )
         .await
@@ -1449,6 +1595,7 @@ mod tests {
         lo: Index48,
         hi: Index48,
         trunk_chunk_blocks: i32,
+        tile_fanout: usize,
         timeout_duration: Duration,
     ) -> (
         Result<Vec<(Index48, Value32)>, PartyError>,
@@ -1466,6 +1613,7 @@ mod tests {
                 Value32::from_hex(SHARE_A).unwrap(),
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 trunk_chunk_blocks,
+                tile_fanout,
             )
             .await
         });
@@ -1478,6 +1626,7 @@ mod tests {
                 Value32::from_hex(SHARE_B).unwrap(),
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 trunk_chunk_blocks,
+                tile_fanout,
             )
             .await
         });

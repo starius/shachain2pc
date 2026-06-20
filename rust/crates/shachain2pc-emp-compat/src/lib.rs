@@ -51,6 +51,7 @@ pub enum CompatError {
     C2pcGarbledTableMismatch(usize),
     C2pcOutputMacMismatch(usize),
     C2pcOutputLabelMismatch(usize),
+    C2pcLambdaMismatch(usize),
     CoinTossMismatch,
     FeqMismatch,
     LengthOverflow(&'static str),
@@ -106,6 +107,9 @@ impl fmt::Display for CompatError {
             }
             Self::C2pcOutputLabelMismatch(index) => {
                 write!(f, "C2PC output label commitment mismatch at output {index}")
+            }
+            Self::C2pcLambdaMismatch(index) => {
+                write!(f, "C2PC public mask mismatch at output {index}")
             }
             Self::CoinTossMismatch => write!(f, "Fpre coin-toss commitment mismatch"),
             Self::FeqMismatch => write!(f, "Fpre equality check mismatch"),
@@ -1168,12 +1172,56 @@ pub struct C2pc {
     mask: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedBits {
+    mac: Vec<Block>,
+    key: Vec<Block>,
+    lambda: Vec<u8>,
+    label: Vec<Block>,
+}
+
+impl AuthenticatedBits {
+    pub fn len(&self) -> usize {
+        self.lambda.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lambda.is_empty()
+    }
+
+    pub fn lambda(&self) -> &[u8] {
+        &self.lambda
+    }
+}
+
+impl Drop for AuthenticatedBits {
+    fn drop(&mut self) {
+        self.mac.zeroize();
+        self.key.zeroize();
+        self.lambda.zeroize();
+        self.label.zeroize();
+    }
+}
+
 impl C2pc {
     pub async fn new(streams: &mut EmpStreams, party: Role, circuit: C2pcCircuit) -> Result<Self> {
+        Self::new_with_setup_size(streams, party, circuit.clone(), circuit.num_ands()).await
+    }
+
+    pub async fn new_with_setup_size(
+        streams: &mut EmpStreams,
+        party: Role,
+        circuit: C2pcCircuit,
+        setup_num_ands: usize,
+    ) -> Result<Self> {
+        let fpre = Fpre::setup(streams, party, c2pc_fpre_setup_size(setup_num_ands)).await?;
+        Ok(Self::from_fpre(party, circuit, fpre))
+    }
+
+    fn from_fpre(party: Role, circuit: C2pcCircuit, fpre: Fpre) -> Self {
         let num_ands = circuit.num_ands();
         let total_pre = circuit.total_pre();
-        let fpre = Fpre::setup(streams, party, c2pc_fpre_setup_size(num_ands)).await?;
-        Ok(Self {
+        Self {
             party,
             mac: vec![Block::zero(); circuit.num_wire],
             key: vec![Block::zero(); circuit.num_wire],
@@ -1190,7 +1238,26 @@ impl C2pc {
             mask: vec![0; circuit.input_len()],
             circuit,
             fpre,
-        })
+        }
+    }
+
+    pub fn reset_circuit(&mut self, circuit: C2pcCircuit) {
+        let num_ands = circuit.num_ands();
+        let total_pre = circuit.total_pre();
+        self.mac = vec![Block::zero(); circuit.num_wire];
+        self.key = vec![Block::zero(); circuit.num_wire];
+        self.preprocess_mac = vec![Block::zero(); total_pre];
+        self.preprocess_key = vec![Block::zero(); total_pre];
+        self.ands_mac = vec![Block::zero(); num_ands * 3];
+        self.ands_key = vec![Block::zero(); num_ands * 3];
+        self.sigma_mac = vec![Block::zero(); num_ands];
+        self.sigma_key = vec![Block::zero(); num_ands];
+        self.gt = vec![[[Block::zero(); 2]; 4]; num_ands];
+        self.gtk = vec![[Block::zero(); 4]; num_ands];
+        self.gtm = vec![[Block::zero(); 4]; num_ands];
+        self.labels = vec![Block::zero(); circuit.num_wire];
+        self.mask = vec![0; circuit.input_len()];
+        self.circuit = circuit;
     }
 
     pub async fn function_independent(&mut self, streams: &mut EmpStreams) -> Result<()> {
@@ -1254,7 +1321,33 @@ impl C2pc {
         Ok(())
     }
 
+    pub fn apply_carried_inputs(&mut self, carried: &AuthenticatedBits) -> Result<()> {
+        let input_len = self.circuit.input_len();
+        if carried.len() != input_len {
+            return Err(CompatError::BadC2pcInputLength {
+                expected: input_len,
+                actual: carried.len(),
+            });
+        }
+        self.mac[..input_len].copy_from_slice(&carried.mac);
+        self.key[..input_len].copy_from_slice(&carried.key);
+        self.labels[..input_len].copy_from_slice(&carried.label);
+        Ok(())
+    }
+
     pub async fn function_dependent(&mut self, streams: &mut EmpStreams) -> Result<()> {
+        self.function_dependent_inner(streams, true).await
+    }
+
+    pub async fn function_dependent_carried(&mut self, streams: &mut EmpStreams) -> Result<()> {
+        self.function_dependent_inner(streams, false).await
+    }
+
+    async fn function_dependent_inner(
+        &mut self,
+        streams: &mut EmpStreams,
+        commit_input_masks: bool,
+    ) -> Result<()> {
         let input_len = self.circuit.input_len();
         let mut pre_index = input_len;
         for gate in &self.circuit.gates {
@@ -1399,29 +1492,33 @@ impl C2pc {
             }
         }
 
-        match self.party {
-            Role::Alice => {
-                streams
-                    .main
-                    .send_partial_blocks(&self.mac[..self.circuit.n1], C2PC_SSP_BYTES)
-                    .await?;
-                for i in self.circuit.n1..input_len {
-                    let received = streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
-                    self.mask[i] = self.resolve_mask(i, received)?;
+        if commit_input_masks {
+            match self.party {
+                Role::Alice => {
+                    streams
+                        .main
+                        .send_partial_blocks(&self.mac[..self.circuit.n1], C2PC_SSP_BYTES)
+                        .await?;
+                    for i in self.circuit.n1..input_len {
+                        let received =
+                            streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
+                        self.mask[i] = self.resolve_mask(i, received)?;
+                    }
+                }
+                Role::Bob => {
+                    for i in 0..self.circuit.n1 {
+                        let received =
+                            streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
+                        self.mask[i] = self.resolve_mask(i, received)?;
+                    }
+                    streams
+                        .main
+                        .send_partial_blocks(&self.mac[self.circuit.n1..input_len], C2PC_SSP_BYTES)
+                        .await?;
                 }
             }
-            Role::Bob => {
-                for i in 0..self.circuit.n1 {
-                    let received = streams.main.recv_partial_blocks(1, C2PC_SSP_BYTES).await?[0];
-                    self.mask[i] = self.resolve_mask(i, received)?;
-                }
-                streams
-                    .main
-                    .send_partial_blocks(&self.mac[self.circuit.n1..input_len], C2PC_SSP_BYTES)
-                    .await?;
-            }
+            streams.main.flush().await?;
         }
-        streams.main.flush().await?;
         Ok(())
     }
 
@@ -1547,6 +1644,138 @@ impl C2pc {
                         output[i] = bit ^ output_mask ^ u8::from(self.mac[wire].get_lsb());
                     }
                 }
+            }
+        }
+        Ok(output)
+    }
+
+    pub async fn online_authenticated_clear(
+        &mut self,
+        streams: &mut EmpStreams,
+        input: &[u8],
+    ) -> Result<AuthenticatedBits> {
+        let input_len = self.circuit.input_len();
+        if input.len() != input_len {
+            return Err(CompatError::BadC2pcInputLength {
+                expected: input_len,
+                actual: input.len(),
+            });
+        }
+
+        let mut mask_input = vec![0u8; self.circuit.num_wire];
+        match self.party {
+            Role::Alice => {
+                for i in self.circuit.n1..input_len {
+                    mask_input[i] = u8::from((input[i] != 0) != self.mac[i].get_lsb());
+                    mask_input[i] ^= self.mask[i];
+                }
+                let bob_mask = streams.main.recv_data(self.circuit.n1).await?;
+                mask_input[..self.circuit.n1].copy_from_slice(&bob_mask);
+                streams
+                    .main
+                    .send_data(&mask_input[self.circuit.n1..input_len])
+                    .await?;
+
+                for (i, bit) in mask_input.iter().copied().enumerate().take(input_len) {
+                    let mut label = self.labels[i];
+                    if Self::mask_bit(bit, i)? != 0 {
+                        label = label.xor(self.fpre.delta);
+                    }
+                    streams.main.send_block(&[label]).await?;
+                }
+            }
+            Role::Bob => {
+                for i in 0..self.circuit.n1 {
+                    mask_input[i] = u8::from((input[i] != 0) != self.mac[i].get_lsb());
+                    mask_input[i] ^= self.mask[i];
+                }
+                streams
+                    .main
+                    .send_data(&mask_input[..self.circuit.n1])
+                    .await?;
+                let alice_mask = streams.main.recv_data(self.circuit.n2).await?;
+                mask_input[self.circuit.n1..input_len].copy_from_slice(&alice_mask);
+                let input_labels = streams.main.recv_block(input_len).await?;
+                self.labels[..input_len].copy_from_slice(&input_labels);
+            }
+        }
+
+        if self.party == Role::Bob {
+            self.evaluate_garbled_circuit(&mut mask_input)?;
+        }
+        self.authenticated_output_from_mask(streams, &mask_input)
+            .await
+    }
+
+    pub async fn online_authenticated_carried(
+        &mut self,
+        streams: &mut EmpStreams,
+        carried: &AuthenticatedBits,
+    ) -> Result<AuthenticatedBits> {
+        let input_len = self.circuit.input_len();
+        if carried.len() != input_len {
+            return Err(CompatError::BadC2pcInputLength {
+                expected: input_len,
+                actual: carried.len(),
+            });
+        }
+
+        let mut mask_input = vec![0u8; self.circuit.num_wire];
+        mask_input[..input_len].copy_from_slice(&carried.lambda);
+        if self.party == Role::Bob {
+            self.labels[..input_len].copy_from_slice(&carried.label);
+            self.evaluate_garbled_circuit(&mut mask_input)?;
+        }
+        self.authenticated_output_from_mask(streams, &mask_input)
+            .await
+    }
+
+    pub async fn reveal_authenticated_public(
+        &self,
+        streams: &mut EmpStreams,
+        wires: &AuthenticatedBits,
+    ) -> Result<Vec<u8>> {
+        let n = wires.len();
+        let mut output = vec![0u8; n];
+        match self.party {
+            Role::Alice => {
+                streams
+                    .main
+                    .send_partial_blocks(&wires.mac, C2PC_SSP_BYTES)
+                    .await?;
+                let peer_macs = streams.main.recv_partial_blocks(n, C2PC_SSP_BYTES).await?;
+                let peer_labels = streams.main.recv_partial_blocks(n, C2PC_SSP_BYTES).await?;
+                let peer_lambda = streams.main.recv_data(n).await?;
+                streams.main.flush().await?;
+                for i in 0..n {
+                    let peer_bit =
+                        Self::resolve_key_bit(&wires.key[i], self.fpre.delta, peer_macs[i], i)?;
+                    let lambda = Self::mask_bit(peer_lambda[i], i)?;
+                    if lambda != wires.lambda[i] {
+                        return Err(CompatError::C2pcLambdaMismatch(i));
+                    }
+                    self.verify_peer_label(i, wires, peer_labels[i], lambda)?;
+                    output[i] = peer_bit ^ lambda ^ u8::from(wires.mac[i].get_lsb());
+                }
+            }
+            Role::Bob => {
+                let peer_macs = streams.main.recv_partial_blocks(n, C2PC_SSP_BYTES).await?;
+                for (i, received) in peer_macs.iter().copied().enumerate() {
+                    let peer_bit =
+                        Self::resolve_key_bit(&wires.key[i], self.fpre.delta, received, i)?;
+                    let lambda = Self::mask_bit(wires.lambda[i], i)?;
+                    output[i] = peer_bit ^ lambda ^ u8::from(wires.mac[i].get_lsb());
+                }
+                streams
+                    .main
+                    .send_partial_blocks(&wires.mac, C2PC_SSP_BYTES)
+                    .await?;
+                streams
+                    .main
+                    .send_partial_blocks(&wires.label, C2PC_SSP_BYTES)
+                    .await?;
+                streams.main.send_data(&wires.lambda).await?;
+                streams.main.flush().await?;
             }
         }
         Ok(output)
@@ -1755,6 +1984,109 @@ impl C2pc {
         let received = received.and(c2pc_mask());
         let key = self.key[wire_index].and(c2pc_mask());
         let key_delta = self.key[wire_index].xor(self.fpre.delta).and(c2pc_mask());
+        if received == key {
+            Ok(0)
+        } else if received == key_delta {
+            Ok(1)
+        } else {
+            Err(CompatError::C2pcOutputMacMismatch(output_index))
+        }
+    }
+
+    async fn authenticated_output_from_mask(
+        &self,
+        streams: &mut EmpStreams,
+        mask_input: &[u8],
+    ) -> Result<AuthenticatedBits> {
+        let out_start = self.output_start();
+        let out_end = out_start + self.circuit.n3;
+        let lambda = match self.party {
+            Role::Alice => {
+                let peer_labels = streams
+                    .main
+                    .recv_partial_blocks(self.circuit.n3, C2PC_SSP_BYTES)
+                    .await?;
+                let peer_lambda = streams.main.recv_data(self.circuit.n3).await?;
+                streams.main.flush().await?;
+                for i in 0..self.circuit.n3 {
+                    let lambda = Self::mask_bit(peer_lambda[i], out_start + i)?;
+                    self.verify_output_label(i, out_start + i, peer_labels[i], lambda)?;
+                }
+                peer_lambda
+            }
+            Role::Bob => {
+                let lambda = mask_input[out_start..out_end].to_vec();
+                streams
+                    .main
+                    .send_partial_blocks(&self.labels[out_start..out_end], C2PC_SSP_BYTES)
+                    .await?;
+                streams.main.send_data(&lambda).await?;
+                streams.main.flush().await?;
+                lambda
+            }
+        };
+        Ok(self.authenticated_bits_from_range(out_start, out_end, lambda))
+    }
+
+    fn authenticated_bits_from_range(
+        &self,
+        start: usize,
+        end: usize,
+        lambda: Vec<u8>,
+    ) -> AuthenticatedBits {
+        AuthenticatedBits {
+            mac: self.mac[start..end].to_vec(),
+            key: self.key[start..end].to_vec(),
+            lambda,
+            label: self.labels[start..end].to_vec(),
+        }
+    }
+
+    fn verify_peer_label(
+        &self,
+        output_index: usize,
+        wires: &AuthenticatedBits,
+        received: Block,
+        lambda: u8,
+    ) -> Result<()> {
+        let mut label = received;
+        if lambda != 0 {
+            label = label.xor(self.fpre.delta);
+        }
+        if label.and(c2pc_mask()) == wires.label[output_index].and(c2pc_mask()) {
+            Ok(())
+        } else {
+            Err(CompatError::C2pcOutputLabelMismatch(output_index))
+        }
+    }
+
+    fn verify_output_label(
+        &self,
+        output_index: usize,
+        wire_index: usize,
+        received: Block,
+        lambda: u8,
+    ) -> Result<()> {
+        let mut label = received;
+        if lambda != 0 {
+            label = label.xor(self.fpre.delta);
+        }
+        if label.and(c2pc_mask()) == self.labels[wire_index].and(c2pc_mask()) {
+            Ok(())
+        } else {
+            Err(CompatError::C2pcOutputLabelMismatch(output_index))
+        }
+    }
+
+    fn resolve_key_bit(
+        key: &Block,
+        delta: Block,
+        received: Block,
+        output_index: usize,
+    ) -> Result<u8> {
+        let received = received.and(c2pc_mask());
+        let key = key.and(c2pc_mask());
+        let key_delta = key.xor(delta).and(c2pc_mask());
         if received == key {
             Ok(0)
         } else if received == key_delta {
@@ -2672,6 +3004,51 @@ mod tests {
 
     fn c2pc_expected_output() -> [u8; 1] {
         [1]
+    }
+
+    fn carried_stage_one_circuit() -> Circuit {
+        Circuit {
+            num_wire: 3,
+            n1: 1,
+            n2: 1,
+            n3: 1,
+            gates: vec![Gate {
+                typ: GateType::And,
+                in0: 0,
+                in1: 1,
+                out: 2,
+            }],
+        }
+    }
+
+    fn carried_stage_two_circuit() -> Circuit {
+        Circuit {
+            num_wire: 2,
+            n1: 1,
+            n2: 0,
+            n3: 1,
+            gates: vec![Gate {
+                typ: GateType::Inv,
+                in0: 0,
+                in1: -1,
+                out: 1,
+            }],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_c2pc_authenticated_carry_reuses_one_delta() {
+        let port = free_port();
+        let alice = tokio::spawn(run_rust_c2pc_authenticated_carry(Role::Alice, port));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(run_rust_c2pc_authenticated_carry(Role::Bob, port));
+        let (alice, bob) = timeout(LIVE_C2PC_TIMEOUT, async {
+            (alice.await.unwrap(), bob.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(alice.unwrap(), vec![0]);
+        assert_eq!(bob.unwrap(), vec![0]);
     }
 
     #[test]
@@ -4348,6 +4725,29 @@ mod tests {
         }
         streams.main.flush().await?;
         Ok(())
+    }
+
+    async fn run_rust_c2pc_authenticated_carry(role: Role, port: u16) -> Result<Vec<u8>> {
+        let mut streams = EmpStreams::open(role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)).await?;
+        let stage_one = C2pcCircuit::from_circuit(&carried_stage_one_circuit())?;
+        let stage_two = C2pcCircuit::from_circuit(&carried_stage_two_circuit())?;
+        let mut c2pc = C2pc::new_with_setup_size(&mut streams, role, stage_one, 1).await?;
+
+        c2pc.function_independent(&mut streams).await?;
+        c2pc.function_dependent(&mut streams).await?;
+        let carried = c2pc
+            .online_authenticated_clear(&mut streams, &[1, 1])
+            .await?;
+
+        c2pc.reset_circuit(stage_two);
+        c2pc.function_independent(&mut streams).await?;
+        c2pc.apply_carried_inputs(&carried)?;
+        c2pc.function_dependent_carried(&mut streams).await?;
+        let carried = c2pc
+            .online_authenticated_carried(&mut streams, &carried)
+            .await?;
+        c2pc.reveal_authenticated_public(&mut streams, &carried)
+            .await
     }
 
     async fn run_rust_c2pc_online_tamper(

@@ -44,6 +44,12 @@ impl Circuit {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TileLevel {
+    pub bit_offset: usize,
+    pub height: usize,
+}
+
 #[derive(Debug)]
 pub enum CircuitError {
     Io(std::io::Error),
@@ -299,10 +305,19 @@ pub fn build_chunk_circuit(
     ))
 }
 
-pub fn build_tile_circuit(sha: &Circuit, tile_height: usize) -> Result<Circuit, CircuitError> {
+pub fn build_tile_circuit(
+    sha: &Circuit,
+    bit_offset: usize,
+    tile_height: usize,
+) -> Result<Circuit, CircuitError> {
     if tile_height < 1 || tile_height > INDEX_BITS as usize {
         return Err(CircuitError::Shape(
             "BuildTileCircuit: invalid tile height".into(),
+        ));
+    }
+    if bit_offset + tile_height > INDEX_BITS as usize {
+        return Err(CircuitError::Shape(
+            "BuildTileCircuit: bit window out of range".into(),
         ));
     }
     if sha.n1 + sha.n2 != 512 || sha.n3 != VALUE_BITS as i32 {
@@ -325,7 +340,7 @@ pub fn build_tile_circuit(sha: &Circuit, tile_height: usize) -> Result<Circuit, 
             if suffix.count_ones() as usize != depth {
                 continue;
             }
-            let bit = suffix.trailing_zeros() as usize;
+            let bit = bit_offset + suffix.trailing_zeros() as usize;
             let parent = suffix & (suffix - 1);
             let mut p = node[parent].clone();
             let idx = flip_bit_index(bit);
@@ -347,6 +362,42 @@ pub fn build_tile_circuit(sha: &Circuit, tile_height: usize) -> Result<Circuit, 
     }
 
     Ok(b.finish(VALUE_BITS as i32, 0, (VALUE_BITS * leaves) as i32))
+}
+
+pub fn plan_tile_levels(depth: usize, tile_height: usize) -> Result<Vec<TileLevel>, CircuitError> {
+    if tile_height < 1 {
+        return Err(CircuitError::Shape(
+            "PlanTileLevels: tile_height must be >= 1".into(),
+        ));
+    }
+    if depth < tile_height {
+        return Err(CircuitError::Shape(
+            "PlanTileLevels: depth must be >= tile_height".into(),
+        ));
+    }
+
+    let mut levels = Vec::new();
+    let mut remaining = depth;
+    let r = depth % tile_height;
+    if r != 0 {
+        levels.push(TileLevel {
+            bit_offset: depth - r,
+            height: r,
+        });
+        remaining = depth - r;
+    }
+    let mut offset = remaining - tile_height;
+    loop {
+        levels.push(TileLevel {
+            bit_offset: offset,
+            height: tile_height,
+        });
+        if offset == 0 {
+            break;
+        }
+        offset -= tile_height;
+    }
+    Ok(levels)
 }
 
 pub fn check_chunk_circuit(c: &Circuit) -> Result<(), CircuitError> {
@@ -474,14 +525,14 @@ pub fn cache_digest(
     lo: u64,
     hi: u64,
     trunk_chunk_blocks: i32,
-    tile_height: i32,
+    tile_fanout: i32,
     sha: &Circuit,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(lo.to_ne_bytes());
     hasher.update(hi.to_ne_bytes());
     hasher.update(trunk_chunk_blocks.to_ne_bytes());
-    hasher.update(tile_height.to_ne_bytes());
+    hasher.update(tile_fanout.to_ne_bytes());
     hasher.update(circuit_digest(sha, &to_emp_gate_array(sha)));
     hasher.finalize().into()
 }
@@ -754,7 +805,7 @@ mod tests {
         let seed =
             Value32::from_hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
                 .unwrap();
-        let circuit = build_tile_circuit(&sha, CACHE_TILE_HEIGHT).unwrap();
+        let circuit = build_tile_circuit(&sha, 0, CACHE_TILE_HEIGHT).unwrap();
         check_tile_circuit(&circuit, CACHE_TILE_HEIGHT).unwrap();
         let out_bits = eval_bristol(&circuit, &seed.to_bits_msb()).unwrap();
         assert_eq!(out_bits.len(), CACHE_TILE_BITS);
@@ -765,6 +816,73 @@ mod tests {
             let expected = generate_from_seed(seed, Index48::new(suffix as u64).unwrap());
             assert_eq!(got, expected, "suffix {suffix}");
         }
+    }
+
+    #[test]
+    fn offset_tile_plaintext_eval_matches_intermediate_reference() {
+        let sha = sha_gadget();
+        let seed =
+            Value32::from_hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
+                .unwrap();
+
+        for bit_offset in [0usize, 1, 4, 8, 20, 44] {
+            for tile_height in [1usize, 2, 3, 4] {
+                if bit_offset + tile_height > INDEX_BITS as usize {
+                    continue;
+                }
+                let circuit = build_tile_circuit(&sha, bit_offset, tile_height).unwrap();
+                check_tile_circuit(&circuit, tile_height).unwrap();
+                let out_bits = eval_bristol(&circuit, &seed.to_bits_msb()).unwrap();
+                for suffix in 0..(1usize << tile_height) {
+                    let start = suffix * VALUE_BITS;
+                    let got = Value32::from_bits_msb(&out_bits[start..start + VALUE_BITS]).unwrap();
+                    let index = Index48::new((suffix as u64) << bit_offset).unwrap();
+                    let expected = generate_from_seed(seed, index);
+                    assert_eq!(
+                        got, expected,
+                        "bit_offset={bit_offset} tile_height={tile_height} suffix={suffix}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tile_level_plan_matches_cpp_shape() {
+        assert_eq!(
+            plan_tile_levels(8, 4).unwrap(),
+            vec![
+                TileLevel {
+                    bit_offset: 4,
+                    height: 4
+                },
+                TileLevel {
+                    bit_offset: 0,
+                    height: 4
+                },
+            ]
+        );
+        assert_eq!(
+            plan_tile_levels(13, 4).unwrap(),
+            vec![
+                TileLevel {
+                    bit_offset: 12,
+                    height: 1
+                },
+                TileLevel {
+                    bit_offset: 8,
+                    height: 4
+                },
+                TileLevel {
+                    bit_offset: 4,
+                    height: 4
+                },
+                TileLevel {
+                    bit_offset: 0,
+                    height: 4
+                },
+            ]
+        );
     }
 
     #[test]
@@ -788,10 +906,10 @@ mod tests {
                 0xffff_ffff_ff00,
                 0xffff_ffff_ffff,
                 16,
-                CACHE_TILE_HEIGHT as i32,
+                CACHE_TILE_LEAVES as i32,
                 &sha,
             )),
-            "deb4f1490561f849c8407905ad49b227751af11ceb27bd50c15d61bad4e48d5f"
+            "715a3bca84f65192fe867ed15c1fa57aeb5d611a6b0626b06d418d66123305d6"
         );
 
         let chunk = build_chunk_circuit(&sha, &[47, 46, 45], true).unwrap();
@@ -800,7 +918,7 @@ mod tests {
             "5104a2fd1427f01bdf0ca477649453bf836c3fb15ac26b49d4f865aa7baf140d"
         );
 
-        let tile = build_tile_circuit(&sha, CACHE_TILE_HEIGHT).unwrap();
+        let tile = build_tile_circuit(&sha, 0, CACHE_TILE_HEIGHT).unwrap();
         assert_eq!(
             hex32(circuit_digest(&tile, &to_emp_gate_array(&tile))),
             "5dead3f8a9201513f80f3dd6e674bd043fa546754a54a2480f1a27248b6bce7c"

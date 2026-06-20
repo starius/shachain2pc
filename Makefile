@@ -42,7 +42,8 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
 # (emp-ag2pc/helper.h, fpre.h, 2pc.h, the old emp::C2PC) which the new emp install
 # no longer provides; their tools/*.cpp are kept for the eventual Rust re-port but
 # are NOT built. See docs/new-emp-ag2pc-notes.md.
-EMP_BINS := $(BUILD)/party $(BUILD)/ag2pc_session_probe
+EMP_BINS := $(BUILD)/party $(BUILD)/ag2pc_session_probe \
+            $(BUILD)/ag2pc_transport_probe
 
 .PHONY: all plain mpc clean test test-cache-tamper test-ag2pc-probe demo cheat
 all: plain mpc
@@ -72,6 +73,10 @@ $(BUILD)/party: demo/party.cpp $(PROTO_SRC) $(RUN_DEPS) | $(BUILD)
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
 $(BUILD)/ag2pc_session_probe: tools/ag2pc_session_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
+$(BUILD)/ag2pc_transport_probe: tools/ag2pc_transport_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 

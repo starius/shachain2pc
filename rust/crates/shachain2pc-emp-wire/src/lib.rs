@@ -11,6 +11,7 @@ use zeroize::Zeroize;
 pub const BLOCK_BYTES: usize = 16;
 pub const EMP_PARTIAL_BLOCK_BYTES: usize = 5;
 pub const EMP_STREAM_COUNT: usize = 3;
+pub const AG2PC_STREAM_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct Block([u8; BLOCK_BYTES]);
@@ -362,6 +363,41 @@ impl EmpStreams {
     }
 }
 
+pub struct Ag2pcStreams {
+    pub main: EmpStream,
+    pub sibling: EmpStream,
+}
+
+impl Ag2pcStreams {
+    pub async fn open(role: Role, port: u16, peer_ip: IpAddr) -> Result<Self> {
+        match role {
+            Role::Alice => Self::listen(port).await,
+            Role::Bob => Self::connect(peer_ip, port).await,
+        }
+    }
+
+    pub async fn listen(port: u16) -> Result<Self> {
+        let listener =
+            TcpListener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)).await?;
+        let main = accept_emp(&listener).await?;
+        sleep(Duration::from_millis(100)).await;
+        let sibling = accept_emp(&listener).await?;
+        Ok(Self { main, sibling })
+    }
+
+    pub async fn connect(peer_ip: IpAddr, port: u16) -> Result<Self> {
+        let addr = SocketAddr::new(peer_ip, port);
+        let main = connect_emp(addr).await?;
+        sleep(Duration::from_millis(100)).await;
+        let sibling = connect_emp(addr).await?;
+        Ok(Self { main, sibling })
+    }
+
+    pub fn streams_mut(&mut self) -> [&mut EmpStream; AG2PC_STREAM_COUNT] {
+        [&mut self.main, &mut self.sibling]
+    }
+}
+
 async fn accept_emp(listener: &TcpListener) -> Result<EmpStream> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -550,6 +586,36 @@ mod tests {
         run_live_case(&bin, Role::Bob).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ag2pc_rust_rust_transport_interop() {
+        let _guard = live_cpp_interop_lock().lock().await;
+        let port = free_port();
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let alice = tokio::spawn(async move {
+            let mut streams = Ag2pcStreams::open(Role::Alice, port, peer).await?;
+            exercise_ag2pc_transport(&mut streams, Role::Alice).await
+        });
+        let bob = tokio::spawn(async move {
+            let mut streams = Ag2pcStreams::open(Role::Bob, port, peer).await?;
+            exercise_ag2pc_transport(&mut streams, Role::Bob).await
+        });
+        let (alice, bob) = timeout(LIVE_INTEROP_TIMEOUT, async { tokio::try_join!(alice, bob) })
+            .await
+            .unwrap()
+            .unwrap();
+        alice.unwrap();
+        bob.unwrap();
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_cpp_ag2pc_transport_interop() {
+        let _guard = live_cpp_interop_lock().lock().await;
+        let bin = cpp_ag2pc_transport_probe();
+        run_live_ag2pc_transport_case(&bin, Role::Alice).await;
+        run_live_ag2pc_transport_case(&bin, Role::Bob).await;
+    }
+
     fn live_cpp_interop_lock() -> &'static Mutex<()> {
         LIVE_CPP_INTEROP_LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -626,9 +692,110 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cpp-probes")]
+    async fn run_live_ag2pc_transport_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = match rust_role {
+            Role::Alice => Role::Bob,
+            Role::Bob => Role::Alice,
+        };
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_role.party_id().to_string())
+            .arg(port.to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let open_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            Ag2pcStreams::open(rust_role, port, peer),
+        )
+        .await;
+        let mut streams = match open_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC stream open failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC stream open timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+
+        match timeout(
+            LIVE_INTEROP_TIMEOUT,
+            exercise_ag2pc_transport(&mut streams, rust_role),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("Rust AG2PC wire script failed: {e}"),
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC wire script timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ AG2PC transport probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn exercise_wire_probe_script(streams: &mut EmpStreams, role: Role) -> Result<()> {
         for (stream_id, stream) in streams.streams_mut().into_iter().enumerate() {
             exercise_stream(stream, role, stream_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn exercise_ag2pc_transport(streams: &mut Ag2pcStreams, role: Role) -> Result<()> {
+        for (stream_id, stream) in streams.streams_mut().into_iter().enumerate() {
+            match role {
+                Role::Alice => {
+                    stream
+                        .send_data(&ag2pc_payload(Role::Alice, stream_id))
+                        .await?;
+                    stream.flush().await?;
+                    assert_eq!(
+                        stream.recv_data(8).await?,
+                        ag2pc_payload(Role::Bob, stream_id)
+                    );
+                }
+                Role::Bob => {
+                    assert_eq!(
+                        stream.recv_data(8).await?,
+                        ag2pc_payload(Role::Alice, stream_id)
+                    );
+                    stream
+                        .send_data(&ag2pc_payload(Role::Bob, stream_id))
+                        .await?;
+                    stream.flush().await?;
+                }
+            }
         }
         Ok(())
     }
@@ -805,6 +972,23 @@ mod tests {
             .collect()
     }
 
+    fn ag2pc_payload(role: Role, stream_id: usize) -> Vec<u8> {
+        let tag = match role {
+            Role::Alice => 0xa7,
+            Role::Bob => 0xb8,
+        };
+        vec![
+            tag,
+            stream_id as u8,
+            0x11 + stream_id as u8,
+            0x22 + stream_id as u8,
+            0x33 + stream_id as u8,
+            0x44 + stream_id as u8,
+            0x55 + stream_id as u8,
+            0x66 + stream_id as u8,
+        ]
+    }
+
     fn cpp_wire_probe() -> PathBuf {
         let root = repo_root();
         let bin = root.join(".build/emp_wire_probe");
@@ -819,6 +1003,28 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/emp_wire_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    fn cpp_ag2pc_transport_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/ag2pc_transport_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/ag2pc_transport_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "failed to build .build/ag2pc_transport_probe"
+            );
+        }
+        assert!(
+            bin.exists(),
+            ".build/ag2pc_transport_probe was not built by the Cargo build script"
         );
         bin
     }

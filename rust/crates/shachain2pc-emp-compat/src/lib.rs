@@ -194,9 +194,13 @@ impl Prp {
     }
 
     pub fn permute_block(&self, blocks: &mut [Block]) {
-        for block in blocks {
-            *block = self.permute_one(*block);
-        }
+        // Batch through AES-NI: encrypt_blocks pipelines 8 blocks wide, vs the
+        // ~4-cycle latency of one-at-a-time encrypt_block. Block is
+        // repr(transparent) over [u8; 16], the same layout as aes::Block.
+        let aes_blocks: &mut [aes::Block] = unsafe {
+            std::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast::<aes::Block>(), blocks.len())
+        };
+        self.cipher.encrypt_blocks(aes_blocks);
     }
 
     pub fn permute_one(&self, block: Block) -> Block {
@@ -1491,8 +1495,24 @@ impl Mitccrh8 {
             self.renew_ks();
         }
         if self.scheduled_bucket.is_some() {
-            for block in blocks {
-                *block = mitccrh_apply(&self.scheduled_keys[0], *block, cir);
+            // All blocks share one key (gid is 8-aligned, so renew_ks always takes
+            // the single-bucket branch): batch the AES instead of one
+            // mitccrh_apply per block. result = AES_key(input) ^ input, with
+            // input = sigma(block) if cir else block.
+            let key = &self.scheduled_keys[0];
+            if cir {
+                for block in blocks.iter_mut() {
+                    *block = block.sigma();
+                }
+            }
+            for chunk in blocks.chunks_mut(16) {
+                let n = chunk.len();
+                let mut inp = [Block::zero(); 16];
+                inp[..n].copy_from_slice(chunk);
+                key.permute_block(chunk);
+                for i in 0..n {
+                    chunk[i] = chunk[i].xor(inp[i]);
+                }
             }
         } else {
             for key_index in 0..k {

@@ -15,52 +15,54 @@ pub const EMP_STREAM_COUNT: usize = 3;
 pub const AG2PC_STREAM_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
+#[repr(transparent)] // same layout as [u8; 16] / aes::Block, so &mut [Block] can be
+                     // reinterpreted for batched AES-NI (see emp-compat Prp).
 pub struct Block([u8; BLOCK_BYTES]);
 
 impl Block {
+    #[inline]
     pub const fn from_bytes(bytes: [u8; BLOCK_BYTES]) -> Self {
         Self(bytes)
     }
 
+    #[inline]
     pub fn make(high: u64, low: u64) -> Self {
-        let mut bytes = [0u8; BLOCK_BYTES];
-        bytes[..8].copy_from_slice(&low.to_le_bytes());
-        bytes[8..].copy_from_slice(&high.to_le_bytes());
-        Self(bytes)
+        Self((((high as u128) << 64) | (low as u128)).to_le_bytes())
     }
 
+    #[inline]
     pub fn zero() -> Self {
         Self([0; BLOCK_BYTES])
     }
 
+    #[inline]
     pub fn as_bytes(&self) -> &[u8; BLOCK_BYTES] {
         &self.0
     }
 
+    #[inline]
     pub fn into_bytes(self) -> [u8; BLOCK_BYTES] {
         self.0
     }
 
+    #[inline]
     pub fn get_lsb(self) -> bool {
         (self.0[0] & 1) == 1
     }
 
+    // 128-bit xor/and: from_ne_bytes/to_ne_bytes are bit reinterprets, so these
+    // compile to a single SIMD op instead of a 16-byte scalar loop.
+    #[inline]
     pub fn xor(self, rhs: Self) -> Self {
-        let mut out = [0u8; BLOCK_BYTES];
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = self.0[i] ^ rhs.0[i];
-        }
-        Self(out)
+        Self((u128::from_ne_bytes(self.0) ^ u128::from_ne_bytes(rhs.0)).to_ne_bytes())
     }
 
+    #[inline]
     pub fn and(self, rhs: Self) -> Self {
-        let mut out = [0u8; BLOCK_BYTES];
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = self.0[i] & rhs.0[i];
-        }
-        Self(out)
+        Self((u128::from_ne_bytes(self.0) & u128::from_ne_bytes(rhs.0)).to_ne_bytes())
     }
 
+    #[inline]
     pub fn sigma(self) -> Self {
         let low = self.low64();
         let high = self.high64();
@@ -71,10 +73,12 @@ impl Block {
         hex_encode(&self.0)
     }
 
+    #[inline]
     fn low64(self) -> u64 {
         u64::from_le_bytes(self.0[..8].try_into().expect("slice length"))
     }
 
+    #[inline]
     fn high64(self) -> u64 {
         u64::from_le_bytes(self.0[8..].try_into().expect("slice length"))
     }

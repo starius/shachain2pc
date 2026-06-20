@@ -10,6 +10,7 @@ build = "build.rs"
 cpp-probes = []
 
 [dependencies]
+sha2.workspace = true
 shachain2pc-types = { path = "../shachain2pc-types" }
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 zeroize.workspace = true

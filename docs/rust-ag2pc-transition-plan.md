@@ -21,10 +21,29 @@ Rust must implement that current backend. Matching only the shachain circuits,
 cache traversal, or recursive tile digest is not enough. We already verified that
 Rust/C++ runs now pass the run digest and then fail at the MPC transport layer.
 
+The v1 transition target is **wire-compatible interop**, not full randomized
+transcript byte identity. A Rust ALICE must be able to run against a C++ BOB, and
+a C++ ALICE must be able to run against a Rust BOB, using normal production
+randomness and the current C++ message formats, ordering, and abort behavior.
+
+Full-run byte-identical transcripts are not expected under randomized OT/MPC
+unless test-only randomness is fixed. Deterministic byte fixtures remain useful
+for local helpers, encodings, message framing, and fixed-seed probes, but they
+are not the security goal by themselves.
+
+Semantic/differential testing is also required, but it is an additional gate, not
+a replacement for v1 interop. For each supported workload, C++/C++, Rust/Rust,
+C++->Rust, and Rust->C++ should produce the same public result, and equivalent
+tampering should abort without a `RESULT`. The independent reference
+implementation remains the oracle for shachain correctness.
+
 The transition is complete only when:
 
 - Rust/Rust passes all party modes;
 - C++/Rust cross-mode passes all party modes;
+- C++/C++, Rust/Rust, and both cross-mode directions match the same reference
+  outputs for the same inputs;
+- equivalent tamper tests abort in Rust/Rust and both cross-mode directions;
 - the old Rust WRK17/C2PC backend is removed from the production/test path;
 - stale old-EMP compatibility probes are removed or archived as historical docs,
   not kept as active build/test targets.
@@ -36,6 +55,10 @@ The transition is complete only when:
 - Do not build a proxy translator between old Rust and new C++ protocols.
 - Do not change shachain semantics, reveal semantics, `ssp`, or tile fanout while
   doing the backend transition.
+- Do not require production runs to be byte-identical end to end under real
+  randomness.
+- Do not accept semantic output equality alone as the transition gate; live
+  C++/Rust wire-compatible interop is required for v1.
 - Do not optimize until wire compatibility, correctness, and abort behavior are
   established.
 
@@ -64,10 +87,12 @@ Implementation rule: the repository should not end with two production MPC
 backends. A temporary side-by-side period is acceptable only while the new backend
 is being proven; the final phase deletes the old backend.
 
-## 4. Phase 0: freeze the new C++ transcript
+## 4. Phase 0: freeze the new C++ compatibility surface
 
 Before porting Rust, add deterministic and live probes for the current C++
 `AG2PCSession` backend. These probes are the compatibility spec.
+
+Freeze the protocol surface that makes cross-mode possible:
 
 Pin in the spec:
 
@@ -82,6 +107,11 @@ Pin in the spec:
 - checkpoint/liveness behavior;
 - abort transcript for a tampered MAC/check.
 
+For deterministic subcomponents, freeze exact bytes. For randomized protocol
+steps, freeze message ordering, lengths, encodings, role behavior, and invariants;
+use live cross-mode tests as the primary oracle. Fixed-seed hooks are acceptable
+only as test-only probes and must not weaken production randomness.
+
 Probe cases:
 
 - empty session then reveal/checkpoint behavior where supported;
@@ -94,10 +124,12 @@ Probe cases:
 - reveal to ALICE only and BOB only;
 - tampered garbling/check/reveal abort.
 
-Outputs should be machine-readable JSONL with hex-encoded wire records and a
-short TOML/Markdown spec explaining the message order. For randomized protocols,
-prefer live cross-mode invariant probes plus optional fixed-seed test hooks only
-if they can be added without weakening production randomness.
+Outputs should be machine-readable JSONL with hex-encoded wire records where the
+bytes are deterministic, plus a short TOML/Markdown spec explaining message
+order, length prefixes, encodings, flush points, and role ordering. For
+randomized protocols, include live cross-mode invariant probes and record enough
+metadata to debug length/order mismatches without pretending that a production
+run should be byte-identical.
 
 Review gate: Claude/human review of the probes/spec before Rust implements the
 backend.
@@ -137,6 +169,8 @@ Tests:
 - C++ sender ↔ Rust receiver;
 - Rust sender ↔ C++ receiver;
 - randomized invariant checks over multiple lengths, including boundary sizes;
+- C++/C++, Rust/Rust, and cross-mode runs agree on public invariants even though
+  randomized wire bytes differ;
 - tamper/consistency-check failure returns `Err`, not partial output.
 
 Review gate: no AG2PC garbling until SoftSpoken cross-mode is stable.
@@ -199,6 +233,8 @@ Tests:
 - C++/Rust multi-AND circuit;
 - C++/Rust checkpoint then second circuit;
 - C++/Rust reveal to PUBLIC/ALICE/BOB;
+- differential C++/C++ vs Rust/Rust behavior tests for the same circuits,
+  including matching outputs and matching abort/no-output behavior;
 - C++/Rust tamper abort.
 
 Review gate: once this phase passes, the old Rust backend can be disconnected
@@ -231,6 +267,8 @@ Tests:
 
 - Rust/Rust correctness against `ref_cli`/`generate_from_seed`;
 - C++/Rust cross-mode for every mode;
+- C++/C++, Rust/Rust, C++->Rust, and Rust->C++ differential runs for the same
+  inputs, ranges, cache settings, and tamper cases;
 - range result order and stdout shape;
 - no-socket `I=0` refusal;
 - digest mismatch abort before preprocessing;
@@ -262,6 +300,13 @@ Acceptance:
 
 Run measurements after backend replacement, not before.
 
+The first optimization pass should preserve the v1 wire protocol. It can still
+batch AES, buffer writes, reduce allocations, reuse memory, parallelize local
+compute, and improve layout as long as C++/Rust interop and abort behavior remain
+green. Protocol-breaking changes such as collapsing sockets, changing message
+order, changing reveal fairness, or redesigning batching belong in a later
+Rust-only v2 after C++ is retired.
+
 Measure:
 
 - single `I=1`, `I=3`, ignored/manual `ffffffffffff`;
@@ -278,7 +323,9 @@ Measure:
 
 Security review checklist:
 
-- transcript probes match C++;
+- deterministic helper/encoding probes match C++;
+- live C++/Rust interop succeeds in both role directions;
+- differential C++/C++ vs Rust/Rust behavior matches for outputs and aborts;
 - all reveal paths are correct-or-abort;
 - tampered preprocessing/garbling/reveal returns `Err`;
 - no stale wire can be used after checkpoint;

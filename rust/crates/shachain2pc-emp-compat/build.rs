@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../../Makefile");
     println!("cargo:rerun-if-changed=../../../tools/csw_probe.cpp");
     println!("cargo:rerun-if-changed=../../../tools/ag2pc_triple_pool_probe.cpp");
+    println!("cargo:rerun-if-changed=../../../tools/ag2pc_protocol_probe.cpp");
     println!("cargo:rerun-if-changed=../../../tools/softspoken_probe.cpp");
     println!("cargo:rerun-if-env-changed=SHACHAIN2PC_BUILD_CPP_PROBES");
 
@@ -22,6 +23,7 @@ fn build_cpp_probe() {
     for target in [
         ".build/csw_probe",
         ".build/ag2pc_triple_pool_probe",
+        ".build/ag2pc_protocol_probe",
         ".build/softspoken_probe",
     ] {
         let status = Command::new("make")

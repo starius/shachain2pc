@@ -43,10 +43,11 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
 # no longer provides; their tools/*.cpp are kept for the eventual Rust re-port but
 # are NOT built. See docs/new-emp-ag2pc-notes.md.
 EMP_BINS := $(BUILD)/party $(BUILD)/ag2pc_session_probe \
-            $(BUILD)/ag2pc_transport_probe $(BUILD)/softspoken_probe
+            $(BUILD)/ag2pc_transport_probe $(BUILD)/softspoken_probe \
+            $(BUILD)/softspoken_helper_probe
 
 .PHONY: all plain mpc clean test test-cache-tamper test-ag2pc-probe \
-        test-softspoken-probe demo cheat
+        test-softspoken-probe test-softspoken-helper-probe demo cheat
 all: plain mpc
 plain: $(PLAIN_BINS)
 mpc: $(EMP_BINS)
@@ -82,6 +83,10 @@ $(BUILD)/ag2pc_transport_probe: tools/ag2pc_transport_probe.cpp | $(BUILD)
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
 $(BUILD)/softspoken_probe: tools/softspoken_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
+$(BUILD)/softspoken_helper_probe: tools/softspoken_helper_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
@@ -138,6 +143,11 @@ test-softspoken-probe: $(BUILD)/softspoken_probe
 	  assert rs[0]["digest"] == rs[1]["digest"]; \
 	  assert rs[0]["delta"] == rs[1]["delta"]' \
 	  $(BUILD)/softspoken_probe_alice.json $(BUILD)/softspoken_probe_bob.json
+
+test-softspoken-helper-probe: $(BUILD)/softspoken_helper_probe
+	./$(BUILD)/softspoken_helper_probe >$(BUILD)/softspoken_helper_probe.json
+	diff -u compat/ag2pc/softspoken-helper-v1.json \
+	  $(BUILD)/softspoken_helper_probe.json
 
 test-cache-tamper: $(BUILD)/party $(BUILD)/ref_cli
 	./demo/cache_tamper_test.sh

@@ -308,6 +308,7 @@ name = "shachain2pc-emp-wire"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "shachain2pc-types",
  "tokio",
  "zeroize",

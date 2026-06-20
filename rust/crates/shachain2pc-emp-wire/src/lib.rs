@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use shachain2pc_types::Role;
 use std::fmt;
 use std::io;
@@ -94,6 +95,8 @@ impl Zeroize for Block {
 #[derive(Debug)]
 pub enum WireError {
     Io(io::Error),
+    FsAlreadyEnabled,
+    FsNotEnabled,
     InvalidPtrMod8(usize),
     InvalidPartialBlockBytes(usize),
     MalformedBoolEncoding {
@@ -110,6 +113,8 @@ impl fmt::Display for WireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{e}"),
+            Self::FsAlreadyEnabled => write!(f, "Fiat-Shamir transcript already enabled"),
+            Self::FsNotEnabled => write!(f, "Fiat-Shamir transcript is not enabled"),
             Self::InvalidPtrMod8(v) => write!(f, "EMP bool ptr_mod8 must be in 0..8, got {v}"),
             Self::InvalidPartialBlockBytes(v) => {
                 write!(f, "partial block byte count must be in 1..16, got {v}")
@@ -226,13 +231,32 @@ pub fn decode_partial_blocks(bytes: &[u8], partial_bytes: usize) -> Result<Vec<B
 
 pub struct EmpStream {
     stream: TcpStream,
-    counter: u64,
+    send_counter: u64,
+    recv_counter: u64,
+    rounds: u64,
+    flushes_count: u64,
+    last_dir: LastDir,
+    send_dirty: bool,
+    fs_send_first: bool,
+    fs_send: Option<Sha256>,
+    fs_recv: Option<Sha256>,
 }
 
 impl EmpStream {
     pub fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
-        Ok(Self { stream, counter: 0 })
+        Ok(Self {
+            stream,
+            send_counter: 0,
+            recv_counter: 0,
+            rounds: 0,
+            flushes_count: 0,
+            last_dir: LastDir::None,
+            send_dirty: false,
+            fs_send_first: false,
+            fs_send: None,
+            fs_recv: None,
+        })
     }
 
     pub async fn listen(port: u16) -> Result<Self> {
@@ -246,22 +270,97 @@ impl EmpStream {
     }
 
     pub fn counter(&self) -> u64 {
-        self.counter
+        self.send_counter
+    }
+
+    pub fn send_counter(&self) -> u64 {
+        self.send_counter
+    }
+
+    pub fn recv_counter(&self) -> u64 {
+        self.recv_counter
+    }
+
+    pub fn rounds(&self) -> u64 {
+        self.rounds
+    }
+
+    pub fn flushes_count(&self) -> u64 {
+        self.flushes_count
+    }
+
+    pub fn enable_fs(&mut self, send_first: bool) -> Result<()> {
+        if self.fs_send.is_some() {
+            return Err(WireError::FsAlreadyEnabled);
+        }
+        self.fs_send_first = send_first;
+        self.fs_send = Some(Sha256::new());
+        self.fs_recv = Some(Sha256::new());
+        Ok(())
+    }
+
+    pub fn fs_enabled(&self) -> bool {
+        self.fs_send.is_some()
+    }
+
+    pub fn get_send_digest(&self) -> Result<Block> {
+        let digest = digest_snapshot(self.fs_send.as_ref().ok_or(WireError::FsNotEnabled)?);
+        Ok(first_digest_block(&digest))
+    }
+
+    pub fn get_recv_digest(&self) -> Result<Block> {
+        let digest = digest_snapshot(self.fs_recv.as_ref().ok_or(WireError::FsNotEnabled)?);
+        Ok(first_digest_block(&digest))
+    }
+
+    pub fn get_digest(&self) -> Result<Block> {
+        let send = digest_snapshot(self.fs_send.as_ref().ok_or(WireError::FsNotEnabled)?);
+        let recv = digest_snapshot(self.fs_recv.as_ref().ok_or(WireError::FsNotEnabled)?);
+        let mut h = Sha256::new();
+        if self.fs_send_first {
+            h.update(send);
+            h.update(recv);
+        } else {
+            h.update(recv);
+            h.update(send);
+        }
+        let digest: [u8; 32] = h.finalize().into();
+        Ok(first_digest_block(&digest))
     }
 
     pub async fn send_data(&mut self, data: &[u8]) -> Result<()> {
+        self.send_counter += data.len() as u64;
+        if self.last_dir != LastDir::Send {
+            self.rounds += 1;
+            self.last_dir = LastDir::Send;
+        }
+        if let Some(fs_send) = &mut self.fs_send {
+            fs_send.update(data);
+        }
         self.stream.write_all(data).await?;
-        self.counter += data.len() as u64;
+        self.send_dirty = true;
         Ok(())
     }
 
     pub async fn recv_data(&mut self, len: usize) -> Result<Vec<u8>> {
+        self.recv_counter += len as u64;
+        if self.last_dir != LastDir::Recv {
+            self.rounds += 1;
+            self.last_dir = LastDir::Recv;
+        }
         let mut out = vec![0u8; len];
         self.stream.read_exact(&mut out).await?;
+        if let Some(fs_recv) = &mut self.fs_recv {
+            fs_recv.update(&out);
+        }
         Ok(out)
     }
 
     pub async fn flush(&mut self) -> Result<()> {
+        if self.send_dirty {
+            self.flushes_count += 1;
+            self.send_dirty = false;
+        }
         self.stream.flush().await?;
         Ok(())
     }
@@ -315,6 +414,13 @@ impl EmpStream {
         let bytes = self.recv_data(count * partial_bytes).await?;
         decode_partial_blocks(&bytes, partial_bytes)
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LastDir {
+    None,
+    Send,
+    Recv,
 }
 
 pub struct EmpStreams {
@@ -438,6 +544,17 @@ fn validate_partial_bytes(partial_bytes: usize) -> Result<()> {
     } else {
         Err(WireError::InvalidPartialBlockBytes(partial_bytes))
     }
+}
+
+fn digest_snapshot(hasher: &Sha256) -> [u8; 32] {
+    let digest = hasher.clone().finalize();
+    digest.into()
+}
+
+fn first_digest_block(digest: &[u8; 32]) -> Block {
+    let mut out = [0u8; BLOCK_BYTES];
+    out.copy_from_slice(&digest[..BLOCK_BYTES]);
+    Block::from_bytes(out)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -605,6 +722,52 @@ mod tests {
             .unwrap();
         alice.unwrap();
         bob.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_digest_matches_emp_direction_order() {
+        let _guard = live_cpp_interop_lock().lock().await;
+        let port = free_port();
+        let alice = tokio::spawn(async move {
+            let mut stream = EmpStream::listen(port).await?;
+            stream.enable_fs(true)?;
+            stream.send_data(b"alpha").await?;
+            stream.flush().await?;
+            assert_eq!(stream.recv_data(4).await?, b"beta");
+            stream.send_data(b"gamma").await?;
+            stream.flush().await?;
+            Ok::<_, WireError>((
+                stream.get_send_digest()?,
+                stream.get_recv_digest()?,
+                stream.get_digest()?,
+                stream.rounds(),
+            ))
+        });
+        let bob = tokio::spawn(async move {
+            let mut stream = EmpStream::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port).await?;
+            stream.enable_fs(false)?;
+            assert_eq!(stream.recv_data(5).await?, b"alpha");
+            stream.send_data(b"beta").await?;
+            stream.flush().await?;
+            assert_eq!(stream.recv_data(5).await?, b"gamma");
+            Ok::<_, WireError>((
+                stream.get_send_digest()?,
+                stream.get_recv_digest()?,
+                stream.get_digest()?,
+                stream.rounds(),
+            ))
+        });
+        let (alice, bob) = timeout(LIVE_INTEROP_TIMEOUT, async { tokio::try_join!(alice, bob) })
+            .await
+            .unwrap()
+            .unwrap();
+        let (alice_send, alice_recv, alice_digest, alice_rounds) = alice.unwrap();
+        let (bob_send, bob_recv, bob_digest, bob_rounds) = bob.unwrap();
+        assert_eq!(alice_send, bob_recv);
+        assert_eq!(alice_recv, bob_send);
+        assert_eq!(alice_digest, bob_digest);
+        assert_eq!(alice_rounds, 3);
+        assert_eq!(bob_rounds, 3);
     }
 
     #[cfg(feature = "cpp-probes")]

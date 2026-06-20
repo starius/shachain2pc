@@ -2,7 +2,6 @@ use shachain2pc_circuit::{
     batch_digest, build_chunk_circuit, build_circuit_for_index, build_tile_circuit, cache_digest,
     check_chunk_circuit, check_tile_circuit, chunk_spec_digest, load_bristol, plan_tile_levels,
     split_chain_bits, tree_digest, Circuit, GateType, CACHE_TILE_HEIGHT, CACHE_TILE_LEAVES,
-    DEFAULT_SHA256_COMPRESS_PATH,
 };
 use shachain2pc_emp_compat::{Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError};
 use shachain2pc_emp_wire::{Ag2pcStreams, EmpStream, WireError};
@@ -1104,13 +1103,16 @@ fn ensure_mode_supported_for_now(
 }
 
 fn default_sha256_compress_path() -> PathBuf {
-    let cwd_path = PathBuf::from(DEFAULT_SHA256_COMPRESS_PATH);
-    if cwd_path.exists() {
-        cwd_path
+    // EMP_PREFIX (set by the nix dev shell) yields an absolute /nix/store path used
+    // as-is; the legacy .deps/emp fallback is relative, so resolve it against the
+    // cwd or, failing that, the repo root.
+    let p = shachain2pc_circuit::default_sha256_compress_path();
+    if p.is_absolute() || p.exists() {
+        p
     } else {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
-            .join(DEFAULT_SHA256_COMPRESS_PATH)
+            .join(p)
     }
 }
 

@@ -1,6 +1,6 @@
 # Build shachain2pc. Run inside the flake dev shell:
 #   nix develop          # builds the pinned, patched emp stack via nix into
-#                        # /nix/store and exports EMP_PREFIX (+ a .deps/emp symlink)
+#                        # /nix/store and exports EMP_PREFIX pointing at it
 #   nix develop -c make
 #
 # emp (emp-tool lib + emp-ot/emp-ag2pc headers) is built reproducibly by the nix

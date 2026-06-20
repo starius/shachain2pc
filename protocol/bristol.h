@@ -13,6 +13,7 @@
 #define SHACHAIN2PC_PROTOCOL_BRISTOL_H
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,16 @@ void SaveBristol(const Circuit& c, const std::string& path);
 // first, then BOB bits); returns n3 output bits. Each element is 0 or 1.
 std::vector<uint8_t> EvalBristol(const Circuit& c,
                                  const std::vector<uint8_t>& in_bits);
+
+// Path to the SHA-256 compression Bristol gadget. emp is built by the nix flake
+// into /nix/store and exported as EMP_PREFIX; fall back to the legacy .deps/emp
+// bootstrap layout when EMP_PREFIX is unset.
+inline std::string DefaultSha256CompressPath() {
+  const char* prefix = std::getenv("EMP_PREFIX");
+  const std::string root =
+      (prefix != nullptr && prefix[0] != '\0') ? std::string(prefix) : ".deps/emp";
+  return root + "/include/emp-tool/circuits/files/bristol_format/sha-256.txt";
+}
 
 }  // namespace shachain2pc::protocol
 

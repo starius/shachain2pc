@@ -86,9 +86,6 @@ constexpr int kCacheTileBits = protocol::kValueBits * kCacheTileLeaves;
 // Full analysis: docs/shared-trunk-cache.md.
 constexpr int kSsp = 40;
 
-constexpr const char* kDefaultSha256CompressPath =
-    ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt";
-
 // CheckDerivationCircuit validates the expected 256+256 -> 256 shape.
 inline void CheckDerivationCircuit(const protocol::Circuit& c,
                                    const std::string& description) {
@@ -107,7 +104,7 @@ inline void CheckDerivationCircuit(const protocol::Circuit& c,
 // artifact from their local index and SHA-256 gadget.
 inline protocol::Circuit BuildCircuitForIndex(
     uint64_t index,
-    const std::string& sha_path = kDefaultSha256CompressPath) {
+    const std::string& sha_path = protocol::DefaultSha256CompressPath()) {
   if (index > protocol::kMaxIndex) {
     throw std::runtime_error("shachain2pc: index exceeds 48 bits");
   }
@@ -313,7 +310,7 @@ inline std::vector<protocol::Value> RunDerivationBatch(
       throw std::runtime_error("shachain2pc: index exceeds 48 bits");
   }
 
-  protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
+  protocol::Circuit sha = protocol::LoadBristol(protocol::DefaultSha256CompressPath());
 
   // Pre-agree on the index set + SHA gadget; clean early abort on mismatch.
   ExchangeCircuitDigest(io, party, BatchDigest(indices, sha));
@@ -481,7 +478,7 @@ inline protocol::Value RunDerivationChunked(emp::NetIO* io, ThreadPool* pool,
   if (blocks_per_chunk < 1)
     throw std::runtime_error("shachain2pc: blocks_per_chunk must be >= 1");
 
-  protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
+  protocol::Circuit sha = protocol::LoadBristol(protocol::DefaultSha256CompressPath());
   std::vector<std::vector<int>> groups =
       protocol::SplitChainBits(index, blocks_per_chunk);
   ExchangeCircuitDigest(io, party, ChunkSpecDigest(index, blocks_per_chunk, sha));
@@ -648,7 +645,7 @@ inline std::vector<protocol::Value> RunDerivationTree(
   const uint64_t high_mask = protocol::kMaxIndex & ~low_mask;
   timing.split_bit = split;
 
-  protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
+  protocol::Circuit sha = protocol::LoadBristol(protocol::DefaultSha256CompressPath());
   ExchangeCircuitDigest(io, party, TreeDigest(indices, trunk_chunk_blocks, sha));
 
   // ---- one-time setup: COT mesh + input authentication ----
@@ -1026,7 +1023,7 @@ inline std::vector<protocol::Value> RunDerivationCache(
   timing.split_bit = split;
   timing.num_indices = (int)(hi - lo + 1);
 
-  protocol::Circuit sha = protocol::LoadBristol(kDefaultSha256CompressPath);
+  protocol::Circuit sha = protocol::LoadBristol(protocol::DefaultSha256CompressPath());
   ExchangeCircuitDigest(io, party,
                         CacheDigest(lo, hi, trunk_chunk_blocks, tile_fanout, sha));
 

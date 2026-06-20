@@ -41,6 +41,21 @@ impl Block {
     }
 
     #[inline]
+    pub fn as_mut_bytes(&mut self) -> &mut [u8; BLOCK_BYTES] {
+        &mut self.0
+    }
+
+    /// View a slice of `Block`s as the underlying contiguous bytes, with no copy.
+    #[inline]
+    pub fn slice_as_bytes(blocks: &[Block]) -> &[u8] {
+        // SAFETY: Block is repr(transparent) over [u8; BLOCK_BYTES] (align 1), so a
+        // run of `blocks` is exactly blocks.len() * BLOCK_BYTES contiguous bytes.
+        unsafe {
+            core::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), blocks.len() * BLOCK_BYTES)
+        }
+    }
+
+    #[inline]
     pub fn into_bytes(self) -> [u8; BLOCK_BYTES] {
         self.0
     }

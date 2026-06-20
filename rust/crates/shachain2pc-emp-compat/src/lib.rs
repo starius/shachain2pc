@@ -1397,11 +1397,9 @@ fn block_to_bools(block: Block) -> [bool; 128] {
 }
 
 fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {
-    let mut rows = Vec::with_capacity(planes.len() * BLOCK_BYTES);
-    for block in planes {
-        rows.extend_from_slice(block.as_bytes());
-    }
-    transpose_128_rows(&rows, bs * BLOCK_BYTES, bs * 128)
+    // planes are already 128 contiguous rows of bs blocks each, so view them as
+    // bytes directly instead of copying into a scratch buffer first.
+    transpose_128_rows(Block::slice_as_bytes(planes), bs * BLOCK_BYTES, bs * 128)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3288,7 +3286,7 @@ unsafe fn transpose_128_rows_simd(rows: &[u8], row_bytes: usize, output_len: usi
     const ROWS: usize = 128;
     debug_assert_eq!(output_len, row_bytes * 8);
     debug_assert_eq!(rows.len(), ROWS * row_bytes);
-    let mut out = vec![[0u8; BLOCK_BYTES]; output_len];
+    let mut out = vec![Block::zero(); output_len];
     let mut lane = [0u8; 16];
     for source_byte in 0..row_bytes {
         for group in 0..(ROWS / 16) {
@@ -3300,20 +3298,20 @@ unsafe fn transpose_128_rows_simd(rows: &[u8], row_bytes: usize, output_len: usi
             // bit runs 7,6,..,0; movemask reads the MSB (== current bit) of each byte.
             for bit in (0..8).rev() {
                 let mask = _mm_movemask_epi8(v) as u32;
-                let out_row = source_byte * 8 + bit;
-                out[out_row][group * 2] = (mask & 0xff) as u8; // rows base..=base+7
-                out[out_row][group * 2 + 1] = ((mask >> 8) & 0xff) as u8; // rows base+8..=base+15
+                let ob = out[source_byte * 8 + bit].as_mut_bytes();
+                ob[group * 2] = (mask & 0xff) as u8; // rows base..=base+7
+                ob[group * 2 + 1] = ((mask >> 8) & 0xff) as u8; // rows base+8..=base+15
                 v = _mm_slli_epi64(v, 1);
             }
         }
     }
-    out.into_iter().map(Block::from_bytes).collect()
+    out
 }
 
 #[cfg(any(test, not(target_arch = "x86_64")))]
 fn transpose_128_rows_soft(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
     debug_assert_eq!(output_len, row_bytes * 8);
-    let mut out = vec![[0u8; BLOCK_BYTES]; output_len];
+    let mut out = vec![Block::zero(); output_len];
     for source_byte in 0..row_bytes {
         for (group, _) in [0u8; BLOCK_BYTES].iter().enumerate() {
             let row = group * 8;
@@ -3329,11 +3327,11 @@ fn transpose_128_rows_soft(rows: &[u8], row_bytes: usize, output_len: usize) -> 
             ]);
             let transposed = transpose_8x8(x).to_le_bytes();
             for bit in 0..8 {
-                out[source_byte * 8 + bit][group] = transposed[bit];
+                out[source_byte * 8 + bit].as_mut_bytes()[group] = transposed[bit];
             }
         }
     }
-    out.into_iter().map(Block::from_bytes).collect()
+    out
 }
 
 #[cfg(any(test, not(target_arch = "x86_64")))]

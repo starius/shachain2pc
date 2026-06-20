@@ -44,7 +44,8 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
 # are NOT built. See docs/new-emp-ag2pc-notes.md.
 EMP_BINS := $(BUILD)/party $(BUILD)/ag2pc_session_probe \
             $(BUILD)/ag2pc_transport_probe $(BUILD)/softspoken_probe \
-            $(BUILD)/softspoken_helper_probe $(BUILD)/csw_helper_probe
+            $(BUILD)/softspoken_helper_probe $(BUILD)/csw_helper_probe \
+            $(BUILD)/csw_probe
 
 .PHONY: all plain mpc clean test test-cache-tamper test-ag2pc-probe \
         test-softspoken-probe test-softspoken-helper-probe \
@@ -92,6 +93,10 @@ $(BUILD)/softspoken_helper_probe: tools/softspoken_helper_probe.cpp | $(BUILD)
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
 $(BUILD)/csw_helper_probe: tools/csw_helper_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
+$(BUILD)/csw_probe: tools/csw_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 

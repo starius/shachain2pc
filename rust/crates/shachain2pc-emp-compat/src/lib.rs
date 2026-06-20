@@ -3061,6 +3061,21 @@ mod tests {
         }
     }
 
+    fn carried_stage_two_and_self_circuit() -> Circuit {
+        Circuit {
+            num_wire: 2,
+            n1: 1,
+            n2: 0,
+            n3: 1,
+            gates: vec![Gate {
+                typ: GateType::And,
+                in0: 0,
+                in1: 0,
+                out: 1,
+            }],
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rust_c2pc_authenticated_carry_reuses_one_delta() {
         let port = free_port();
@@ -3074,6 +3089,38 @@ mod tests {
         .unwrap();
         assert_eq!(alice.unwrap(), vec![0]);
         assert_eq!(bob.unwrap(), vec![0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_c2pc_carried_label_tamper_rejects_before_reveal() {
+        let port = free_port();
+        let alice = tokio::spawn(run_rust_c2pc_carried_label_tamper(Role::Alice, port));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(run_rust_c2pc_carried_label_tamper(Role::Bob, port));
+        let (alice, bob) = timeout(LIVE_C2PC_TIMEOUT, async {
+            (alice.await.unwrap(), bob.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert!(alice.is_err());
+        assert!(matches!(bob, Err(CompatError::C2pcGarbledTableMismatch(0))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_c2pc_reveal_lambda_tamper_is_rejected_by_peer() {
+        let port = free_port();
+        let alice = tokio::spawn(run_rust_c2pc_reveal_lambda_tamper(Role::Alice, port));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(run_rust_c2pc_reveal_lambda_tamper(Role::Bob, port));
+        let (alice, bob) = timeout(LIVE_C2PC_TIMEOUT, async {
+            (alice.await.unwrap(), bob.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(alice, Err(CompatError::C2pcLambdaMismatch(0))));
+        // PUBLIC reveal is intentionally Bob-unfair: Bob may locally finish
+        // after sending bad reveal material, but Alice must reject it.
+        drop(bob);
     }
 
     #[test]
@@ -4796,6 +4843,58 @@ mod tests {
         let carried = c2pc
             .online_authenticated_carried(&mut streams, &carried)
             .await?;
+        c2pc.reveal_authenticated_public(&mut streams, &carried)
+            .await
+    }
+
+    async fn run_rust_c2pc_carried_label_tamper(role: Role, port: u16) -> Result<Vec<u8>> {
+        let mut streams = EmpStreams::open(role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)).await?;
+        let stage_one = C2pcCircuit::from_circuit(&carried_stage_one_circuit())?;
+        let stage_two = C2pcCircuit::from_circuit(&carried_stage_two_and_self_circuit())?;
+        let mut c2pc = C2pc::new_with_setup_size(&mut streams, role, stage_one, 1).await?;
+
+        c2pc.function_independent(&mut streams).await?;
+        c2pc.function_dependent(&mut streams).await?;
+        let mut carried = c2pc
+            .online_authenticated_clear(&mut streams, &[1, 1])
+            .await?;
+
+        c2pc.reset_circuit(stage_two);
+        c2pc.function_independent(&mut streams).await?;
+        if role == Role::Bob {
+            carried.label[0] = carried.label[0].xor(c2pc_mask());
+        }
+        c2pc.apply_carried_inputs(&carried)?;
+        c2pc.function_dependent_carried(&mut streams).await?;
+        let carried = c2pc
+            .online_authenticated_carried(&mut streams, &carried)
+            .await?;
+        c2pc.reveal_authenticated_public(&mut streams, &carried)
+            .await
+    }
+
+    async fn run_rust_c2pc_reveal_lambda_tamper(role: Role, port: u16) -> Result<Vec<u8>> {
+        let mut streams = EmpStreams::open(role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)).await?;
+        let stage_one = C2pcCircuit::from_circuit(&carried_stage_one_circuit())?;
+        let stage_two = C2pcCircuit::from_circuit(&carried_stage_two_circuit())?;
+        let mut c2pc = C2pc::new_with_setup_size(&mut streams, role, stage_one, 1).await?;
+
+        c2pc.function_independent(&mut streams).await?;
+        c2pc.function_dependent(&mut streams).await?;
+        let carried = c2pc
+            .online_authenticated_clear(&mut streams, &[1, 1])
+            .await?;
+
+        c2pc.reset_circuit(stage_two);
+        c2pc.function_independent(&mut streams).await?;
+        c2pc.apply_carried_inputs(&carried)?;
+        c2pc.function_dependent_carried(&mut streams).await?;
+        let mut carried = c2pc
+            .online_authenticated_carried(&mut streams, &carried)
+            .await?;
+        if role == Role::Bob {
+            carried.lambda[0] ^= 1;
+        }
         c2pc.reveal_authenticated_public(&mut streams, &carried)
             .await
     }

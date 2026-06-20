@@ -4,8 +4,8 @@ use shachain2pc_circuit::{
     split_chain_bits, tree_digest, Circuit, CACHE_TILE_HEIGHT, CACHE_TILE_LEAVES,
     DEFAULT_SHA256_COMPRESS_PATH,
 };
-use shachain2pc_emp_compat::{AuthenticatedBits, C2pc, C2pcCircuit, CompatError};
-use shachain2pc_emp_wire::{EmpStream, EmpStreams, WireError};
+use shachain2pc_emp_compat::{Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError};
+use shachain2pc_emp_wire::{Ag2pcStreams, EmpStream, WireError};
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
 use std::collections::HashMap;
 use std::env;
@@ -139,6 +139,8 @@ enum PartyOutput {
     Range(Vec<(Index48, Value32)>),
 }
 
+const AG2PC_SSP: usize = 40;
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     match parse_args(env::args().collect()) {
@@ -235,33 +237,27 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
     let sha = load_bristol(default_sha256_compress_path())?;
     let circuit = build_circuit_for_index(index, &sha)?;
     let digest = batch_digest(&[index.get()], &sha);
-    let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
+    let program = Ag2pcProgram::from_circuit(&circuit)?;
     drop(circuit);
     timing.mark("build_circuit");
 
-    let mut streams = open_streams_after_digest(args.role, args.port, args.peer_ip, digest).await?;
+    let mut streams =
+        open_ag2pc_streams_after_digest(args.role, args.port, args.peer_ip, digest).await?;
     timing.mark("open_streams");
-    let mut c2pc = C2pc::new(&mut streams, args.role, c2pc_circuit).await?;
+    let mut session = Ag2pcSession::setup(&mut streams, args.role, AG2PC_SSP).await?;
     streams.main.flush().await?;
-    timing.mark("c2pc_setup");
-    c2pc.function_independent(&mut streams).await?;
+    timing.mark("ag2pc_setup");
+    let seed_inputs =
+        authenticate_seed_inputs(&mut session, &mut streams, args.role, args.share).await?;
+    timing.mark("input_auth");
+    let authenticated = session
+        .run_program(&mut streams, &program, &seed_inputs)
+        .await?;
+    timing.mark("compute");
+    let output = session.reveal_public(&mut streams, &authenticated).await?;
+    session.end(&mut streams).await?;
     streams.main.flush().await?;
-    timing.mark("function_independent");
-    c2pc.function_dependent(&mut streams).await?;
-    streams.main.flush().await?;
-    timing.mark("function_dependent");
-
-    let mut input = vec![0u8; 2 * VALUE_BITS];
-    let mut share_bits = args.share.to_bits_msb();
-    match args.role {
-        Role::Alice => input[VALUE_BITS..].copy_from_slice(&share_bits),
-        Role::Bob => input[..VALUE_BITS].copy_from_slice(&share_bits),
-    }
-    share_bits.zeroize();
-    let output = c2pc.online(&mut streams, &input, true).await?;
-    input.zeroize();
-    streams.main.flush().await?;
-    timing.mark("online");
+    timing.mark("reveal");
     value_from_bits(&output).map(PartyOutput::Single)
 }
 
@@ -277,40 +273,37 @@ async fn run_derivation_batch(
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
     let mut timing = PhaseTiming::new(role, first_index);
     let sha = load_bristol(default_sha256_compress_path())?;
-    let mut circuits = Vec::with_capacity(indices.len());
-    let mut max_ands = 0usize;
+    let mut programs = Vec::with_capacity(indices.len());
     for &index in indices {
         let circuit = build_circuit_for_index(index, &sha)?;
-        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
-        max_ands = max_ands.max(c2pc_circuit.num_ands());
-        circuits.push(c2pc_circuit);
+        programs.push(Ag2pcProgram::from_circuit(&circuit)?);
     }
     let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
     let digest = batch_digest(&index_values, &sha);
     timing.mark("build_batch_circuits");
 
-    let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
+    let mut streams = open_ag2pc_streams_after_digest(role, port, peer_ip, digest).await?;
     timing.mark("open_streams");
-    let mut c2pc =
-        C2pc::new_with_setup_size(&mut streams, role, circuits[0].clone(), max_ands).await?;
+    let mut session = Ag2pcSession::setup(&mut streams, role, AG2PC_SSP).await?;
     streams.main.flush().await?;
-    timing.mark("c2pc_setup");
+    timing.mark("ag2pc_setup");
 
-    let mut input = clear_input_bits(role, share);
+    let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
+    timing.mark("input_auth");
     let mut authenticated = Vec::with_capacity(indices.len());
-    for (i, circuit) in circuits.into_iter().enumerate() {
-        if i != 0 {
-            c2pc.reset_circuit(circuit);
-        }
-        let out = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
+    for (i, program) in programs.into_iter().enumerate() {
+        let out = session
+            .run_program(&mut streams, &program, &seed_inputs)
+            .await?;
         authenticated.push((indices[i], out));
         timing.mark("batch_item");
     }
-    input.zeroize();
 
-    reveal_authenticated_values(&c2pc, &mut streams, &authenticated)
+    let outputs = reveal_authenticated_values(&mut session, &mut streams, &authenticated)
         .await
-        .inspect(|_| timing.mark("batch_reveal"))
+        .inspect(|_| timing.mark("batch_reveal"))?;
+    session.end(&mut streams).await?;
+    Ok(outputs)
 }
 
 async fn run_derivation_tree(
@@ -337,43 +330,38 @@ async fn run_derivation_tree(
         ));
     }
 
-    let mut trunk_circuits = Vec::with_capacity(trunk_groups.len());
-    let mut branch_circuits = Vec::with_capacity(indices.len());
-    let mut max_ands = 0usize;
+    let mut trunk_programs = Vec::with_capacity(trunk_groups.len());
+    let mut branch_programs = Vec::with_capacity(indices.len());
     for (chunk, bits) in trunk_groups.iter().enumerate() {
         let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
         check_chunk_circuit(&circuit)?;
-        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
-        max_ands = max_ands.max(c2pc_circuit.num_ands());
-        trunk_circuits.push(c2pc_circuit);
+        trunk_programs.push(Ag2pcProgram::from_circuit(&circuit)?);
     }
     for &index in indices {
         let bits = set_bits_desc(index.get() & low_mask);
         let circuit = build_chunk_circuit(&sha, &bits, false)?;
         check_chunk_circuit(&circuit)?;
-        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
-        max_ands = max_ands.max(c2pc_circuit.num_ands());
-        branch_circuits.push(c2pc_circuit);
+        branch_programs.push(Ag2pcProgram::from_circuit(&circuit)?);
     }
     let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
     let digest = tree_digest(&index_values, trunk_chunk_blocks, &sha);
     timing.mark("build_tree_circuits");
 
-    let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
+    let mut streams = open_ag2pc_streams_after_digest(role, port, peer_ip, digest).await?;
     timing.mark("open_streams");
-    let mut c2pc =
-        C2pc::new_with_setup_size(&mut streams, role, trunk_circuits[0].clone(), max_ands).await?;
+    let mut session = Ag2pcSession::setup(&mut streams, role, AG2PC_SSP).await?;
     streams.main.flush().await?;
-    timing.mark("c2pc_setup");
+    timing.mark("ag2pc_setup");
 
-    let mut input = clear_input_bits(role, share);
-    let mut trunk = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
-    input.zeroize();
+    let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
+    timing.mark("input_auth");
+    let mut trunk = session
+        .run_program(&mut streams, &trunk_programs[0], &seed_inputs)
+        .await?;
     timing.mark("tree_trunk_0");
 
-    for (chunk, circuit) in trunk_circuits.into_iter().enumerate().skip(1) {
-        c2pc.reset_circuit(circuit);
-        trunk = run_carried_authenticated_stage(&mut c2pc, &mut streams, &trunk).await?;
+    for (chunk, program) in trunk_programs.into_iter().enumerate().skip(1) {
+        trunk = session.run_program(&mut streams, &program, &trunk).await?;
         timing.mark(match chunk {
             1 => "tree_trunk_1",
             2 => "tree_trunk_2",
@@ -383,16 +371,17 @@ async fn run_derivation_tree(
     }
 
     let mut authenticated = Vec::with_capacity(indices.len());
-    for (i, circuit) in branch_circuits.into_iter().enumerate() {
-        c2pc.reset_circuit(circuit);
-        let out = run_carried_authenticated_stage(&mut c2pc, &mut streams, &trunk).await?;
+    for (i, program) in branch_programs.into_iter().enumerate() {
+        let out = session.run_program(&mut streams, &program, &trunk).await?;
         authenticated.push((indices[i], out));
         timing.mark("tree_branch");
     }
 
-    reveal_authenticated_values(&c2pc, &mut streams, &authenticated)
+    let outputs = reveal_authenticated_values(&mut session, &mut streams, &authenticated)
         .await
-        .inspect(|_| timing.mark("tree_reveal"))
+        .inspect(|_| timing.mark("tree_reveal"))?;
+    session.end(&mut streams).await?;
+    Ok(outputs)
 }
 
 async fn run_derivation_cache(
@@ -426,14 +415,11 @@ async fn run_derivation_cache(
         ));
     }
 
-    let mut trunk_circuits = Vec::with_capacity(trunk_groups.len());
-    let mut max_ands = 0usize;
+    let mut trunk_programs = Vec::with_capacity(trunk_groups.len());
     for (chunk, bits) in trunk_groups.iter().enumerate() {
         let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
         check_chunk_circuit(&circuit)?;
-        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
-        max_ands = max_ands.max(c2pc_circuit.num_ands());
-        trunk_circuits.push(c2pc_circuit);
+        trunk_programs.push(Ag2pcProgram::from_circuit(&circuit)?);
     }
 
     let depth = if split < 0 {
@@ -447,32 +433,27 @@ async fn run_derivation_cache(
     } else {
         None
     };
-    let mut recursive_circuits = Vec::new();
+    let mut recursive_programs = Vec::new();
     if let Some(levels) = &recursive_levels {
-        recursive_circuits.reserve(levels.len());
+        recursive_programs.reserve(levels.len());
         for &level in levels {
             let raw = build_tile_circuit(&sha, level.bit_offset, level.height)?;
             check_tile_circuit(&raw, level.height)?;
-            let c2pc_circuit = C2pcCircuit::from_circuit(&raw)?;
-            max_ands = max_ands.max(c2pc_circuit.num_ands());
-            recursive_circuits.push((level, c2pc_circuit));
+            recursive_programs.push((level, Ag2pcProgram::from_circuit(&raw)?));
         }
     }
 
-    let tile_circuit = if tile_fanout >= 2 {
+    let tile_program = if tile_fanout >= 2 {
         let raw = build_tile_circuit(&sha, 0, CACHE_TILE_HEIGHT)?;
         check_tile_circuit(&raw, CACHE_TILE_HEIGHT)?;
-        let c2pc_circuit = C2pcCircuit::from_circuit(&raw)?;
-        max_ands = max_ands.max(c2pc_circuit.num_ands());
-        Some(c2pc_circuit)
+        Some(Ag2pcProgram::from_circuit(&raw)?)
     } else {
         None
     };
 
     let one_step_raw = build_chunk_circuit(&sha, &[0], false)?;
     check_chunk_circuit(&one_step_raw)?;
-    let one_step_circuit = C2pcCircuit::from_circuit(&one_step_raw)?;
-    max_ands = max_ands.max(one_step_circuit.num_ands());
+    let one_step_program = Ag2pcProgram::from_circuit(&one_step_raw)?;
 
     let digest = cache_digest(
         lo,
@@ -485,21 +466,21 @@ async fn run_derivation_cache(
     );
     timing.mark("build_cache_circuits");
 
-    let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
+    let mut streams = open_ag2pc_streams_after_digest(role, port, peer_ip, digest).await?;
     timing.mark("open_streams");
-    let mut c2pc =
-        C2pc::new_with_setup_size(&mut streams, role, trunk_circuits[0].clone(), max_ands).await?;
+    let mut session = Ag2pcSession::setup(&mut streams, role, AG2PC_SSP).await?;
     streams.main.flush().await?;
-    timing.mark("c2pc_setup");
+    timing.mark("ag2pc_setup");
 
-    let mut input = clear_input_bits(role, share);
-    let mut trunk = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
-    input.zeroize();
+    let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
+    timing.mark("input_auth");
+    let mut trunk = session
+        .run_program(&mut streams, &trunk_programs[0], &seed_inputs)
+        .await?;
     timing.mark("cache_trunk_0");
 
-    for (chunk, circuit) in trunk_circuits.into_iter().enumerate().skip(1) {
-        c2pc.reset_circuit(circuit);
-        trunk = run_carried_authenticated_stage(&mut c2pc, &mut streams, &trunk).await?;
+    for (chunk, program) in trunk_programs.into_iter().enumerate().skip(1) {
+        trunk = session.run_program(&mut streams, &program, &trunk).await?;
         timing.mark(match chunk {
             1 => "cache_trunk_1",
             2 => "cache_trunk_2",
@@ -508,16 +489,14 @@ async fn run_derivation_cache(
         });
     }
 
-    if !recursive_circuits.is_empty() {
+    if !recursive_programs.is_empty() {
         let mut roots = vec![trunk.clone()];
-        for (level_index, (level, circuit)) in recursive_circuits.iter().enumerate() {
-            let is_bottom = level_index + 1 == recursive_circuits.len();
+        for (level_index, (level, program)) in recursive_programs.iter().enumerate() {
+            let is_bottom = level_index + 1 == recursive_programs.len();
             if is_bottom {
                 let mut tiles = Vec::with_capacity(roots.len());
                 for root in roots {
-                    c2pc.reset_circuit(circuit.clone());
-                    let tile =
-                        run_carried_authenticated_stage(&mut c2pc, &mut streams, &root).await?;
+                    let tile = session.run_program(&mut streams, program, &root).await?;
                     tiles.push(tile);
                     timing.mark("cache_tile");
                 }
@@ -533,9 +512,7 @@ async fn run_derivation_cache(
                         "shachain2pc: missing recursive cached tile",
                     ))?;
                     let leaf = tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?;
-                    let bits = c2pc
-                        .reveal_authenticated_public(&mut streams, &leaf)
-                        .await?;
+                    let bits = session.reveal_public(&mut streams, &leaf).await?;
                     results[(reveal_index - lo) as usize] = Some(value_from_bits(&bits)?);
                     if reveal_index == lo {
                         break;
@@ -545,7 +522,7 @@ async fn run_derivation_cache(
                 streams.main.flush().await?;
                 timing.mark("cache_reveal");
 
-                return indices
+                let outputs = indices
                     .iter()
                     .map(|index| {
                         let offset = (index.get() - lo) as usize;
@@ -557,12 +534,13 @@ async fn run_derivation_cache(
                         ))
                     })
                     .collect();
+                session.end(&mut streams).await?;
+                return outputs;
             }
 
             let mut next = Vec::with_capacity(roots.len() * (1usize << level.height));
             for root in roots {
-                c2pc.reset_circuit(circuit.clone());
-                let tile = run_carried_authenticated_stage(&mut c2pc, &mut streams, &root).await?;
+                let tile = session.run_program(&mut streams, program, &root).await?;
                 for slot in 0..(1usize << level.height) {
                     next.push(tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?);
                 }
@@ -574,8 +552,8 @@ async fn run_derivation_cache(
 
     let mut stack_bits = Vec::new();
     let mut stack_vals = vec![trunk];
-    let mut tile_outs: HashMap<u64, AuthenticatedBits> = HashMap::new();
-    let mut single_outs: HashMap<u64, AuthenticatedBits> = HashMap::new();
+    let mut tile_outs: HashMap<u64, Ag2pcSecureWires> = HashMap::new();
+    let mut single_outs: HashMap<u64, Ag2pcSecureWires> = HashMap::new();
     let tile_mask = (CACHE_TILE_LEAVES as u64) - 1;
     let can_tile = tile_fanout >= 2 && split >= (CACHE_TILE_HEIGHT as i32 - 1);
 
@@ -589,27 +567,24 @@ async fn run_derivation_cache(
         if full_tile {
             let prefix = set_bits_desc((tile_base & low_mask) & !tile_mask);
             align_cache_stack(
-                &mut c2pc,
+                &mut session,
                 &mut streams,
                 &sha,
-                &one_step_circuit,
+                &one_step_program,
                 &mut stack_bits,
                 &mut stack_vals,
                 &prefix,
             )
             .await?;
-            c2pc.reset_circuit(
-                tile_circuit
-                    .as_ref()
-                    .expect("full_tile requires tile_circuit")
-                    .clone(),
-            );
-            let tile = run_carried_authenticated_stage(
-                &mut c2pc,
-                &mut streams,
-                stack_vals.last().expect("stack has trunk"),
-            )
-            .await?;
+            let tile = session
+                .run_program(
+                    &mut streams,
+                    tile_program
+                        .as_ref()
+                        .expect("full_tile requires tile_program"),
+                    stack_vals.last().expect("stack has trunk"),
+                )
+                .await?;
             tile_outs.insert(tile_base, tile);
             timing.mark("cache_tile");
 
@@ -622,10 +597,10 @@ async fn run_derivation_cache(
 
         let low = set_bits_desc(index & low_mask);
         align_cache_stack(
-            &mut c2pc,
+            &mut session,
             &mut streams,
             &sha,
-            &one_step_circuit,
+            &one_step_program,
             &mut stack_bits,
             &mut stack_vals,
             &low,
@@ -646,9 +621,7 @@ async fn run_derivation_cache(
         if let Some(tile) = tile_outs.get(&tile_base) {
             let slot = (reveal_index & tile_mask) as usize;
             let leaf = tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?;
-            let bits = c2pc
-                .reveal_authenticated_public(&mut streams, &leaf)
-                .await?;
+            let bits = session.reveal_public(&mut streams, &leaf).await?;
             results[(reveal_index - lo) as usize] = Some(value_from_bits(&bits)?);
         } else {
             let wires = single_outs
@@ -656,9 +629,7 @@ async fn run_derivation_cache(
                 .ok_or(PartyError::UnsupportedMode(
                     "shachain2pc: missing cached output",
                 ))?;
-            let bits = c2pc
-                .reveal_authenticated_public(&mut streams, wires)
-                .await?;
+            let bits = session.reveal_public(&mut streams, wires).await?;
             results[(reveal_index - lo) as usize] = Some(value_from_bits(&bits)?);
         }
         if reveal_index == lo {
@@ -669,7 +640,7 @@ async fn run_derivation_cache(
     streams.main.flush().await?;
     timing.mark("cache_reveal");
 
-    indices
+    let outputs = indices
         .iter()
         .map(|index| {
             let offset = (index.get() - lo) as usize;
@@ -680,16 +651,18 @@ async fn run_derivation_cache(
                 ))?,
             ))
         })
-        .collect()
+        .collect();
+    session.end(&mut streams).await?;
+    outputs
 }
 
 async fn align_cache_stack(
-    c2pc: &mut C2pc,
-    streams: &mut EmpStreams,
+    session: &mut Ag2pcSession,
+    streams: &mut Ag2pcStreams,
     sha: &Circuit,
-    one_step_template: &C2pcCircuit,
+    one_step_template: &Ag2pcProgram,
     stack_bits: &mut Vec<usize>,
-    stack_vals: &mut Vec<AuthenticatedBits>,
+    stack_vals: &mut Vec<Ag2pcSecureWires>,
     target: &[usize],
 ) -> Result<(), PartyError> {
     let mut prefix = 0usize;
@@ -700,20 +673,20 @@ async fn align_cache_stack(
     stack_bits.truncate(prefix);
     stack_vals.truncate(prefix + 1);
     for &bit in &target[prefix..] {
-        let circuit = if bit == 0 {
+        let program = if bit == 0 {
             one_step_template.clone()
         } else {
             let raw = build_chunk_circuit(sha, &[bit], false)?;
             check_chunk_circuit(&raw)?;
-            C2pcCircuit::from_circuit(&raw)?
+            Ag2pcProgram::from_circuit(&raw)?
         };
-        c2pc.reset_circuit(circuit);
-        let next = run_carried_authenticated_stage(
-            c2pc,
-            streams,
-            stack_vals.last().expect("stack has trunk"),
-        )
-        .await?;
+        let next = session
+            .run_program(
+                streams,
+                &program,
+                stack_vals.last().expect("stack has trunk"),
+            )
+            .await?;
         stack_vals.push(next);
         stack_bits.push(bit);
     }
@@ -731,33 +704,32 @@ async fn run_derivation_chunked(
     let mut timing = PhaseTiming::new(role, index);
     let sha = load_bristol(default_sha256_compress_path())?;
     let groups = split_chain_bits(index.get(), blocks_per_chunk)?;
-    let mut circuits = Vec::with_capacity(groups.len());
-    let mut max_ands = 0usize;
+    let mut programs = Vec::with_capacity(groups.len());
     for (chunk, bits) in groups.iter().enumerate() {
         let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
         check_chunk_circuit(&circuit)?;
-        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
-        max_ands = max_ands.max(c2pc_circuit.num_ands());
-        circuits.push(c2pc_circuit);
+        programs.push(Ag2pcProgram::from_circuit(&circuit)?);
     }
     let digest = chunk_spec_digest(index.get(), blocks_per_chunk as i32, &sha);
     timing.mark("build_chunk_circuits");
 
-    let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
+    let mut streams = open_ag2pc_streams_after_digest(role, port, peer_ip, digest).await?;
     timing.mark("open_streams");
-    let mut c2pc =
-        C2pc::new_with_setup_size(&mut streams, role, circuits[0].clone(), max_ands).await?;
+    let mut session = Ag2pcSession::setup(&mut streams, role, AG2PC_SSP).await?;
     streams.main.flush().await?;
-    timing.mark("c2pc_setup");
+    timing.mark("ag2pc_setup");
 
-    let mut input = clear_input_bits(role, share);
-    let mut carried = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
-    input.zeroize();
+    let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
+    timing.mark("input_auth");
+    let mut carried = session
+        .run_program(&mut streams, &programs[0], &seed_inputs)
+        .await?;
     timing.mark("chunk_0");
 
-    for (chunk, circuit) in circuits.into_iter().enumerate().skip(1) {
-        c2pc.reset_circuit(circuit);
-        carried = run_carried_authenticated_stage(&mut c2pc, &mut streams, &carried).await?;
+    for (chunk, program) in programs.into_iter().enumerate().skip(1) {
+        carried = session
+            .run_program(&mut streams, &program, &carried)
+            .await?;
         timing.mark(match chunk {
             1 => "chunk_1",
             2 => "chunk_2",
@@ -766,58 +738,49 @@ async fn run_derivation_chunked(
         });
     }
 
-    let output = c2pc
-        .reveal_authenticated_public(&mut streams, &carried)
-        .await?;
+    let output = session.reveal_public(&mut streams, &carried).await?;
+    session.end(&mut streams).await?;
     streams.main.flush().await?;
     timing.mark("reveal");
     value_from_bits(&output)
 }
 
-async fn run_clear_authenticated_stage(
-    c2pc: &mut C2pc,
-    streams: &mut EmpStreams,
-    input: &[u8],
-) -> Result<AuthenticatedBits, PartyError> {
-    c2pc.function_independent(streams).await?;
-    c2pc.function_dependent(streams).await?;
-    Ok(c2pc.online_authenticated_clear(streams, input).await?)
-}
-
-async fn run_carried_authenticated_stage(
-    c2pc: &mut C2pc,
-    streams: &mut EmpStreams,
-    carried: &AuthenticatedBits,
-) -> Result<AuthenticatedBits, PartyError> {
-    c2pc.function_independent(streams).await?;
-    c2pc.apply_carried_inputs(carried)?;
-    c2pc.function_dependent_carried(streams).await?;
-    Ok(c2pc.online_authenticated_carried(streams, carried).await?)
-}
-
 async fn reveal_authenticated_values(
-    c2pc: &C2pc,
-    streams: &mut EmpStreams,
-    authenticated: &[(Index48, AuthenticatedBits)],
+    session: &mut Ag2pcSession,
+    streams: &mut Ag2pcStreams,
+    authenticated: &[(Index48, Ag2pcSecureWires)],
 ) -> Result<Vec<(Index48, Value32)>, PartyError> {
     let mut outputs = Vec::with_capacity(authenticated.len());
     for (index, wires) in authenticated {
-        let bits = c2pc.reveal_authenticated_public(streams, wires).await?;
+        let bits = session.reveal_public(streams, wires).await?;
         outputs.push((*index, value_from_bits(&bits)?));
     }
     streams.main.flush().await?;
     Ok(outputs)
 }
 
-fn clear_input_bits(role: Role, share: Value32) -> Vec<u8> {
-    let mut input = vec![0u8; 2 * VALUE_BITS];
+async fn authenticate_seed_inputs(
+    session: &mut Ag2pcSession,
+    streams: &mut Ag2pcStreams,
+    role: Role,
+    share: Value32,
+) -> Result<Ag2pcSecureWires, PartyError> {
+    let mut bob_bits = vec![0u8; VALUE_BITS];
+    let mut alice_bits = vec![0u8; VALUE_BITS];
     let mut share_bits = share.to_bits_msb();
     match role {
-        Role::Alice => input[VALUE_BITS..].copy_from_slice(&share_bits),
-        Role::Bob => input[..VALUE_BITS].copy_from_slice(&share_bits),
+        Role::Alice => alice_bits.copy_from_slice(&share_bits),
+        Role::Bob => bob_bits.copy_from_slice(&share_bits),
     }
     share_bits.zeroize();
-    input
+    let mut bits_per_owner = vec![bob_bits, alice_bits];
+    let inputs = session
+        .process_inputs(streams, &[Role::Bob, Role::Alice], &bits_per_owner)
+        .await?;
+    for bits in &mut bits_per_owner {
+        bits.zeroize();
+    }
+    Ok(Ag2pcSecureWires::concat(&inputs))
 }
 
 fn value_from_bits(bits: &[u8]) -> Result<Value32, PartyError> {
@@ -1024,40 +987,29 @@ fn default_sha256_compress_path() -> PathBuf {
     }
 }
 
-async fn open_streams_after_digest(
+async fn open_ag2pc_streams_after_digest(
     role: Role,
     port: u16,
     peer_ip: IpAddr,
     digest: [u8; 32],
-) -> Result<EmpStreams, PartyError> {
+) -> Result<Ag2pcStreams, PartyError> {
     // The C++ party exchanges the circuit digest on the main stream before it
-    // constructs C2PC/Fpre, so the auxiliary streams must be opened after it.
+    // constructs AG2PCSession, so the sibling stream must be opened after it.
     match role {
         Role::Alice => {
             let listener =
                 TcpListener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)).await?;
             let mut main = accept_emp(&listener).await?;
             exchange_circuit_digest(&mut main, role, digest).await?;
-            let fpre_io0 = accept_emp(&listener).await?;
-            let fpre_io2_0 = accept_emp(&listener).await?;
-            Ok(EmpStreams {
-                main,
-                fpre_io0,
-                fpre_io2_0,
-            })
+            let sibling = accept_emp(&listener).await?;
+            Ok(Ag2pcStreams { main, sibling })
         }
         Role::Bob => {
             let mut main = EmpStream::connect(peer_ip, port).await?;
             exchange_circuit_digest(&mut main, role, digest).await?;
             sleep(Duration::from_millis(1)).await;
-            let fpre_io0 = EmpStream::connect(peer_ip, port).await?;
-            sleep(Duration::from_millis(1)).await;
-            let fpre_io2_0 = EmpStream::connect(peer_ip, port).await?;
-            Ok(EmpStreams {
-                main,
-                fpre_io0,
-                fpre_io2_0,
-            })
+            let sibling = EmpStream::connect(peer_ip, port).await?;
+            Ok(Ag2pcStreams { main, sibling })
         }
     }
 }

@@ -57,10 +57,20 @@ checkout() { # path url commit
   git -C "$1" checkout --detach "$3"
 }
 
+apply_patch_once() { # repo patch
+  if git -C "$1" apply --check "$2"; then
+    git -C "$1" apply "$2"
+  elif ! git -C "$1" apply --reverse --check "$2"; then
+    git -C "$1" apply --check "$2"
+  fi
+}
+
 mkdir -p "$SRC" "$BUILD"
 checkout "$SRC/emp-tool"   https://github.com/emp-toolkit/emp-tool.git   "$EMP_TOOL_COMMIT"
 checkout "$SRC/emp-ot"     https://github.com/emp-toolkit/emp-ot.git     "$EMP_OT_COMMIT"
 checkout "$SRC/emp-ag2pc"  https://github.com/emp-toolkit/emp-ag2pc.git  "$EMP_AG2PC_COMMIT"
+apply_patch_once "$SRC/emp-ag2pc" \
+  "$ROOT_DIR/patches/emp-ag2pc-546d5e4-align-prg-random-data.patch"
 
 rm -rf "$PREFIX"; mkdir -p "$PREFIX"
 

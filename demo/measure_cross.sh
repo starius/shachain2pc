@@ -27,19 +27,25 @@ measure() { # label alice_bin bob_bin
   local label="$1" abin="$2" bbin="$3"
   local port ao bo t0 t1
   port="$(free_port)"; ao="$TMP/$label.ao"; bo="$TMP/$label.bo"
+  # Time the whole pairing: Alice startup + protocol + both parties exiting.
+  t0=$(date +%s.%N)
   env "${ENVV[@]}" "$abin" 1 "$port" "$SPEC" "$ASHARE" >"$ao" 2>/dev/null &
   local ap=$!
-  sleep 0.3
-  t0=$(date +%s.%N)
+  sleep 0.3  # let Alice bind the port before Bob connects (constant harness overhead)
   set +e
   env "${ENVV[@]}" "$bbin" 2 "$port" "$SPEC" "$BSHARE" 127.0.0.1 >"$bo" 2>/dev/null
   local brc=$?
-  t1=$(date +%s.%N)
   wait "$ap"; local arc=$?
+  t1=$(date +%s.%N)
   set -e
   local wall got bad=0
   wall=$(awk "BEGIN{print $t1-$t0}")
   got=$(grep -c '^RESULT ' "$bo" || true)
+  # Alice and Bob must agree on every RESULT line...
+  local abdiff
+  abdiff=$(diff <(grep '^RESULT ' "$ao") <(grep '^RESULT ' "$bo") | grep -c '^[<>]' || true)
+  bad=$((bad + abdiff))
+  # ...and Bob's RESULTs must match the single-party reference.
   while read -r tag idx val; do
     [[ "$tag" == "RESULT" ]] || continue
     [[ "$val" == "$("$REF_BIN" "$ASHARE" "$BSHARE" "$idx")" ]] || bad=$((bad + 1))

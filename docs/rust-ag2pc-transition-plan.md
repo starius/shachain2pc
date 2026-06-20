@@ -1,7 +1,8 @@
 # Rust AG2PC backend transition plan
 
 Status: implementation completed through Phase 6. Phase 7 remains open for
-broader measurement and final security review.
+broader measurement and final security review; mode-level cross-mode tamper
+smoke coverage is in place.
 
 Current implementation state:
 
@@ -14,6 +15,9 @@ Current implementation state:
 - Cross-mode smoke tests have passed locally in both role directions for
   single-index `I=1`, multi-block `I=3`, range `1-3`, chunked `I=3`,
   tree range `2-3`, and cache range `0x10-0x1f`.
+- Cross-mode tamper smoke passes in both role directions for chunked, tree,
+  cache-tile, and cache-fallback modes; Alice's test-only
+  `SHACHAIN2PC_TAMPER` hook aborts without any `RESULT`.
 - The old Rust WRK17/C2PC runtime and its stale old-EMP tests have been removed
   from the active Rust code/test path.
 - Active Rust/C++ compatibility tests now target only the current CSW,
@@ -278,7 +282,8 @@ from `party` behind a feature or branch-local switch.
 ## 9. Phase 5: reconnect party modes to new backend
 
 Status: completed. The Rust `party` binary now uses the AG2PC session path for
-all current modes and no longer calls the old `C2pc` API.
+all current modes, no longer calls the old `C2pc` API, and mirrors the C++
+test-only `SHACHAIN2PC_TAMPER` hook for chunk/tree/cache modes.
 
 Move `shachain2pc-party` from the old `C2pc` API to the new `Session` API.
 

@@ -29,9 +29,12 @@ What was tested locally:
   `10-1f`: passed.
 - Active Rust/C++ helper probes for CSW, SoftSpoken, AG2PC triple-pool draw,
   AG2PC input/reveal protocol, and AG2PC compute-in-place: passed.
+- `demo/cross_mode_tamper_smoke.sh` passes in both role directions for chunked,
+  tree, cache-tile, and cache-fallback mode tampering.
 
 Remaining validation:
 
 - Run broader benchmark and peak-RSS measurements after the backend transition.
 - Re-run larger cache batches and the ignored/manual 48-block worst case.
-- Add or run end-to-end cross-mode tamper tests for the party binary modes.
+- Add broader adversarial coverage beyond the mode-level smoke if a reviewer
+  wants every typed abort path exercised end-to-end.

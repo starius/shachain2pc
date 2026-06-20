@@ -130,5 +130,14 @@ run_case cache 10-1f \
   SHACHAIN2PC_CACHE=1 \
   SHACHAIN2PC_CHUNK_BLOCKS=16 \
   SHACHAIN2PC_TILE_FANOUT=16
+# 1024-leaf aligned subtree (depth 10): exercises a multi-level recursive tile
+# cover (partial top height 2, then two height-4 levels), unlike the single
+# 16-leaf tile above. Opt-in via CROSS_MODE_BIG=1 since it runs 1024 secrets.
+if [[ "${CROSS_MODE_BIG:-0}" == "1" ]]; then
+  run_case cache1024 800000000000-8000000003ff \
+    SHACHAIN2PC_CACHE=1 \
+    SHACHAIN2PC_CHUNK_BLOCKS=16 \
+    SHACHAIN2PC_TILE_FANOUT=16
+fi
 
 echo "cross-mode smoke passed"

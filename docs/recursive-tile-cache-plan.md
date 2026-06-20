@@ -1,6 +1,6 @@
 # Recursive tiled cache plan
 
-Status: planning note. No implementation yet.
+Status: planning note, revised after design review. No implementation yet.
 
 This is the next-step design for reducing remote-latency round trips while
 keeping the memory spike bounded. It generalizes the current fixed 16-leaf tile
@@ -34,6 +34,17 @@ because BOB learns before ALICE receives the broadcast. A party can always abort
 at the last step. If fair exchange is needed, it has to come from the surrounding
 Lightning protocol or a separate penalty/settlement mechanism, not plain 2PC.
 
+Integrity, however, is a sharper concern than fairness. The current `PUBLIC`
+reveal is correct-or-abort: BOB reconstructs from authenticated wires and the MAC
+check turns a wrong value into an abort, not a wrong secret. A naive simultaneous
+mask exchange that just XORs two locally held masks has no such check, so a
+malicious peer can send a bad mask and the other party reconstructs a wrong
+secret undetected. For revocation material a wrong secret is eventually caught
+on-chain, but it can wedge the channel meanwhile. So any reveal optimization MUST
+preserve abort-on-wrong-value -- keep the MAC check in the reconstruction, or use
+commit/open -- not merely match the existing fairness level. Commit/open restores
+integrity but reintroduces a round, which is the cost we were trying to avoid.
+
 For now, reveal remains unchanged and is measured separately.
 
 ## 2. Goal
@@ -60,6 +71,31 @@ Implementation-wise this is a special case, not a real tile circuit:
 `log2(1) = 0`, so there is no useful `BuildTileCircuit` call. Each branch edge
 is computed with the existing one-SHA `BuildChunkCircuit(sha, {bit}, false)`
 path.
+
+### Which latency this actually reduces
+
+Be explicit about the target, because it decides whether this is the right lever.
+A cache run has three serial phases at the transport: trunk, branch (precompute),
+and reveal. Recursion shrinks only the **branch** phase -- it collapses one-SHA
+prefix steps into upper tiles, cutting branch instances roughly in half (31 -> 17
+for 256 leaves). It does not touch trunk or reveal.
+
+Reveal is one `PUBLIC` reveal per secret and runs *after* precompute, with no
+overlap. At 50 ms RTT, 256 sequential reveals cost about 12.9 s (Section 1). So:
+
+- **End-to-end, back-to-back batch** (all leaves revealed in a burst): the
+  round-bearing steps are roughly trunk (~3) + branch + reveal (256). Recursion
+  removes ~14 of ~290 -- about 5%. Reveal dominates, and only the deferred reveal
+  optimization (Section 1) attacks it.
+- **Upfront precompute / cache refill** (reveal amortized at one RTT per channel
+  update over time): the cost you wait for is trunk + branch ~= 34 steps, and
+  recursion removes ~14 -- about 40%. This is the regime where recursion clearly
+  wins.
+
+So recursion is the right lever for refill/precompute latency and for budget
+(Section 6), not for steady-state per-update latency. If end-to-end burst latency
+is the goal, do the reveal optimization first. This plan assumes the
+precompute/refill regime.
 
 ## 3. High-level shape
 
@@ -168,6 +204,12 @@ top height 1, then height 4, 4, 4
 
 This avoids expanding to 16 bits and computing unused subtrees.
 
+Implementation note: this boundary handling is the riskiest part of the plan. The
+recommended first slice (Section 8) implements only aligned power-of-two coverage
+and falls back to the existing bottom-16-tile + one-SHA scheme at boundaries,
+deferring variable-height boundary tiles until the aligned path is trusted. Do
+not let boundary complexity gate the headline aligned win.
+
 ## 6. Budget accounting
 
 The security budget should continue to count malicious bucketing instances, not
@@ -202,13 +244,29 @@ The per-instance residual remains approximately `< 2^-ssp`, assuming the AG2PC
 bucketing proof applies to each larger tile circuit exactly as it does today.
 Larger tiles reduce instance count but increase circuit size per instance.
 
+This is a first-class benefit, not just accounting. Because the per-seed budget is
+`N * 2^-ssp` over instances `N`, halving branch instances (31 -> 17 for 256, a
+~45% cut) buys roughly 1.8x more channel updates against one seed before the
+budget forces a rotation. At the demo `ssp = 40` ceiling that headroom is worth as
+much as the latency change, and unlike the latency win it holds regardless of RTT.
+
 ## 7. Memory tradeoff
 
 Recursive tiling reduces round trips. It does not automatically reduce retained
 state if we eagerly precompute every leaf and hold all authenticated outputs
 until future reveals.
 
-There are two useful modes:
+First, set the floor correctly. The dominant memory cost is the per-tile
+preprocessing peak of a single tile circuit, not the retained outputs. A height-4
+tile is 15 SHA blocks and peaks around 240 MB while it is being garbled; a
+retained authenticated output is only a label plus MAC (tens of bytes per wire).
+Recursion is RAM-neutral versus the current tiled cache: it reuses the same tile
+height, so the per-instance peak is unchanged at ~240 MB. Retained-output growth
+is a separate, smaller term that only matters for large batches -- negligible for
+256-1024 leaves, but tens of MB for 8k+ (intermediate roots plus leaves), worth
+managing there.
+
+Two retention modes address that large-batch term:
 
 1. Eager precompute:
    compute all leaves before any reveal. This gives the lowest hot-path compute
@@ -229,13 +287,22 @@ plan should not assume eager storage is the final answer for 8k+ batches.
 2. Generalize the tile circuit:
    `BuildTileCircuit(sha, bit_offset, tile_height)`.
 3. Add pure tests:
-   verify offset tile circuits against `generate_from_seed` for several offsets
-   and heights.
-4. Implement recursive range covering:
-   full covered nodes use tile circuits; boundaries use smaller tiles or
-   one-step fallback.
-5. Keep cache digest negotiation strict:
-   include `tile_fanout`, trunk chunk size, range, and SHA gadget digest.
+   verify offset tile circuits against `generate_from_seed` for several
+   `(bit_offset, height)` pairs. For `bit_offset > 0` the outputs are intermediate
+   roots, so check them against `generate_from_seed(seed, ancestor_index)` with
+   the low bits zeroed. Also test the covering *decisions* (which arms run, which
+   fall back) for unaligned ranges, not just circuit shapes. `verify_circuit`'s
+   `RunTilePlain` today only covers `bit_offset == 0`; extend it.
+4. Implement recursive range covering incrementally. Land the aligned
+   power-of-two case first -- it is the clean ~2x branch win and is simple to get
+   right. For boundaries, fall back to the already-validated bottom-16-tile +
+   one-SHA scheme rather than introducing variable-height boundary tiles; defer
+   the latter until the aligned path is measured and trusted.
+5. Keep cache digest negotiation strict and bind `tile_fanout`. The covering
+   decomposition must be deterministic and identical on both sides (derived from
+   `(lo, hi, tile_fanout)`, never negotiated) so a mismatch aborts cleanly instead
+   of silently building different circuit sequences. The single run-level digest
+   must cover `tile_fanout`, trunk chunk size, range, and the SHA gadget digest.
 6. Extend tamper tests:
    tamper an upper tile and a bottom tile; both must abort before reveal.
 7. Measure:
@@ -244,12 +311,35 @@ plan should not assume eager storage is the final answer for 8k+ batches.
 
 ## 9. Expected effect
 
-For remote peers, the main win is fewer branch instances, hence fewer
-latency-bearing protocol phases. The 256-secret 50 ms RTT case should improve
-because branch instances drop from 31 to 17. Reveal will still cost about one RTT
-per actually revealed secret, and that is intentional for now.
+For remote peers, recursion cuts branch instances (31 -> 17 for 256 leaves), which
+reduces the precompute/refill latency and extends the per-seed budget by ~1.8x.
+The budget part is real and RTT-independent.
 
-The main risk is memory growth from retaining many authenticated leaf outputs.
-That is a storage policy issue, not a recursive-tiling security issue. If eager
-8k batches are too large, switch to frontier precompute while keeping the same
-recursive node primitive.
+Be honest about end-to-end burst latency, though. Reveal is unchanged at one RTT
+per secret and runs after precompute with no overlap, so for a back-to-back
+256-secret batch at 50 ms RTT (~12.9 s of reveal) recursion removes only ~5% of
+the round-bearing steps -- the reveal phase, not branches, dominates that case,
+and only the deferred reveal optimization (Section 1) attacks it. See Section 2,
+"Which latency this actually reduces."
+
+The main implementation risk is the recursive covering for unaligned/boundary
+ranges (Section 5); mitigate by landing the aligned case first and falling back to
+the existing scheme at boundaries. The main memory risk is retained authenticated
+outputs for 8k+ batches (Section 7), addressed by frontier precompute; recursion
+itself is RAM-neutral.
+
+## 10. Recommended sequencing
+
+1. Generalize the tile circuit to `BuildTileCircuit(sha, bit_offset, tile_height)`
+   and pure-test it for `bit_offset > 0`.
+2. Implement aligned power-of-two recursive covering; fall back to the current
+   bottom-16 + one-SHA scheme at boundaries.
+3. Measure the branch/reveal split at 50 ms RTT to confirm which phase to attack
+   next.
+4. If end-to-end burst latency still matters after the budget and refill wins,
+   pick up the reveal optimization (Section 1) with integrity preserved -- that is
+   the larger end-to-end lever.
+
+Aligned recursion plus the budget win is the high-value, low-risk first slice. The
+reveal optimization is the bigger end-to-end win but carries the integrity caveat
+in Section 1 and should not be rushed.

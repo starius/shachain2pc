@@ -22,9 +22,10 @@
 set -euo pipefail
 
 # DEPRECATED: emp is now built reproducibly by the nix flake (packages.emp).
-# Running `nix develop` builds the patched emp stack into /nix/store and links
-# .deps/emp to it -- no bootstrap needed. This script is retained only as a
-# non-nix fallback; it builds the same pins + patch into ./.deps/emp.
+# Running `nix develop` builds the patched emp stack into /nix/store and exports
+# EMP_PREFIX pointing at it -- no bootstrap needed. This script is retained only
+# as a non-nix fallback; it builds the same pins + patch into ./.deps/emp, the
+# layout EMP_PREFIX falls back to when it is unset.
 echo "NOTE: bootstrap-emp.sh is deprecated; 'nix develop' builds emp via nix." >&2
 
 # Allow -march=native through nix's cc-wrapper (it strips native arch by default

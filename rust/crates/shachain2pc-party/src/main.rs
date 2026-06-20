@@ -1224,6 +1224,37 @@ mod tests {
         assert_eq!(bob.unwrap(), expected);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_tree_range_matches_reference() {
+        let lo = Index48::from_hex("800000000000").unwrap();
+        let hi = Index48::from_hex("800000000001").unwrap();
+        let (alice, bob) = run_pair_tree(lo, hi, 0, Duration::from_secs(900)).await;
+        let expected = expected_range(lo, hi);
+        assert_eq!(alice.unwrap(), expected);
+        assert_eq!(bob.unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_cache_fallback_range_matches_reference() {
+        let lo = Index48::from_hex("800000000000").unwrap();
+        let hi = Index48::from_hex("800000000001").unwrap();
+        let (alice, bob) = run_pair_cache(lo, hi, 16, Duration::from_secs(900)).await;
+        let expected = expected_range(lo, hi);
+        assert_eq!(alice.unwrap(), expected);
+        assert_eq!(bob.unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "16-leaf cache tile is too slow for the default debug test run"]
+    async fn rust_cache_tile_range_matches_reference() {
+        let lo = Index48::from_hex("800000000000").unwrap();
+        let hi = Index48::from_hex("80000000000f").unwrap();
+        let (alice, bob) = run_pair_cache(lo, hi, 16, Duration::from_secs(7200)).await;
+        let expected = expected_range(lo, hi);
+        assert_eq!(alice.unwrap(), expected);
+        assert_eq!(bob.unwrap(), expected);
+    }
+
     #[test]
     fn mode_support_boundary_is_explicit() {
         let single = IndexSpec::Single(Index48::from_hex("1").unwrap());
@@ -1369,6 +1400,96 @@ mod tests {
         .unwrap()
     }
 
+    async fn run_pair_tree(
+        lo: Index48,
+        hi: Index48,
+        trunk_chunk_blocks: i32,
+        timeout_duration: Duration,
+    ) -> (
+        Result<Vec<(Index48, Value32)>, PartyError>,
+        Result<Vec<(Index48, Value32)>, PartyError>,
+    ) {
+        let _guard = party_test_lock().lock().await;
+        let port = free_port();
+        let alice_indices = indices_between(lo, hi);
+        let bob_indices = alice_indices.clone();
+        let alice = tokio::spawn(async move {
+            run_derivation_tree(
+                Role::Alice,
+                port,
+                &alice_indices,
+                Value32::from_hex(SHARE_A).unwrap(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                trunk_chunk_blocks,
+            )
+            .await
+        });
+        sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(async move {
+            run_derivation_tree(
+                Role::Bob,
+                port,
+                &bob_indices,
+                Value32::from_hex(SHARE_B).unwrap(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                trunk_chunk_blocks,
+            )
+            .await
+        });
+        timeout(timeout_duration, async {
+            let alice = alice.await.unwrap();
+            let bob = bob.await.unwrap();
+            (alice, bob)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn run_pair_cache(
+        lo: Index48,
+        hi: Index48,
+        trunk_chunk_blocks: i32,
+        timeout_duration: Duration,
+    ) -> (
+        Result<Vec<(Index48, Value32)>, PartyError>,
+        Result<Vec<(Index48, Value32)>, PartyError>,
+    ) {
+        let _guard = party_test_lock().lock().await;
+        let port = free_port();
+        let alice_indices = indices_between(lo, hi);
+        let bob_indices = alice_indices.clone();
+        let alice = tokio::spawn(async move {
+            run_derivation_cache(
+                Role::Alice,
+                port,
+                &alice_indices,
+                Value32::from_hex(SHARE_A).unwrap(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                trunk_chunk_blocks,
+            )
+            .await
+        });
+        sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(async move {
+            run_derivation_cache(
+                Role::Bob,
+                port,
+                &bob_indices,
+                Value32::from_hex(SHARE_B).unwrap(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                trunk_chunk_blocks,
+            )
+            .await
+        });
+        timeout(timeout_duration, async {
+            let alice = alice.await.unwrap();
+            let bob = bob.await.unwrap();
+            (alice, bob)
+        })
+        .await
+        .unwrap()
+    }
+
     async fn run_pair_range(
         lo: Index48,
         hi: Index48,
@@ -1461,6 +1582,19 @@ mod tests {
         Value32::from_hex(SHARE_A)
             .unwrap()
             .xor(Value32::from_hex(SHARE_B).unwrap())
+    }
+
+    fn indices_between(lo: Index48, hi: Index48) -> Vec<Index48> {
+        (lo.get()..=hi.get())
+            .map(|value| Index48::new(value).unwrap())
+            .collect()
+    }
+
+    fn expected_range(lo: Index48, hi: Index48) -> Vec<(Index48, Value32)> {
+        indices_between(lo, hi)
+            .into_iter()
+            .map(|index| (index, generate_from_seed(combined_seed(), index)))
+            .collect()
     }
 
     fn free_port() -> u16 {

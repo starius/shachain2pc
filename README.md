@@ -83,7 +83,8 @@ one circuit and garbles another.
   malicious-2PC-of-SHA-256 core.
 - **Build: nix** — a flake dev shell (`nix develop`) pins the toolchain and
   OpenSSL and builds the pinned, patched emp stack reproducibly into `/nix/store`
-  (`packages.emp`), exporting `EMP_PREFIX` (and a `.deps/emp` symlink) to it.
+  (`packages.emp`), exporting `EMP_PREFIX` to it (the Makefile and the C++/Rust
+  SHA-256 gadget paths read `EMP_PREFIX`; no `.deps` checkout is involved).
 
 The cryptographic rounds live inside the vetted `emp-ag2pc` engine; the "pure
 protocol" this project owns is the circuit/relation definition and the share/IO

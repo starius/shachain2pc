@@ -111,14 +111,10 @@
             export OPENSSL_ROOT_DIR='${opensslDev}'
             export OPENSSL_INCLUDE_DIR='${opensslDev}/include'
             export OPENSSL_CRYPTO_LIBRARY='${opensslLib}/lib/libcrypto.so'
-            # emp is built reproducibly by nix in /nix/store. Point EMP_PREFIX at it
-            # and keep a .deps/emp symlink so hardcoded .deps/emp paths (the SHA-256
-            # bristol file in protocol/circuit_gen and the Rust default path) resolve
-            # to the immutable store build instead of a mutable bootstrap checkout.
+            # emp is built reproducibly by nix in /nix/store. EMP_PREFIX points at
+            # it; the Makefile and both the C++ and Rust SHA-256 gadget paths read
+            # EMP_PREFIX directly, so no .deps checkout/symlink is involved.
             export EMP_PREFIX='${emp}'
-            mkdir -p .deps
-            rm -rf .deps/emp
-            ln -sfn '${emp}' .deps/emp
           '';
         };
       });

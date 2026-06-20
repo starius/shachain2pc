@@ -210,8 +210,7 @@ static bool VerifyRecursiveCachePlain(const proto::Circuit& sha,
 }
 
 int main() {
-  proto::Circuit sha = proto::LoadBristol(
-      ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt");
+  proto::Circuit sha = proto::LoadBristol(proto::DefaultSha256CompressPath());
 
   struct Case {
     uint8_t seed_fill;

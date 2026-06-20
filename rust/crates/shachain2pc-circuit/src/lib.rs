@@ -2,10 +2,18 @@ use sha2::{Digest, Sha256};
 use shachain2pc_types::{Index48, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub const DEFAULT_SHA256_COMPRESS_PATH: &str =
-    ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt";
+/// Path to the SHA-256 compression Bristol gadget. emp is built by the nix flake
+/// into /nix/store and exported as EMP_PREFIX; fall back to the legacy .deps/emp
+/// bootstrap layout (relative to the working dir) when EMP_PREFIX is unset.
+pub fn default_sha256_compress_path() -> PathBuf {
+    const SUFFIX: &str = "include/emp-tool/circuits/files/bristol_format/sha-256.txt";
+    match std::env::var("EMP_PREFIX") {
+        Ok(prefix) if !prefix.is_empty() => PathBuf::from(prefix).join(SUFFIX),
+        _ => PathBuf::from(".deps/emp").join(SUFFIX),
+    }
+}
 pub const CACHE_TILE_HEIGHT: usize = 4;
 pub const CACHE_TILE_LEAVES: usize = 1 << CACHE_TILE_HEIGHT;
 pub const CACHE_TILE_BITS: usize = VALUE_BITS * CACHE_TILE_LEAVES;
@@ -700,7 +708,7 @@ mod tests {
     }
 
     fn sha_gadget() -> Circuit {
-        load_bristol(repo_root().join(DEFAULT_SHA256_COMPRESS_PATH)).unwrap()
+        load_bristol(repo_root().join(default_sha256_compress_path())).unwrap()
     }
 
     fn hex32(bytes: [u8; 32]) -> String {

@@ -17,6 +17,7 @@
 #include "../protocol/bristol.h"
 
 using shachain2pc::protocol::Circuit;
+using shachain2pc::protocol::DefaultSha256CompressPath;
 using shachain2pc::protocol::EvalBristol;
 using shachain2pc::protocol::LoadBristol;
 
@@ -60,8 +61,7 @@ static std::vector<uint8_t> Pad32(const std::vector<uint8_t>& x) {
 }
 
 int main() {
-  Circuit c = LoadBristol(
-      ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt");
+  Circuit c = LoadBristol(DefaultSha256CompressPath());
   std::printf("circuit: n1=%d n2=%d n3=%d wires=%d gates=%d\n", c.n1, c.n2,
               c.n3, c.num_wire, c.num_gate());
 

@@ -14,6 +14,16 @@ pub fn default_sha256_compress_path() -> PathBuf {
         _ => PathBuf::from(".deps/emp").join(SUFFIX),
     }
 }
+
+/// The SHA-256 compression Bristol gadget, embedded into the binary at build time
+/// (build.rs resolves it from EMP_PREFIX). Lets a binary derive the gadget with
+/// no runtime file dependency.
+pub const SHA256_BRISTOL_SRC: &str = include_str!(env!("SHA256_BRISTOL_PATH"));
+
+/// Parse the embedded SHA-256 compression gadget (no file I/O).
+pub fn sha256_compress_gadget() -> Result<Circuit, CircuitError> {
+    parse_bristol(SHA256_BRISTOL_SRC, "<embedded sha-256>")
+}
 pub const CACHE_TILE_HEIGHT: usize = 4;
 pub const CACHE_TILE_LEAVES: usize = 1 << CACHE_TILE_HEIGHT;
 pub const CACHE_TILE_BITS: usize = VALUE_BITS * CACHE_TILE_LEAVES;
@@ -93,6 +103,12 @@ impl From<shachain2pc_types::ParseError> for CircuitError {
 pub fn load_bristol(path: impl AsRef<Path>) -> Result<Circuit, CircuitError> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)?;
+    parse_bristol(&text, &path.to_string_lossy())
+}
+
+/// Parse a Bristol-format circuit from `text`. `src` labels the source in error
+/// messages (a file path, or the embedded-gadget marker).
+pub fn parse_bristol(text: &str, src: &str) -> Result<Circuit, CircuitError> {
     let mut it = text.split_whitespace();
     let num_gate: i32 = next_parse(&mut it, "num_gate")?;
     let num_wire: i32 = next_parse(&mut it, "num_wire")?;
@@ -110,7 +126,7 @@ pub fn load_bristol(path: impl AsRef<Path>) -> Result<Circuit, CircuitError> {
     {
         return Err(CircuitError::Parse(format!(
             "LoadBristol: inconsistent header in {}",
-            path.display()
+            src
         )));
     }
 
@@ -121,7 +137,7 @@ pub fn load_bristol(path: impl AsRef<Path>) -> Result<Circuit, CircuitError> {
         if n_out != 1 {
             return Err(CircuitError::Parse(format!(
                 "LoadBristol: bad gate arity in {}",
-                path.display()
+                src
             )));
         }
 
@@ -137,7 +153,7 @@ pub fn load_bristol(path: impl AsRef<Path>) -> Result<Circuit, CircuitError> {
                     _ => {
                         return Err(CircuitError::Parse(format!(
                             "LoadBristol: unknown 2-input op in {}",
-                            path.display()
+                            src
                         )))
                     }
                 };
@@ -157,7 +173,7 @@ pub fn load_bristol(path: impl AsRef<Path>) -> Result<Circuit, CircuitError> {
             _ => {
                 return Err(CircuitError::Parse(format!(
                     "LoadBristol: unexpected gate fan-in in {}",
-                    path.display()
+                    src
                 )))
             }
         };
@@ -169,7 +185,7 @@ pub fn load_bristol(path: impl AsRef<Path>) -> Result<Circuit, CircuitError> {
         {
             return Err(CircuitError::Parse(format!(
                 "LoadBristol: gate wire index out of range in {}",
-                path.display()
+                src
             )));
         }
         gates.push(gate);
@@ -709,6 +725,13 @@ mod tests {
 
     fn sha_gadget() -> Circuit {
         load_bristol(repo_root().join(default_sha256_compress_path())).unwrap()
+    }
+
+    #[test]
+    fn embedded_gadget_matches_file() {
+        // The gadget baked in via include_str! must parse to the same circuit as
+        // the on-disk emp file, so the party can run with no runtime file.
+        assert_eq!(sha256_compress_gadget().unwrap(), sha_gadget());
     }
 
     fn hex32(bytes: [u8; 32]) -> String {

@@ -1270,15 +1270,15 @@ impl C2pc {
         self.ands_mac.clear();
         self.ands_key.clear();
         let ands_len = self.ands_block_len();
-        let mut first_refill = true;
-        while first_refill || self.ands_mac.len() < ands_len {
-            first_refill = false;
-            let (mut batch_mac, mut batch_key) = self.fpre.refill(streams).await?.into_parts();
-            let take = (ands_len - self.ands_mac.len()).min(batch_mac.len());
-            self.ands_mac.extend_from_slice(&batch_mac[..take]);
-            self.ands_key.extend_from_slice(&batch_key[..take]);
-            batch_mac.zeroize();
-            batch_key.zeroize();
+        if ands_len != 0 {
+            while self.ands_mac.len() < ands_len {
+                let (mut batch_mac, mut batch_key) = self.fpre.refill(streams).await?.into_parts();
+                let take = (ands_len - self.ands_mac.len()).min(batch_mac.len());
+                self.ands_mac.extend_from_slice(&batch_mac[..take]);
+                self.ands_key.extend_from_slice(&batch_key[..take]);
+                batch_mac.zeroize();
+                batch_key.zeroize();
+            }
         }
         timing.mark("fpre_refill");
 

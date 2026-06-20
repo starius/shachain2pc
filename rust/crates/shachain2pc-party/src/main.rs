@@ -1,11 +1,11 @@
 use shachain2pc_circuit::{
     batch_digest, build_chunk_circuit, build_circuit_for_index, check_chunk_circuit,
     chunk_spec_digest, circuit_digest, load_bristol, split_chain_bits, to_emp_gate_array,
-    DEFAULT_SHA256_COMPRESS_PATH,
+    tree_digest, DEFAULT_SHA256_COMPRESS_PATH,
 };
 use shachain2pc_emp_compat::{AuthenticatedBits, C2pc, C2pcCircuit, CompatError};
 use shachain2pc_emp_wire::{EmpStream, EmpStreams, WireError};
-use shachain2pc_types::{Index48, Role, Value32, VALUE_BITS};
+use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -176,9 +176,26 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
     let requested_mode = requested_mode_from_env(args.index_spec.is_range());
     ensure_mode_supported_for_now(&args.index_spec, requested_mode)?;
     if let Some(indices) = args.index_spec.indices() {
-        return run_derivation_batch(args.role, args.port, &indices, args.share, args.peer_ip)
-            .await
-            .map(PartyOutput::Range);
+        let outputs = match requested_mode {
+            RequestedMode::Full => {
+                run_derivation_batch(args.role, args.port, &indices, args.share, args.peer_ip)
+                    .await?
+            }
+            RequestedMode::Tree => {
+                let trunk_chunk_blocks = trunk_chunk_blocks_from_env(0);
+                run_derivation_tree(
+                    args.role,
+                    args.port,
+                    &indices,
+                    args.share,
+                    args.peer_ip,
+                    trunk_chunk_blocks,
+                )
+                .await?
+            }
+            RequestedMode::Chunked | RequestedMode::Cache => unreachable!("checked above"),
+        };
+        return Ok(PartyOutput::Range(outputs));
     }
 
     let index = args.index_spec.single_index()?;
@@ -280,6 +297,88 @@ async fn run_derivation_batch(
     reveal_authenticated_values(&c2pc, &mut streams, &authenticated)
         .await
         .inspect(|_| timing.mark("batch_reveal"))
+}
+
+async fn run_derivation_tree(
+    role: Role,
+    port: u16,
+    indices: &[Index48],
+    share: Value32,
+    peer_ip: IpAddr,
+    trunk_chunk_blocks: i32,
+) -> Result<Vec<(Index48, Value32)>, PartyError> {
+    let first_index = *indices
+        .first()
+        .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
+    let mut timing = PhaseTiming::new(role, first_index);
+    let sha = load_bristol(default_sha256_compress_path())?;
+    let (_, low_mask, high_mask) = range_split_masks(indices)?;
+    let trunk_groups = split_chain_bits(
+        first_index.get() & high_mask,
+        effective_chunk_size(trunk_chunk_blocks)?,
+    )?;
+    if trunk_groups.iter().map(Vec::len).sum::<usize>() == 0 {
+        return Err(PartyError::UnsupportedMode(
+            "shachain2pc: shared-trunk needs >=1 common high set bit (no shared hash in this range); use batch mode",
+        ));
+    }
+
+    let mut trunk_circuits = Vec::with_capacity(trunk_groups.len());
+    let mut branch_circuits = Vec::with_capacity(indices.len());
+    let mut max_ands = 0usize;
+    for (chunk, bits) in trunk_groups.iter().enumerate() {
+        let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
+        check_chunk_circuit(&circuit)?;
+        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
+        max_ands = max_ands.max(c2pc_circuit.num_ands());
+        trunk_circuits.push(c2pc_circuit);
+    }
+    for &index in indices {
+        let bits = set_bits_desc(index.get() & low_mask);
+        let circuit = build_chunk_circuit(&sha, &bits, false)?;
+        check_chunk_circuit(&circuit)?;
+        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
+        max_ands = max_ands.max(c2pc_circuit.num_ands());
+        branch_circuits.push(c2pc_circuit);
+    }
+    let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
+    let digest = tree_digest(&index_values, trunk_chunk_blocks, &sha);
+    timing.mark("build_tree_circuits");
+
+    let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
+    timing.mark("open_streams");
+    let mut c2pc =
+        C2pc::new_with_setup_size(&mut streams, role, trunk_circuits[0].clone(), max_ands).await?;
+    streams.main.flush().await?;
+    timing.mark("c2pc_setup");
+
+    let mut input = clear_input_bits(role, share);
+    let mut trunk = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
+    input.zeroize();
+    timing.mark("tree_trunk_0");
+
+    for (chunk, circuit) in trunk_circuits.into_iter().enumerate().skip(1) {
+        c2pc.reset_circuit(circuit);
+        trunk = run_carried_authenticated_stage(&mut c2pc, &mut streams, &trunk).await?;
+        timing.mark(match chunk {
+            1 => "tree_trunk_1",
+            2 => "tree_trunk_2",
+            3 => "tree_trunk_3",
+            _ => "tree_trunk",
+        });
+    }
+
+    let mut authenticated = Vec::with_capacity(indices.len());
+    for (i, circuit) in branch_circuits.into_iter().enumerate() {
+        c2pc.reset_circuit(circuit);
+        let out = run_carried_authenticated_stage(&mut c2pc, &mut streams, &trunk).await?;
+        authenticated.push((indices[i], out));
+        timing.mark("tree_branch");
+    }
+
+    reveal_authenticated_values(&c2pc, &mut streams, &authenticated)
+        .await
+        .inspect(|_| timing.mark("tree_reveal"))
 }
 
 async fn run_derivation_chunked(
@@ -474,6 +573,58 @@ fn chunk_blocks_from_env() -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+fn trunk_chunk_blocks_from_env(default: i32) -> i32 {
+    env::var("SHACHAIN2PC_CHUNK_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn effective_chunk_size(trunk_chunk_blocks: i32) -> Result<usize, PartyError> {
+    if trunk_chunk_blocks > 0 {
+        usize::try_from(trunk_chunk_blocks).map_err(|_| {
+            PartyError::UnsupportedMode("SHACHAIN2PC_CHUNK_BLOCKS is too large for this platform")
+        })
+    } else {
+        Ok(INDEX_BITS as usize)
+    }
+}
+
+fn range_split_masks(indices: &[Index48]) -> Result<(i32, u64, u64), PartyError> {
+    let first = indices
+        .first()
+        .ok_or(PartyError::UnsupportedMode("range must not be empty"))?
+        .get();
+    let mut diff = 0u64;
+    for index in indices {
+        diff |= index.get() ^ first;
+    }
+    let mut split = -1;
+    for bit in (0..INDEX_BITS).rev() {
+        if ((diff >> bit) & 1) != 0 {
+            split = bit as i32;
+            break;
+        }
+    }
+    let low_mask = if split < 0 {
+        0
+    } else {
+        (1u64 << (split as u32 + 1)) - 1
+    };
+    let high_mask = MAX_INDEX & !low_mask;
+    Ok((split, low_mask, high_mask))
+}
+
+fn set_bits_desc(value: u64) -> Vec<usize> {
+    let mut bits = Vec::new();
+    for bit in (0..INDEX_BITS).rev() {
+        if ((value >> bit) & 1) != 0 {
+            bits.push(bit as usize);
+        }
+    }
+    bits
+}
+
 fn ensure_mode_supported_for_now(
     index_spec: &IndexSpec,
     mode: RequestedMode,
@@ -485,9 +636,7 @@ fn ensure_mode_supported_for_now(
         (_, RequestedMode::Chunked) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_CHUNK_BLOCKS mode is single-index only",
         )),
-        (true, RequestedMode::Tree) => Err(PartyError::UnsupportedMode(
-            "Rust SHACHAIN2PC_TREE mode is not implemented until the session/carry sync phase",
-        )),
+        (true, RequestedMode::Tree) => Ok(()),
         (false, RequestedMode::Tree) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_TREE mode requires a range",
         )),
@@ -860,14 +1009,44 @@ mod tests {
             ensure_mode_supported_for_now(&range, RequestedMode::Chunked),
             Err(PartyError::UnsupportedMode(msg)) if msg.contains("single-index")
         ));
-        assert!(matches!(
-            ensure_mode_supported_for_now(&range, RequestedMode::Tree),
-            Err(PartyError::UnsupportedMode(msg)) if msg.contains("TREE")
-        ));
+        assert!(ensure_mode_supported_for_now(&range, RequestedMode::Tree).is_ok());
         assert!(matches!(
             ensure_mode_supported_for_now(&range, RequestedMode::Cache),
             Err(PartyError::UnsupportedMode(msg)) if msg.contains("CACHE")
         ));
+    }
+
+    #[test]
+    fn range_split_masks_match_high_trunk_low_branch() {
+        let indices = [
+            Index48::from_hex("800000000010").unwrap(),
+            Index48::from_hex("80000000001f").unwrap(),
+        ];
+        let (split, low_mask, high_mask) = range_split_masks(&indices).unwrap();
+        assert_eq!(split, 3);
+        assert_eq!(low_mask, 0x0f);
+        assert_eq!(high_mask, 0xffff_ffff_fff0);
+        assert_eq!(set_bits_desc(indices[0].get() & high_mask), vec![47, 4]);
+        assert_eq!(set_bits_desc(indices[1].get() & low_mask), vec![3, 2, 1, 0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_tree_without_shared_hash_refuses_before_socket() {
+        let port = free_port();
+        let lo = Index48::from_hex("1").unwrap();
+        let hi = Index48::from_hex("2").unwrap();
+        let err = run_derivation_tree(
+            Role::Alice,
+            port,
+            &[lo, hi],
+            Value32::from_hex(SHARE_A).unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PartyError::UnsupportedMode(msg) if msg.contains("shared-trunk")));
+        StdTcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     }
 
     async fn assert_party_pair_matches_reference(index_hex: &str, timeout_duration: Duration) {

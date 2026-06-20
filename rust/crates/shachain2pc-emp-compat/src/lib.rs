@@ -446,7 +446,25 @@ fn u128_to_block(value: u128) -> Block {
     Block::from_bytes(value.to_le_bytes())
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+#[inline]
 fn gf_mul(a: Block, b: Block) -> Block {
+    // SAFETY: target_feature(pclmulqdq) (and sse2, baseline on x86_64) guarantees
+    // the carryless-multiply intrinsics are available.
+    unsafe { gf_mul_clmul(a, b) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+#[inline]
+fn gf_mul(a: Block, b: Block) -> Block {
+    gf_mul_soft(a, b)
+}
+
+// Reference GF(2^128) multiply (poly x^128 + x^7 + x^2 + x + 1, normal bit order).
+// Kept as the non-x86 fallback and as the differential-test oracle for the CLMUL
+// path (tests::gf_mul_clmul_matches_soft).
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn gf_mul_soft(a: Block, b: Block) -> Block {
     let a = block_to_u128(a);
     let b = block_to_u128(b);
     let mut product = [0u64; 4];
@@ -456,6 +474,36 @@ fn gf_mul(a: Block, b: Block) -> Block {
         }
     }
     gf_reduce(product)
+}
+
+// pclmulqdq GF(2^128) multiply: schoolbook 128x128 carryless product, then fold
+// mod x^128 + x^7 + x^2 + x + 1 (g = 0x87). x^128 == g, so a degree-<256 product
+// reduces with two clmul folds. Validated bit-for-bit against gf_mul_soft.
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+#[inline]
+unsafe fn gf_mul_clmul(a: Block, b: Block) -> Block {
+    use core::arch::x86_64::*;
+    let a = _mm_loadu_si128(a.as_bytes().as_ptr().cast());
+    let b = _mm_loadu_si128(b.as_bytes().as_ptr().cast());
+    let g = _mm_set_epi64x(0, 0x87);
+    // 256-bit carryless product split into low/high 128-bit halves.
+    let t0 = _mm_clmulepi64_si128(a, b, 0x00); // a.lo * b.lo
+    let t3 = _mm_clmulepi64_si128(a, b, 0x11); // a.hi * b.hi
+    let t1 = _mm_clmulepi64_si128(a, b, 0x01); // a.hi * b.lo
+    let t2 = _mm_clmulepi64_si128(a, b, 0x10); // a.lo * b.hi
+    let mid = _mm_xor_si128(t1, t2);
+    let p_lo = _mm_xor_si128(t0, _mm_slli_si128(mid, 8));
+    let p_hi = _mm_xor_si128(t3, _mm_srli_si128(mid, 8));
+    // Fold p_hi (x^128..x^255) down: p_hi * g, then fold the 7-bit overflow once.
+    let c0 = _mm_clmulepi64_si128(p_hi, g, 0x00); // p_hi.lo * g
+    let c1 = _mm_clmulepi64_si128(p_hi, g, 0x01); // p_hi.hi * g
+    let q_lo = _mm_xor_si128(c0, _mm_slli_si128(c1, 8));
+    let q_hi = _mm_srli_si128(c1, 8); // 7-bit overflow at x^128..
+    let e = _mm_clmulepi64_si128(q_hi, g, 0x00);
+    let res = _mm_xor_si128(_mm_xor_si128(p_lo, q_lo), e);
+    let mut out = [0u8; 16];
+    _mm_storeu_si128(out.as_mut_ptr().cast(), res);
+    Block::from_bytes(out)
 }
 
 fn xor_shifted_u128(dst: &mut [u64; 4], value: u128, shift: usize) {
@@ -3740,6 +3788,25 @@ mod tests {
                 hex_encode(&hash_once(&msg)),
                 record["outputs"]["sha256"].as_str().unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn gf_mul_clmul_matches_soft() {
+        // gf_mul (CLMUL on x86) must equal the bit-by-bit reference for all inputs.
+        let mut prg = Prg::new(Block::make(0x9e37_79b9, 0x7f4a_7c15), 0);
+        for _ in 0..5000 {
+            let pair = prg.random_block(2);
+            assert_eq!(gf_mul(pair[0], pair[1]), gf_mul_soft(pair[0], pair[1]));
+        }
+        // Edge cases: zero, one, all-ones, high bit set.
+        let one = Block::make(0, 1);
+        let ones = Block::make(u64::MAX, u64::MAX);
+        let hi = Block::make(1 << 63, 0);
+        for &a in &[Block::zero(), one, ones, hi] {
+            for &b in &[Block::zero(), one, ones, hi] {
+                assert_eq!(gf_mul(a, b), gf_mul_soft(a, b));
+            }
         }
     }
 

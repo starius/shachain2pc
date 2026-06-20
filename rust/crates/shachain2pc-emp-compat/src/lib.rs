@@ -527,12 +527,21 @@ pub fn sfvole_sender_butterfly(
     let key = Prp::new(Block::make(0, session_id));
     let mut u = vec![Block::zero(); bs];
     let mut v = vec![Block::zero(); k * bs];
+    // Batch the q AES calls per column (all share `key`): r[x] = AES(in) ^ in
+    // with in = make(0, counter) ^ leaves[x]. Buffers hoisted out of the loop.
+    let mut r = vec![Block::zero(); q];
+    let mut inputs = vec![Block::zero(); q];
 
     for j in 0..bs {
-        let mut r = vec![Block::zero(); q];
-        for x in 0..q {
-            r[x] = aes_dm(&key, counter_base + j as u64, leaves[x]);
-            u[j] = u[j].xor(r[x]);
+        let ctr = Block::make(0, counter_base + j as u64);
+        for (dst, leaf) in inputs.iter_mut().zip(leaves) {
+            *dst = ctr.xor(*leaf);
+        }
+        r.copy_from_slice(&inputs);
+        key.permute_block(&mut r);
+        for (rx, inp) in r.iter_mut().zip(&inputs) {
+            *rx = rx.xor(*inp);
+            u[j] = u[j].xor(*rx);
         }
         for plane in 0..k {
             let mut acc = Block::zero();
@@ -560,11 +569,18 @@ pub fn sfvole_receiver_butterfly(
     let q = 1usize << k;
     let key = Prp::new(Block::make(0, session_id));
     let mut w = vec![Block::zero(); k * bs];
+    let mut r = vec![Block::zero(); q];
+    let mut inputs = vec![Block::zero(); q];
 
     for j in 0..bs {
-        let mut r = vec![Block::zero(); q];
-        for y in 0..q {
-            r[y] = aes_dm(&key, counter_base + j as u64, leaves[alpha ^ y]);
+        let ctr = Block::make(0, counter_base + j as u64);
+        for (y, dst) in inputs.iter_mut().enumerate() {
+            *dst = ctr.xor(leaves[alpha ^ y]);
+        }
+        r.copy_from_slice(&inputs);
+        key.permute_block(&mut r);
+        for (rx, inp) in r.iter_mut().zip(&inputs) {
+            *rx = rx.xor(*inp);
         }
         for plane in 0..k {
             let mut acc = Block::zero();

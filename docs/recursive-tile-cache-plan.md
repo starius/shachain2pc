@@ -1,6 +1,9 @@
 # Recursive tiled cache plan
 
-Status: planning note, revised after design review. No implementation yet.
+Status: implemented and measured (see Section 9, "Measured"). Originally a
+planning note; kept as the design record. The aligned recursive cover, the
+`tile_fanout` knob, and the offset tile circuit are implemented; unaligned ranges
+fall back to the existing bottom-16 + one-SHA scheme.
 
 This is the next-step design for reducing remote-latency round trips while
 keeping the memory spike bounded. It generalizes the current fixed 16-leaf tile
@@ -327,6 +330,39 @@ ranges (Section 5); mitigate by landing the aligned case first and falling back 
 the existing scheme at boundaries. The main memory risk is retained authenticated
 outputs for 8k+ batches (Section 7), addressed by frontier precompute; recursion
 itself is RAM-neutral.
+
+### Measured (50 ms emulated RTT)
+
+Aligned ranges, fanout 16, trunk chunk 16, ssp 40, versus the pure
+one-SHA-per-secret baseline (fanout 1). Reveal is measured separately. Every run
+verified mismatches=0 against the reference.
+
+| leaves | mode | branch instances | branch s/secret | preReveal s/secret | reveal s/secret | peak RSS |
+|---:|:--|---:|---:|---:|---:|---:|
+| 256  | recursive | 17   | 0.118 | 0.141 | 0.050 | 248 MB |
+| 1024 | recursive | 69   | 0.119 | 0.125 | 0.050 | 250 MB |
+| 8192 | recursive | 547  | 0.118 | 0.120 | 0.050 | 513 MB |
+| 256  | one-SHA   | 255  | 0.639 | 0.661 | 0.050 | 248 MB |
+| 1024 | one-SHA   | 1023 | 0.642 | 0.647 | 0.050 | 248 MB |
+
+The marginal precompute cost is ~0.118 s/secret independent of batch size; the
+one-time trunk (5.5-8 s) amortizes, so preReveal/secret falls toward it as the
+batch grows. Branch instances match the cover formula (256->17, 1024->69,
+8192->547, the last with a height-1 top level).
+
+Two corrections to the expectations above, from the measurement:
+
+1. **Recursion vs pure one-SHA is a ~5.4x per-secret precompute win** (0.64 ->
+   0.118 s), not ~2x. The ~2x figure was recursion vs the already-tiled hybrid;
+   against plain one-SHA the branch phase has ~15x more instances (255 vs 17 for
+   256 leaves) and tiling collapses them. Budget headroom vs one-SHA is likewise
+   ~15x, not ~1.8x.
+2. **Precompute, not reveal, dominates at 50 ms.** Branch is ~0.118 s/secret vs
+   reveal ~0.050 s/secret (one RTT). The "reveal dominates" note above
+   under-counted per-instance round cost: a 15-edge tile costs ~1.8 s at 50 ms,
+   not the ~0.5 s assumed, so the branch phase is large in absolute terms. The
+   phase recursion optimizes is therefore the dominant one; the deferred reveal
+   optimization (Section 1) addresses the smaller ~0.05 s/secret term.
 
 ## 10. Recommended sequencing
 

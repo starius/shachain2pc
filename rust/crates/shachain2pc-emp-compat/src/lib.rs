@@ -43,6 +43,11 @@ pub enum CompatError {
         expected: usize,
         actual: usize,
     },
+    BadAuthenticatedSlice {
+        len: usize,
+        start: usize,
+        end: usize,
+    },
     C2pcInvalidMaskBit {
         wire: usize,
         value: u8,
@@ -92,6 +97,10 @@ impl fmt::Display for CompatError {
             Self::BadC2pcInputLength { expected, actual } => write!(
                 f,
                 "C2PC online input length mismatch: expected={expected}, actual={actual}"
+            ),
+            Self::BadAuthenticatedSlice { len, start, end } => write!(
+                f,
+                "authenticated bit slice [{start}, {end}) is out of range for length {len}"
             ),
             Self::C2pcInvalidMaskBit { wire, value } => {
                 write!(f, "C2PC mask byte at wire {wire} is not a bit: {value}")
@@ -1191,6 +1200,22 @@ impl AuthenticatedBits {
 
     pub fn lambda(&self) -> &[u8] {
         &self.lambda
+    }
+
+    pub fn slice(&self, start: usize, end: usize) -> Result<Self> {
+        if start > end || end > self.len() {
+            return Err(CompatError::BadAuthenticatedSlice {
+                len: self.len(),
+                start,
+                end,
+            });
+        }
+        Ok(Self {
+            mac: self.mac[start..end].to_vec(),
+            key: self.key[start..end].to_vec(),
+            lambda: self.lambda[start..end].to_vec(),
+            label: self.label[start..end].to_vec(),
+        })
     }
 }
 
@@ -3049,6 +3074,31 @@ mod tests {
         .unwrap();
         assert_eq!(alice.unwrap(), vec![0]);
         assert_eq!(bob.unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn authenticated_bits_slice_is_bounds_checked() {
+        let wires = AuthenticatedBits {
+            mac: (0..4).map(|i| Block::make(0, i)).collect(),
+            key: (0..4).map(|i| Block::make(1, i)).collect(),
+            lambda: vec![0, 1, 0, 1],
+            label: (0..4).map(|i| Block::make(2, i)).collect(),
+        };
+        let slice = wires.slice(1, 3).unwrap();
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice.mac, vec![Block::make(0, 1), Block::make(0, 2)]);
+        assert_eq!(slice.key, vec![Block::make(1, 1), Block::make(1, 2)]);
+        assert_eq!(slice.lambda, vec![1, 0]);
+        assert_eq!(slice.label, vec![Block::make(2, 1), Block::make(2, 2)]);
+
+        assert!(matches!(
+            wires.slice(3, 5),
+            Err(CompatError::BadAuthenticatedSlice {
+                len: 4,
+                start: 3,
+                end: 5
+            })
+        ));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use p256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
-use shachain2pc_emp_wire::{Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
+use shachain2pc_emp_wire::{Ag2pcStreams, Block, EmpStream, EmpStreams, WireError, BLOCK_BYTES};
 use shachain2pc_types::Role;
 use std::env;
 use std::fmt;
@@ -35,6 +35,8 @@ pub enum CompatError {
         data1: usize,
     },
     BadCswLength(usize),
+    BadAg2pcOwner(u8),
+    BadAg2pcInputShape,
     BadFpreCheckIndex(usize),
     BadFpreGeneratedLength {
         expected: usize,
@@ -94,6 +96,12 @@ impl fmt::Display for CompatError {
             }
             Self::BadCswLength(len) => {
                 write!(f, "CSW base OT length must be at least 80, got {len}")
+            }
+            Self::BadAg2pcOwner(owner) => {
+                write!(f, "AG2PC input owner must be 1 or 2, got {owner}")
+            }
+            Self::BadAg2pcInputShape => {
+                write!(f, "AG2PC owner and input-bit vector lengths differ")
             }
             Self::BadFpreCheckIndex(index) => {
                 write!(f, "Fpre check index must be 0 or 1, got {index}")
@@ -1106,6 +1114,21 @@ impl SoftSpoken4 {
         })
     }
 
+    pub fn new_with_delta(role: Role, malicious: bool, delta: Block) -> Result<Self> {
+        let mut out = Self::new(role, malicious)?;
+        out.set_delta(delta)?;
+        Ok(out)
+    }
+
+    pub fn set_delta(&mut self, delta: Block) -> Result<()> {
+        if self.setup_done || self.role != Role::Alice {
+            return Err(CompatError::IknpWrongRole("SoftSpoken4::set_delta"));
+        }
+        self.delta = delta;
+        self.delta_bool = block_to_bools(delta);
+        Ok(())
+    }
+
     pub fn delta(&self) -> Block {
         self.delta
     }
@@ -1117,7 +1140,7 @@ impl SoftSpoken4 {
         Ok(out)
     }
 
-    async fn begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+    pub async fn begin(&mut self, stream: &mut EmpStream) -> Result<()> {
         if self.role == Role::Alice {
             self.send_begin(stream).await
         } else {
@@ -1125,7 +1148,7 @@ impl SoftSpoken4 {
         }
     }
 
-    async fn end(&mut self, stream: &mut EmpStream) -> Result<()> {
+    pub async fn end(&mut self, stream: &mut EmpStream) -> Result<()> {
         if self.role == Role::Alice {
             self.send_end(stream).await
         } else {
@@ -1133,7 +1156,7 @@ impl SoftSpoken4 {
         }
     }
 
-    async fn next_n(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+    pub async fn next_n(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
         let mut out = Vec::with_capacity(length);
         while out.len() + SOFTSPOKEN_CHUNK_OTS <= length {
             out.extend(self.next_chunk(stream, SOFTSPOKEN_CHUNK_BLOCKS).await?);
@@ -1463,6 +1486,293 @@ fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {
         rows.extend_from_slice(block.as_bytes());
     }
     transpose_128_rows(&rows, bs * BLOCK_BYTES, bs * 128)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AShareBundle {
+    pub mac: Block,
+    pub key: Block,
+}
+
+impl Default for AShareBundle {
+    fn default() -> Self {
+        Self {
+            mac: Block::zero(),
+            key: Block::zero(),
+        }
+    }
+}
+
+impl Zeroize for AShareBundle {
+    fn zeroize(&mut self) {
+        self.mac.zeroize();
+        self.key.zeroize();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Ag2pcSecureWires {
+    pub lambda: Vec<u8>,
+    pub wire_bundle: Vec<AShareBundle>,
+    pub label0: Vec<Block>,
+    pub eval_label: Vec<Block>,
+}
+
+impl Ag2pcSecureWires {
+    pub fn len(&self) -> usize {
+        self.lambda.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lambda.is_empty()
+    }
+
+    pub fn slice(&self, start: usize, end: usize) -> Result<Self> {
+        if start > end || end > self.len() {
+            return Err(CompatError::BadAuthenticatedSlice {
+                len: self.len(),
+                start,
+                end,
+            });
+        }
+        Ok(Self {
+            lambda: self.lambda[start..end].to_vec(),
+            wire_bundle: self.wire_bundle[start..end].to_vec(),
+            label0: if self.label0.is_empty() {
+                Vec::new()
+            } else {
+                self.label0[start..end].to_vec()
+            },
+            eval_label: if self.eval_label.is_empty() {
+                Vec::new()
+            } else {
+                self.eval_label[start..end].to_vec()
+            },
+        })
+    }
+}
+
+impl Drop for Ag2pcSecureWires {
+    fn drop(&mut self) {
+        self.lambda.zeroize();
+        self.wire_bundle.zeroize();
+        self.label0.zeroize();
+        self.eval_label.zeroize();
+    }
+}
+
+pub struct Ag2pcTriplePool {
+    party: Role,
+    ssp: usize,
+    abit1: SoftSpoken4,
+    abit2: SoftSpoken4,
+    delta: Block,
+    cots_minted_since_check: bool,
+}
+
+impl Ag2pcTriplePool {
+    pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
+        if !streams.main.fs_enabled() {
+            streams.main.enable_fs(party == Role::Alice)?;
+        }
+        if !streams.sibling.fs_enabled() {
+            streams.sibling.enable_fs(party == Role::Alice)?;
+        }
+
+        let delta = random_ag2pc_delta(party)?;
+        let mut out = Self {
+            party,
+            ssp,
+            abit1: SoftSpoken4::new_with_delta(Role::Alice, true, delta)?,
+            abit2: SoftSpoken4::new(Role::Bob, true)?,
+            delta,
+            cots_minted_since_check: false,
+        };
+        out.begin_abits(streams).await?;
+        Ok(out)
+    }
+
+    pub fn party(&self) -> Role {
+        self.party
+    }
+
+    pub fn delta(&self) -> Block {
+        self.delta
+    }
+
+    pub fn ssp(&self) -> usize {
+        self.ssp
+    }
+
+    pub fn get_bucket_size(&self, size: usize) -> usize {
+        let size = size.max(1024);
+        let log2_l = (size as f64).log2();
+        let mut bucket = 2usize;
+        while log2_l * ((bucket - 1) as f64) <= self.ssp as f64 {
+            bucket += 1;
+        }
+        bucket
+    }
+
+    pub async fn draw(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        count: usize,
+    ) -> Result<Vec<AShareBundle>> {
+        let (mac, key) = self.gen_cot_shares(streams, count).await?;
+        Ok(mac
+            .into_iter()
+            .zip(key)
+            .map(|(mac, key)| AShareBundle { mac, key })
+            .collect())
+    }
+
+    pub async fn maybe_flush_cot_check(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        if self.cots_minted_since_check {
+            self.flush_cot_check(streams).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn flush_cot_check(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        self.cots_minted_since_check = false;
+        self.end_abits(streams).await?;
+        self.begin_abits(streams).await
+    }
+
+    pub async fn end(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        self.cots_minted_since_check = false;
+        self.end_abits(streams).await
+    }
+
+    async fn gen_cot_shares(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        count: usize,
+    ) -> Result<(Vec<Block>, Vec<Block>)> {
+        self.cots_minted_since_check = true;
+        match self.party {
+            Role::Alice => {
+                let (key, mac) = tokio::try_join!(
+                    ag2pc_next_n_flush(&mut self.abit1, &mut streams.sibling, count),
+                    ag2pc_next_n_flush(&mut self.abit2, &mut streams.main, count)
+                )?;
+                Ok((mac, key))
+            }
+            Role::Bob => {
+                let (key, mac) = tokio::try_join!(
+                    ag2pc_next_n_flush(&mut self.abit1, &mut streams.main, count),
+                    ag2pc_next_n_flush(&mut self.abit2, &mut streams.sibling, count)
+                )?;
+                Ok((mac, key))
+            }
+        }
+    }
+
+    async fn begin_abits(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        match self.party {
+            Role::Alice => {
+                tokio::try_join!(
+                    ag2pc_begin_flush(&mut self.abit1, &mut streams.sibling),
+                    ag2pc_begin_flush(&mut self.abit2, &mut streams.main)
+                )?;
+            }
+            Role::Bob => {
+                tokio::try_join!(
+                    ag2pc_begin_flush(&mut self.abit1, &mut streams.main),
+                    ag2pc_begin_flush(&mut self.abit2, &mut streams.sibling)
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn end_abits(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+        match self.party {
+            Role::Alice => {
+                tokio::try_join!(
+                    ag2pc_end_flush(&mut self.abit1, &mut streams.sibling),
+                    ag2pc_end_flush(&mut self.abit2, &mut streams.main)
+                )?;
+            }
+            Role::Bob => {
+                tokio::try_join!(
+                    ag2pc_end_flush(&mut self.abit1, &mut streams.main),
+                    ag2pc_end_flush(&mut self.abit2, &mut streams.sibling)
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Ag2pcTriplePool {
+    fn drop(&mut self) {
+        self.delta.zeroize();
+    }
+}
+
+async fn ag2pc_begin_flush(soft: &mut SoftSpoken4, stream: &mut EmpStream) -> Result<()> {
+    soft.begin(stream).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn ag2pc_next_n_flush(
+    soft: &mut SoftSpoken4,
+    stream: &mut EmpStream,
+    count: usize,
+) -> Result<Vec<Block>> {
+    let out = soft.next_n(stream, count).await?;
+    stream.flush().await?;
+    Ok(out)
+}
+
+async fn ag2pc_end_flush(soft: &mut SoftSpoken4, stream: &mut EmpStream) -> Result<()> {
+    soft.end(stream).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+fn random_ag2pc_delta(party: Role) -> Result<Block> {
+    let mut bytes = random_block()?.into_bytes();
+    bytes[0] |= 1;
+    if party == Role::Alice {
+        bytes[0] |= 2;
+    } else {
+        bytes[0] &= !2;
+    }
+    Ok(Block::from_bytes(bytes))
+}
+
+fn select_block(bit: u8) -> Block {
+    if (bit & 1) == 0 {
+        Block::zero()
+    } else {
+        Block::from_bytes([0xff; BLOCK_BYTES])
+    }
+}
+
+fn block_lsb(block: Block) -> u8 {
+    u8::from(block.get_lsb())
+}
+
+pub fn verify_ag2pc_share_relation(
+    local: &[AShareBundle],
+    local_delta: Block,
+    peer: &[AShareBundle],
+    peer_delta: Block,
+) -> bool {
+    local.len() == peer.len()
+        && local.iter().zip(peer).all(|(mine, theirs)| {
+            let mine_expected = theirs
+                .key
+                .xor(select_block(block_lsb(mine.mac)).and(peer_delta));
+            let peer_expected = mine
+                .key
+                .xor(select_block(block_lsb(theirs.mac)).and(local_delta));
+            mine.mac == mine_expected && theirs.mac == peer_expected
+        })
 }
 
 struct IknpSendState {
@@ -3695,6 +4005,7 @@ mod tests {
     const LIVE_C2PC_TIMEOUT: Duration = Duration::from_secs(120);
     const LIVE_IKNP_LENGTH: usize = 2051;
     const LIVE_LEAKY_LENGTH: usize = 257;
+    const LIVE_AG2PC_DRAW_LENGTH: usize = 257;
     const LIVE_FPRE_REQUESTED_SIZE: usize = 321;
     const LIVE_FPRE_GENERATE_LENGTH: usize = 683;
     const LIVE_FPRE_CHECK_LENGTH: usize = 683;
@@ -4704,6 +5015,53 @@ mod tests {
         assert_softspoken_relation(&receiver, delta, &sender);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rust_ag2pc_triple_pool_draw_roundtrip() {
+        let port = free_port();
+        let alice = tokio::spawn(async move {
+            let mut streams =
+                Ag2pcStreams::open(Role::Alice, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    .await
+                    .unwrap();
+            let mut pool = Ag2pcTriplePool::setup(&mut streams, Role::Alice, 40)
+                .await
+                .unwrap();
+            let bundle = pool
+                .draw(&mut streams, LIVE_AG2PC_DRAW_LENGTH)
+                .await
+                .unwrap();
+            pool.flush_cot_check(&mut streams).await.unwrap();
+            (pool.delta(), bundle)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(async move {
+            let mut streams = Ag2pcStreams::open(Role::Bob, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .await
+                .unwrap();
+            let mut pool = Ag2pcTriplePool::setup(&mut streams, Role::Bob, 40)
+                .await
+                .unwrap();
+            let bundle = pool
+                .draw(&mut streams, LIVE_AG2PC_DRAW_LENGTH)
+                .await
+                .unwrap();
+            pool.flush_cot_check(&mut streams).await.unwrap();
+            (pool.delta(), bundle)
+        });
+        let ((alice_delta, alice_bundle), (bob_delta, bob_bundle)) =
+            timeout(LIVE_INTEROP_TIMEOUT, async {
+                (alice.await.unwrap(), bob.await.unwrap())
+            })
+            .await
+            .unwrap();
+        assert!(verify_ag2pc_share_relation(
+            &alice_bundle,
+            alice_delta,
+            &bob_bundle,
+            bob_delta
+        ));
+    }
+
     #[cfg(feature = "cpp-probes")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_csw_base_ot_interop() {
@@ -4722,6 +5080,15 @@ mod tests {
         let bin = cpp_softspoken_probe();
         run_live_softspoken_case(&bin, Role::Alice).await;
         run_live_softspoken_case(&bin, Role::Bob).await;
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_cpp_ag2pc_triple_pool_draw_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_ag2pc_triple_pool_probe();
+        run_live_ag2pc_triple_pool_case(&bin, Role::Alice).await;
+        run_live_ag2pc_triple_pool_case(&bin, Role::Bob).await;
     }
 
     async fn run_live_otco_case(bin: &Path, rust_transport: TestTransport, rust_role: TestOtRole) {
@@ -5810,6 +6177,83 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cpp-probes")]
+    async fn run_live_ag2pc_triple_pool_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_role.party_id().to_string())
+            .arg(port.to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if rust_role == Role::Bob {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            Ag2pcStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC triple-pool stream open failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC triple-pool stream open timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+        let result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_ag2pc_triple_pool_peer(&mut streams, rust_role),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC triple-pool failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC triple-pool timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ AG2PC triple-pool probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -5837,6 +6281,59 @@ mod tests {
             stream.flush().await?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn run_rust_ag2pc_triple_pool_peer(streams: &mut Ag2pcStreams, role: Role) -> Result<()> {
+        let mut pool = Ag2pcTriplePool::setup(streams, role, 40).await?;
+        let local = pool.draw(streams, LIVE_AG2PC_DRAW_LENGTH).await?;
+        pool.flush_cot_check(streams).await?;
+
+        let (peer_delta, peer) = if role == Role::Alice {
+            send_ag2pc_bundle(&mut streams.main, pool.delta(), &local).await?;
+            recv_ag2pc_bundle(&mut streams.main).await?
+        } else {
+            let peer = recv_ag2pc_bundle(&mut streams.main).await?;
+            send_ag2pc_bundle(&mut streams.main, pool.delta(), &local).await?;
+            peer
+        };
+        assert!(verify_ag2pc_share_relation(
+            &local,
+            pool.delta(),
+            &peer,
+            peer_delta
+        ));
+        pool.end(streams).await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn send_ag2pc_bundle(
+        stream: &mut EmpStream,
+        delta: Block,
+        bundle: &[AShareBundle],
+    ) -> Result<()> {
+        let mac: Vec<Block> = bundle.iter().map(|item| item.mac).collect();
+        let key: Vec<Block> = bundle.iter().map(|item| item.key).collect();
+        stream.send_block(&[delta]).await?;
+        stream.send_block(&mac).await?;
+        stream.send_block(&key).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn recv_ag2pc_bundle(stream: &mut EmpStream) -> Result<(Block, Vec<AShareBundle>)> {
+        let delta = stream.recv_block(1).await?[0];
+        let mac = stream.recv_block(LIVE_AG2PC_DRAW_LENGTH).await?;
+        let key = stream.recv_block(LIVE_AG2PC_DRAW_LENGTH).await?;
+        Ok((
+            delta,
+            mac.into_iter()
+                .zip(key)
+                .map(|(mac, key)| AShareBundle { mac, key })
+                .collect(),
+        ))
     }
 
     fn assert_softspoken_relation(receiver_data: &[Block], delta: Block, sender_data: &[Block]) {
@@ -6651,6 +7148,28 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/softspoken_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    fn cpp_ag2pc_triple_pool_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/ag2pc_triple_pool_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/ag2pc_triple_pool_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "failed to build .build/ag2pc_triple_pool_probe"
+            );
+        }
+        assert!(
+            bin.exists(),
+            ".build/ag2pc_triple_pool_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

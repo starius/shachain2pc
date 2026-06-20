@@ -1,12 +1,15 @@
 # Build shachain2pc. Run inside the flake dev shell:
-#   nix develop -c ./tools/bootstrap-emp.sh   # once: fetch + build emp
+#   nix develop          # builds the pinned, patched emp stack via nix into
+#                        # /nix/store and exports EMP_PREFIX (+ a .deps/emp symlink)
 #   nix develop -c make
 #
-# emp (emp-tool lib + emp-ot/emp-ag2pc headers) lives in .deps/emp after
-# bootstrap; OpenSSL comes from the nix shell via pkg-config.
+# emp (emp-tool lib + emp-ot/emp-ag2pc headers) is built reproducibly by the nix
+# flake (packages.emp) into /nix/store; EMP_PREFIX points there. OpenSSL comes
+# from the nix shell via pkg-config. EMP_PREFIX falls back to .deps/emp when unset
+# (e.g. a legacy bootstrap checkout).
 
 CXX ?= g++
-EMP_PREFIX := .deps/emp
+EMP_PREFIX ?= .deps/emp
 
 # Allow -march=native through nix's cc-wrapper (strips native arch by default).
 export NIX_ENFORCE_NO_NATIVE := 0

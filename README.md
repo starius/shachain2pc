@@ -82,8 +82,8 @@ one circuit and garbles another.
   **not** need post-quantum or threshold security, so we use just the
   malicious-2PC-of-SHA-256 core.
 - **Build: nix** — a flake dev shell (`nix develop`) pins the toolchain and
-  OpenSSL; `tools/bootstrap-emp.sh` fetches and builds the pinned emp stack into
-  `.deps/emp`.
+  OpenSSL and builds the pinned, patched emp stack reproducibly into `/nix/store`
+  (`packages.emp`), exporting `EMP_PREFIX` (and a `.deps/emp` symlink) to it.
 
 The cryptographic rounds live inside the vetted `emp-ag2pc` engine; the "pure
 protocol" this project owns is the circuit/relation definition and the share/IO
@@ -105,10 +105,13 @@ layout.
 Requires nix (for the toolchain and OpenSSL) on an x86-64 host.
 
 ```sh
-nix develop -c ./tools/bootstrap-emp.sh   # once: fetch + build emp into .deps/emp
-nix develop -c make                        # build everything
+nix develop -c make                        # nix builds the patched emp (once), then everything
 nix develop -c cargo build --manifest-path rust/Cargo.toml --release
 ```
+
+The first `nix develop` builds the emp stack via the flake (`packages.emp`) into
+`/nix/store`; no separate bootstrap step is needed. (`tools/bootstrap-emp.sh`
+remains as a deprecated non-nix fallback.)
 
 The Rust release binary is `rust/target/release/party`. The C++ binary is
 `.build/party`.

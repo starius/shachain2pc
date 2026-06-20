@@ -24,6 +24,7 @@ enum PartyError {
     Io(std::io::Error),
     CircuitMismatch,
     SeedRevealRefused,
+    UnsupportedMode(&'static str),
 }
 
 impl fmt::Display for PartyError {
@@ -42,6 +43,7 @@ impl fmt::Display for PartyError {
                 f,
                 "I=0 reveals the seed (root of all revocation secrets); re-run with --allow-seed-reveal to proceed"
             ),
+            Self::UnsupportedMode(msg) => f.write_str(msg),
         }
     }
 }
@@ -76,10 +78,46 @@ impl From<std::io::Error> for PartyError {
 struct Args {
     role: Role,
     port: u16,
-    index: Index48,
+    index_spec: IndexSpec,
     share: Value32,
     peer_ip: IpAddr,
     allow_seed_reveal: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum IndexSpec {
+    Single(Index48),
+    Range { lo: Index48, hi: Index48 },
+}
+
+impl IndexSpec {
+    fn is_range(&self) -> bool {
+        matches!(self, Self::Range { .. })
+    }
+
+    fn contains_seed(&self) -> bool {
+        match self {
+            Self::Single(index) => index.get() == 0,
+            Self::Range { lo, hi } => lo.get() == 0 && hi.get() >= lo.get(),
+        }
+    }
+
+    fn single_index(&self) -> Result<Index48, PartyError> {
+        match self {
+            Self::Single(index) => Ok(*index),
+            Self::Range { .. } => Err(PartyError::UnsupportedMode(
+                "Rust range execution is not implemented until the session/carry sync phase",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestedMode {
+    Full,
+    Chunked,
+    Tree,
+    Cache,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -102,11 +140,14 @@ async fn main() {
 }
 
 async fn run_derivation(args: Args) -> Result<Value32, PartyError> {
-    ensure_index_allowed(args.index, args.allow_seed_reveal)?;
+    ensure_index_allowed(&args.index_spec, args.allow_seed_reveal)?;
+    let requested_mode = requested_mode_from_env(args.index_spec.is_range());
+    ensure_mode_supported_for_now(&args.index_spec, requested_mode)?;
+    let index = args.index_spec.single_index()?;
 
-    let mut timing = PhaseTiming::new(args.role, args.index);
+    let mut timing = PhaseTiming::new(args.role, index);
     let sha = load_bristol(default_sha256_compress_path())?;
-    let circuit = build_circuit_for_index(args.index, &sha)?;
+    let circuit = build_circuit_for_index(index, &sha)?;
     let gate_arr = to_emp_gate_array(&circuit);
     let digest = circuit_digest(&circuit, &gate_arr);
     let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
@@ -182,15 +223,63 @@ impl PhaseTiming {
     }
 }
 
-fn ensure_index_allowed(index: Index48, allow_seed_reveal: bool) -> Result<(), PartyError> {
+fn ensure_index_allowed(index: &IndexSpec, allow_seed_reveal: bool) -> Result<(), PartyError> {
     // Index 0 is the shachain seed (generate_from_seed runs no SHA round at I=0),
     // not a normal per-commitment reveal, so require an explicit local override.
     // The C++ party (demo/party.cpp) enforces the same guard, including ranges
     // that contain 0.
-    if index.get() == 0 && !allow_seed_reveal {
+    if index.contains_seed() && !allow_seed_reveal {
         Err(PartyError::SeedRevealRefused)
     } else {
         Ok(())
+    }
+}
+
+fn requested_mode_from_env(is_range: bool) -> RequestedMode {
+    if is_range && env_nonzero("SHACHAIN2PC_CACHE") {
+        return RequestedMode::Cache;
+    }
+    if is_range && env_nonzero("SHACHAIN2PC_TREE") {
+        return RequestedMode::Tree;
+    }
+    if env_positive("SHACHAIN2PC_CHUNK_BLOCKS") {
+        return RequestedMode::Chunked;
+    }
+    RequestedMode::Full
+}
+
+fn env_nonzero(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .is_some_and(|value| value != 0)
+}
+
+fn env_positive(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .is_some_and(|value| value > 0)
+}
+
+fn ensure_mode_supported_for_now(
+    index_spec: &IndexSpec,
+    mode: RequestedMode,
+) -> Result<(), PartyError> {
+    match (index_spec.is_range(), mode) {
+        (false, RequestedMode::Full) => Ok(()),
+        (true, RequestedMode::Full) => Err(PartyError::UnsupportedMode(
+            "Rust range execution is not implemented until the session/carry sync phase",
+        )),
+        (_, RequestedMode::Chunked) => Err(PartyError::UnsupportedMode(
+            "Rust SHACHAIN2PC_CHUNK_BLOCKS mode is not implemented until the session/carry sync phase",
+        )),
+        (_, RequestedMode::Tree) => Err(PartyError::UnsupportedMode(
+            "Rust SHACHAIN2PC_TREE mode is not implemented until the session/carry sync phase",
+        )),
+        (_, RequestedMode::Cache) => Err(PartyError::UnsupportedMode(
+            "Rust SHACHAIN2PC_CACHE mode is not implemented until the session/carry sync phase",
+        )),
     }
 }
 
@@ -312,9 +401,9 @@ fn parse_args(args: Vec<String>) -> Result<Args, PartyError> {
     if port == 0 {
         return Err(PartyError::Parse("port must be in 1..65535".to_owned()));
     }
-    let index = Index48::from_hex(&positional[2]).map_err(|e| PartyError::Parse(e.to_string()))?;
+    let index_spec = parse_index_spec(&positional[2])?;
     let share = Value32::from_hex(&positional[3]).map_err(|e| PartyError::Parse(e.to_string()))?;
-    ensure_index_allowed(index, allow_seed_reveal)?;
+    ensure_index_allowed(&index_spec, allow_seed_reveal)?;
     let peer_ip = if let Some(peer) = positional.get(4) {
         peer.parse()
             .map_err(|_| PartyError::Parse(format!("bad peer ip: {peer}")))?
@@ -324,16 +413,44 @@ fn parse_args(args: Vec<String>) -> Result<Args, PartyError> {
     Ok(Args {
         role,
         port,
-        index,
+        index_spec,
         share,
         peer_ip,
         allow_seed_reveal,
     })
 }
 
+fn parse_index_spec(spec: &str) -> Result<IndexSpec, PartyError> {
+    if let Some(dash) = spec.find('-') {
+        let lo_s = &spec[..dash];
+        let hi_s = &spec[dash + 1..];
+        if lo_s.is_empty() || hi_s.is_empty() {
+            return Err(PartyError::Parse(
+                "range must be LO-HI (both hex)".to_owned(),
+            ));
+        }
+        let lo = Index48::from_hex(lo_s).map_err(|e| PartyError::Parse(e.to_string()))?;
+        let hi = Index48::from_hex(hi_s).map_err(|e| PartyError::Parse(e.to_string()))?;
+        if lo > hi {
+            return Err(PartyError::Parse("range LO must be <= HI".to_owned()));
+        }
+        let count = hi.get() - lo.get() + 1;
+        const MAX_BATCH: u64 = 100_000;
+        if count > MAX_BATCH {
+            return Err(PartyError::Parse(
+                "range too large (max 100000 indices)".to_owned(),
+            ));
+        }
+        Ok(IndexSpec::Range { lo, hi })
+    } else {
+        let index = Index48::from_hex(spec).map_err(|e| PartyError::Parse(e.to_string()))?;
+        Ok(IndexSpec::Single(index))
+    }
+}
+
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} [--allow-seed-reveal] <1|2> <port> <I_hex> <share_hex> [peer_ip]\n  1 = ALICE (garbler, listens), 2 = BOB (evaluator, connects)"
+        "usage: {program} [--allow-seed-reveal] <1|2> <port> <I_spec> <share_hex> [peer_ip]\n  I_spec = single hex index (\"64\") or inclusive hex range (\"64-c8\")\n  1 = ALICE (garbler, listens), 2 = BOB (evaluator, connects)"
     )
 }
 
@@ -418,7 +535,10 @@ mod tests {
         ] {
             let parsed = parse_args(args.into_iter().map(str::to_owned).collect()).unwrap();
             assert!(parsed.allow_seed_reveal);
-            assert_eq!(parsed.index.get(), 0);
+            assert_eq!(
+                parsed.index_spec,
+                IndexSpec::Single(Index48::new(0).unwrap())
+            );
         }
     }
 
@@ -432,6 +552,109 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PartyError::SeedRevealRefused));
+    }
+
+    #[test]
+    fn parses_range_index_spec() {
+        let parsed = parse_args(
+            ["party", "1", "1234", "64-c8", SHARE_A]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.index_spec,
+            IndexSpec::Range {
+                lo: Index48::from_hex("64").unwrap(),
+                hi: Index48::from_hex("c8").unwrap(),
+            }
+        );
+
+        let err = parse_index_spec("c8-64").unwrap_err();
+        assert!(matches!(err, PartyError::Parse(msg) if msg == "range LO must be <= HI"));
+
+        let err = parse_index_spec("1-").unwrap_err();
+        assert!(matches!(err, PartyError::Parse(msg) if msg == "range must be LO-HI (both hex)"));
+
+        let err = parse_index_spec("0-186a0").unwrap_err();
+        assert!(
+            matches!(err, PartyError::Parse(msg) if msg == "range too large (max 100000 indices)")
+        );
+    }
+
+    #[test]
+    fn parse_range_containing_seed_requires_flag() {
+        let err = parse_args(
+            ["party", "1", "1234", "0-5", SHARE_A]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PartyError::SeedRevealRefused));
+
+        let parsed = parse_args(
+            ["party", "--allow-seed-reveal", "1", "1234", "0-5", SHARE_A]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.index_spec,
+            IndexSpec::Range {
+                lo: Index48::new(0).unwrap(),
+                hi: Index48::new(5).unwrap(),
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_range_mode_refuses_before_socket_until_session_sync() {
+        let port = free_port();
+        let err = run_derivation(Args {
+            role: Role::Alice,
+            port,
+            index_spec: IndexSpec::Range {
+                lo: Index48::from_hex("64").unwrap(),
+                hi: Index48::from_hex("65").unwrap(),
+            },
+            share: Value32::from_hex(SHARE_A).unwrap(),
+            peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            allow_seed_reveal: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PartyError::UnsupportedMode(msg) if msg.contains("range execution")));
+        StdTcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    }
+
+    #[test]
+    fn mode_support_boundary_is_explicit() {
+        let single = IndexSpec::Single(Index48::from_hex("1").unwrap());
+        let range = IndexSpec::Range {
+            lo: Index48::from_hex("64").unwrap(),
+            hi: Index48::from_hex("65").unwrap(),
+        };
+
+        assert!(ensure_mode_supported_for_now(&single, RequestedMode::Full).is_ok());
+        assert!(matches!(
+            ensure_mode_supported_for_now(&range, RequestedMode::Full),
+            Err(PartyError::UnsupportedMode(msg)) if msg.contains("range execution")
+        ));
+        assert!(matches!(
+            ensure_mode_supported_for_now(&single, RequestedMode::Chunked),
+            Err(PartyError::UnsupportedMode(msg)) if msg.contains("CHUNK_BLOCKS")
+        ));
+        assert!(matches!(
+            ensure_mode_supported_for_now(&range, RequestedMode::Tree),
+            Err(PartyError::UnsupportedMode(msg)) if msg.contains("TREE")
+        ));
+        assert!(matches!(
+            ensure_mode_supported_for_now(&range, RequestedMode::Cache),
+            Err(PartyError::UnsupportedMode(msg)) if msg.contains("CACHE")
+        ));
     }
 
     async fn assert_party_pair_matches_reference(index_hex: &str, timeout_duration: Duration) {
@@ -485,7 +708,7 @@ mod tests {
         Args {
             role,
             port,
-            index,
+            index_spec: IndexSpec::Single(index),
             share: Value32::from_hex(share).unwrap(),
             peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             allow_seed_reveal,

@@ -237,10 +237,12 @@ Set `SHACHAIN2PC_COMPAT_TIMING=1` as well to print Fpre/C2PC subphase timings.
   target for funds. For production, use `ssp ≈ 60-64`, track every instance
   against the per-seed budget, and rotate the seed before crossing the chosen
   risk threshold. The adaptive cache's default trunk chunk size is 16
-  (`SHACHAIN2PC_CHUNK_BLOCKS=16`), and the low subtree is computed in fixed
-  16-leaf tiles when a range contains full aligned tiles. Cross-restart
-  persistence of the authenticated cache is still future work. Full analysis and
-  the cost trade-off:
+  (`SHACHAIN2PC_CHUNK_BLOCKS=16`). For aligned full subtrees it uses recursive
+  multi-output tiles with default fanout 16 (`SHACHAIN2PC_TILE_FANOUT=16`);
+  `SHACHAIN2PC_TILE_FANOUT=1` disables recursive tiling and uses the one-SHA
+  fallback traversal. Unaligned ranges fall back to the existing bottom-16 tile
+  plus one-SHA stack-cache shape. Cross-restart persistence of the authenticated
+  cache is still future work. Full analysis and the cost trade-off:
   [`docs/shared-trunk-cache.md`](docs/shared-trunk-cache.md).
 - Both parties derive the circuit independently from the authorized `I`, so they
   evaluate byte-identical circuits. If one party enters a different `I`, the

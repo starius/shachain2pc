@@ -1074,6 +1074,9 @@ pub struct SoftSpoken4 {
     cur_recv_session: u64,
     cur_send_b0: u64,
     cur_recv_b0: u64,
+    leftover: Vec<Block>,
+    leftover_pos: usize,
+    leftover_count: usize,
     alphas: [usize; SOFTSPOKEN_N],
     leaves_recv: Vec<Block>,
     leaves_send: Vec<Block>,
@@ -1105,6 +1108,9 @@ impl SoftSpoken4 {
             cur_recv_session: 0,
             cur_send_b0: 0,
             cur_recv_b0: 0,
+            leftover: Vec::new(),
+            leftover_pos: 0,
+            leftover_count: 0,
             alphas: [0; SOFTSPOKEN_N],
             leaves_recv: Vec::new(),
             leaves_send: Vec::new(),
@@ -1134,9 +1140,15 @@ impl SoftSpoken4 {
     }
 
     pub async fn run(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+        let mut out = vec![Block::zero(); length];
+        let got = self.drain_leftover(&mut out);
+        if got == length {
+            return Ok(out);
+        }
         self.begin(stream).await?;
-        let out = self.next_n(stream, length).await?;
+        let rest = self.next_n(stream, length - got).await?;
         self.end(stream).await?;
+        out[got..].copy_from_slice(&rest);
         Ok(out)
     }
 
@@ -1157,15 +1169,40 @@ impl SoftSpoken4 {
     }
 
     pub async fn next_n(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
-        let mut out = Vec::with_capacity(length);
-        while out.len() + SOFTSPOKEN_CHUNK_OTS <= length {
-            out.extend(self.next_chunk(stream, SOFTSPOKEN_CHUNK_BLOCKS).await?);
-        }
-        if out.len() < length {
+        let mut out = vec![Block::zero(); length];
+        let mut got = self.drain_leftover(&mut out);
+        while got + SOFTSPOKEN_CHUNK_OTS <= length {
             let chunk = self.next_chunk(stream, SOFTSPOKEN_CHUNK_BLOCKS).await?;
-            out.extend_from_slice(&chunk[..length - out.len()]);
+            out[got..got + SOFTSPOKEN_CHUNK_OTS].copy_from_slice(&chunk);
+            got += SOFTSPOKEN_CHUNK_OTS;
+        }
+        if got < length {
+            let chunk = self.next_chunk(stream, SOFTSPOKEN_CHUNK_BLOCKS).await?;
+            let take = length - got;
+            out[got..].copy_from_slice(&chunk[..take]);
+            self.leftover = chunk;
+            self.leftover_pos = take;
+            self.leftover_count = SOFTSPOKEN_CHUNK_OTS - take;
         }
         Ok(out)
+    }
+
+    fn reset_leftover(&mut self) {
+        self.leftover_pos = 0;
+        self.leftover_count = 0;
+    }
+
+    fn drain_leftover(&mut self, out: &mut [Block]) -> usize {
+        if self.leftover_count == 0 || out.is_empty() {
+            return 0;
+        }
+        let take = out.len().min(self.leftover_count);
+        let start = self.leftover_pos;
+        let end = start + take;
+        out[..take].copy_from_slice(&self.leftover[start..end]);
+        self.leftover_pos += take;
+        self.leftover_count -= take;
+        take
     }
 
     async fn next_chunk(&mut self, stream: &mut EmpStream, bs: usize) -> Result<Vec<Block>> {
@@ -1177,6 +1214,7 @@ impl SoftSpoken4 {
     }
 
     async fn send_begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+        self.reset_leftover();
         if !self.setup_done {
             self.bootstrap_send(stream).await?;
         }
@@ -1190,6 +1228,7 @@ impl SoftSpoken4 {
     }
 
     async fn recv_begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+        self.reset_leftover();
         if !self.setup_done {
             self.bootstrap_recv(stream).await?;
         }
@@ -1584,6 +1623,97 @@ pub enum Ag2pcRevealRecipient {
     Party(Role),
 }
 
+struct Mitccrh8 {
+    start_point: Block,
+    gid: u64,
+    key_used: usize,
+    scheduled_bucket: Option<u64>,
+    scheduled_keys: Vec<Prp>,
+}
+
+impl Mitccrh8 {
+    fn new(seed: Block) -> Self {
+        Self {
+            start_point: seed,
+            gid: 0,
+            key_used: 8,
+            scheduled_bucket: None,
+            scheduled_keys: Vec::new(),
+        }
+    }
+
+    fn hash(&mut self, blocks: &mut [Block], k: usize, h: usize) {
+        self.hash_inner(blocks, k, h, false);
+    }
+
+    #[allow(dead_code)]
+    fn hash_cir(&mut self, blocks: &mut [Block], k: usize, h: usize) {
+        self.hash_inner(blocks, k, h, true);
+    }
+
+    fn hash_inner(&mut self, blocks: &mut [Block], k: usize, h: usize, cir: bool) {
+        assert!(k <= 8);
+        assert_eq!(8 % k, 0);
+        assert_eq!(blocks.len(), k * h);
+        if self.key_used == 8 {
+            self.renew_ks();
+        }
+        if self.scheduled_bucket.is_some() {
+            for block in blocks {
+                *block = mitccrh_apply(&self.scheduled_keys[0], *block, cir);
+            }
+        } else {
+            for key_index in 0..k {
+                for j in 0..h {
+                    let offset = key_index * h + j;
+                    blocks[offset] = mitccrh_apply(
+                        &self.scheduled_keys[self.key_used + key_index],
+                        blocks[offset],
+                        cir,
+                    );
+                }
+            }
+        }
+        self.key_used += k;
+    }
+
+    fn renew_ks(&mut self) {
+        let first = self.gid >> 3;
+        let last = (self.gid + 7) >> 3;
+        self.scheduled_keys.clear();
+        if first == last {
+            self.scheduled_keys
+                .push(Prp::new(self.start_point.xor(Block::make(first, 0))));
+            self.scheduled_bucket = Some(first);
+        } else {
+            for i in 0..8 {
+                self.scheduled_keys.push(Prp::new(
+                    self.start_point.xor(Block::make((self.gid + i) >> 3, 0)),
+                ));
+            }
+            self.scheduled_bucket = None;
+        }
+        self.gid += 8;
+        self.key_used = 0;
+    }
+}
+
+fn mitccrh_apply(key: &Prp, block: Block, cir: bool) -> Block {
+    let input = if cir { block.sigma() } else { block };
+    key.permute_one(input).xor(input)
+}
+
+struct Ag2pcComputeHashes<'a> {
+    gmitc: &'a mut Mitccrh8,
+    emitc: &'a mut Mitccrh8,
+    feq: &'a mut Sha256,
+}
+
+struct Ag2pcLayerView<'a> {
+    mac: &'a [Block],
+    key: &'a [Block],
+}
+
 impl Ag2pcProtocol {
     pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
         let fpre = Ag2pcTriplePool::setup(streams, party, ssp).await?;
@@ -1959,6 +2089,85 @@ impl Ag2pcTriplePool {
             .collect())
     }
 
+    pub async fn compute_inplace(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        rep_a: &[AShareBundle],
+        rep_b: &[AShareBundle],
+    ) -> Result<Vec<AShareBundle>> {
+        if rep_a.len() != rep_b.len() {
+            return Err(CompatError::BadAg2pcInputShape);
+        }
+        let l = rep_a.len();
+        if l == 0 {
+            return Ok(Vec::new());
+        }
+        let bucket = self.get_bucket_size(l);
+        let pair_seed = {
+            let mine = u64::from(self.party.party_id());
+            let peer = u64::from(3 - self.party.party_id());
+            Block::make(mine.min(peer), mine.max(peer))
+        };
+        let mut gmitc = Mitccrh8::new(pair_seed);
+        let mut emitc = Mitccrh8::new(pair_seed);
+        let mut feq = Sha256::new();
+        let mut hashes = Ag2pcComputeHashes {
+            gmitc: &mut gmitc,
+            emitc: &mut emitc,
+            feq: &mut feq,
+        };
+
+        let mut acc_mac = vec![Block::zero(); 3 * l];
+        let mut acc_key = vec![Block::zero(); 3 * l];
+        for i in 0..l {
+            acc_mac[i] = rep_a[i].mac;
+            acc_key[i] = rep_a[i].key;
+            acc_mac[l + i] = rep_b[i].mac;
+            acc_key[l + i] = rep_b[i].key;
+        }
+        let (r_mac, r_key) = self.gen_cot_shares(streams, l).await?;
+        acc_mac[2 * l..3 * l].copy_from_slice(&r_mac);
+        acc_key[2 * l..3 * l].copy_from_slice(&r_key);
+        self.leaky_and_halfgate(streams, &mut acc_mac, &mut acc_key, l, &mut hashes)
+            .await?;
+        self.layered_bucket_into_acc(streams, &mut acc_mac, &mut acc_key, bucket, l, &mut hashes)
+            .await?;
+
+        let dme: [u8; HASH_DIGEST_BYTES] = feq.finalize().into();
+        ag2pc_feq_check(&mut streams.main, self.party, &dme).await?;
+
+        let mut xb_me = vec![0u8; l];
+        let mut yb_me = vec![0u8; l];
+        for i in 0..l {
+            xb_me[i] = block_lsb(rep_a[i].mac) ^ block_lsb(acc_mac[i]);
+            yb_me[i] = block_lsb(rep_b[i].mac) ^ block_lsb(acc_mac[l + i]);
+        }
+        let (xb_peer, yb_peer) = self
+            .exchange_two_bool_vectors(streams, &xb_me, &yb_me, l)
+            .await?;
+
+        let mut out = vec![AShareBundle::default(); l];
+        let dxor = self.delta.xor(bit0_mask());
+        for i in 0..l {
+            let xb = xb_me[i] ^ xb_peer[i];
+            let yb = yb_me[i] ^ yb_peer[i];
+            let mut mac = acc_mac[2 * l + i]
+                .xor(select_block(xb).and(acc_mac[l + i]))
+                .xor(select_block(yb).and(acc_mac[i]));
+            let mut key = acc_key[2 * l + i]
+                .xor(select_block(xb).and(acc_key[l + i]))
+                .xor(select_block(yb).and(acc_key[i]));
+            let both = select_block(xb & yb);
+            if self.party == Role::Alice {
+                mac = mac.xor(both.and(bit0_mask()));
+            } else {
+                key = key.xor(both.and(dxor));
+            }
+            out[i] = AShareBundle { mac, key };
+        }
+        Ok(out)
+    }
+
     pub async fn maybe_flush_cot_check(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
         if self.cots_minted_since_check {
             self.flush_cot_check(streams).await?;
@@ -1997,6 +2206,219 @@ impl Ag2pcTriplePool {
                     ag2pc_next_n_flush(&mut self.abit2, &mut streams.sibling, count)
                 )?;
                 Ok((mac, key))
+            }
+        }
+    }
+
+    async fn leaky_and_halfgate(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        mac: &mut [Block],
+        key: &mut [Block],
+        l: usize,
+        hashes: &mut Ag2pcComputeHashes<'_>,
+    ) -> Result<()> {
+        let mut g_blocks = Vec::with_capacity(l);
+        for k0 in (0..l).step_by(8) {
+            let batch = (l - k0).min(8);
+            let mut pad = [Block::zero(); 16];
+            for j in 0..8 {
+                if j < batch {
+                    let kk = key[k0 + j];
+                    pad[2 * j] = kk;
+                    pad[2 * j + 1] = kk.xor(self.delta);
+                }
+            }
+            hashes.gmitc.hash(&mut pad, 8, 2);
+            for j in 0..batch {
+                let k = k0 + j;
+                let c = select_block(block_lsb(mac[l + k]))
+                    .and(self.delta)
+                    .xor(key[l + k])
+                    .xor(mac[l + k]);
+                g_blocks.push(pad[2 * j].xor(pad[2 * j + 1]).xor(c));
+            }
+        }
+        let w_blocks = self.exchange_blocks(streams, &g_blocks, l).await?;
+
+        let mut sout = vec![Block::zero(); l];
+        for k0 in (0..l).step_by(8) {
+            let batch = (l - k0).min(8);
+            let mut pad = [Block::zero(); 16];
+            for j in 0..8 {
+                if j < batch {
+                    pad[2 * j] = mac[k0 + j];
+                    pad[2 * j + 1] = key[k0 + j];
+                }
+            }
+            hashes.emitc.hash(&mut pad, 8, 2);
+            for j in 0..batch {
+                let k = k0 + j;
+                let hm = pad[2 * j];
+                let hk = pad[2 * j + 1];
+                let e = hm.xor(w_blocks[k].and(select_block(block_lsb(mac[k]))));
+                let c = select_block(block_lsb(mac[l + k]))
+                    .and(self.delta)
+                    .xor(key[l + k])
+                    .xor(mac[l + k]);
+                sout[k] = hk
+                    .xor(e)
+                    .xor(key[2 * l + k])
+                    .xor(mac[2 * l + k])
+                    .xor(c.and(select_block(block_lsb(mac[k]))))
+                    .xor(self.delta.and(select_block(block_lsb(mac[2 * l + k]))));
+            }
+        }
+
+        let s_me: Vec<u8> = sout.iter().map(|block| block_lsb1(*block)).collect();
+        let s_peer = self.exchange_bool_vector(streams, &s_me, l).await?;
+        let dxor = self.delta.xor(bit0_mask());
+        for k in 0..l {
+            let d = s_me[k] ^ s_peer[k];
+            let mask = select_block(d);
+            if self.party == Role::Alice {
+                mac[2 * l + k] = mac[2 * l + k].xor(bit0_mask().and(mask));
+            } else {
+                key[2 * l + k] = key[2 * l + k].xor(dxor.and(mask));
+            }
+            sout[k] = sout[k].xor(self.delta.and(mask));
+        }
+        hashes.feq.update(blocks_to_bytes(&sout));
+        Ok(())
+    }
+
+    async fn layered_bucket_into_acc(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        acc_mac: &mut [Block],
+        acc_key: &mut [Block],
+        bucket: usize,
+        l: usize,
+        hashes: &mut Ag2pcComputeHashes<'_>,
+    ) -> Result<()> {
+        for _ in 0..bucket - 1 {
+            let (mut sac_mac, mut sac_key) = self.gen_cot_shares(streams, 3 * l).await?;
+            self.leaky_and_halfgate(streams, &mut sac_mac, &mut sac_key, l, hashes)
+                .await?;
+            let seed = EmpRo::new("AG2PC RO", Block::zero())
+                .absorb_block(streams.main.get_digest()?)
+                .absorb_block(streams.sibling.get_digest()?)
+                .squeeze_block();
+            let mut prg = Prg::new(seed, 0);
+            let raw = u32::from_ne_bytes(
+                prg.random_data(4)
+                    .try_into()
+                    .expect("four random bytes for bucket shift"),
+            );
+            let r = (raw as usize) % l;
+            let layer = Ag2pcLayerView {
+                mac: &sac_mac,
+                key: &sac_key,
+            };
+            self.bucket_one_layer(streams, acc_mac, acc_key, layer, l, r)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn bucket_one_layer(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        acc_mac: &mut [Block],
+        acc_key: &mut [Block],
+        layer: Ag2pcLayerView<'_>,
+        l: usize,
+        r: usize,
+    ) -> Result<()> {
+        let mut d_me = vec![0u8; l];
+        let cut = l - r;
+        for i in 0..l {
+            let src = if i < cut { i + r } else { i + r - l };
+            acc_mac[i] = acc_mac[i].xor(layer.mac[src]);
+            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer.mac[2 * l + src]);
+            acc_key[i] = acc_key[i].xor(layer.key[src]);
+            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer.key[2 * l + src]);
+            d_me[i] = block_lsb(acc_mac[l + i]) ^ block_lsb(layer.mac[l + src]);
+        }
+        let d_peer = self.exchange_bool_vector(streams, &d_me, l).await?;
+        for i in 0..l {
+            let src = if i < cut { i + r } else { i + r - l };
+            let mask = select_block(d_me[i] ^ d_peer[i]);
+            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer.mac[src].and(mask));
+            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer.key[src].and(mask));
+        }
+        Ok(())
+    }
+
+    async fn exchange_blocks(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        mine: &[Block],
+        peer_len: usize,
+    ) -> Result<Vec<Block>> {
+        match self.party {
+            Role::Alice => {
+                let ((), peer) = tokio::try_join!(
+                    ag2pc_send_blocks(&mut streams.main, mine),
+                    ag2pc_recv_blocks(&mut streams.sibling, peer_len)
+                )?;
+                Ok(peer)
+            }
+            Role::Bob => {
+                let ((), peer) = tokio::try_join!(
+                    ag2pc_send_blocks(&mut streams.sibling, mine),
+                    ag2pc_recv_blocks(&mut streams.main, peer_len)
+                )?;
+                Ok(peer)
+            }
+        }
+    }
+
+    async fn exchange_bool_vector(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        mine: &[u8],
+        peer_len: usize,
+    ) -> Result<Vec<u8>> {
+        match self.party {
+            Role::Alice => {
+                let ((), peer) = tokio::try_join!(
+                    ag2pc_send_bool_vector(&mut streams.main, mine),
+                    ag2pc_recv_bool_vector(&mut streams.sibling, peer_len)
+                )?;
+                Ok(peer)
+            }
+            Role::Bob => {
+                let ((), peer) = tokio::try_join!(
+                    ag2pc_send_bool_vector(&mut streams.sibling, mine),
+                    ag2pc_recv_bool_vector(&mut streams.main, peer_len)
+                )?;
+                Ok(peer)
+            }
+        }
+    }
+
+    async fn exchange_two_bool_vectors(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        mine_a: &[u8],
+        mine_b: &[u8],
+        peer_len: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        match self.party {
+            Role::Alice => {
+                let ((), peer) = tokio::try_join!(
+                    ag2pc_send_two_bool_vectors(&mut streams.main, mine_a, mine_b),
+                    ag2pc_recv_two_bool_vectors(&mut streams.sibling, peer_len)
+                )?;
+                Ok(peer)
+            }
+            Role::Bob => {
+                let ((), peer) = tokio::try_join!(
+                    ag2pc_send_two_bool_vectors(&mut streams.sibling, mine_a, mine_b),
+                    ag2pc_recv_two_bool_vectors(&mut streams.main, peer_len)
+                )?;
+                Ok(peer)
             }
         }
     }
@@ -2066,6 +2488,120 @@ async fn ag2pc_end_flush(soft: &mut SoftSpoken4, stream: &mut EmpStream) -> Resu
     Ok(())
 }
 
+async fn ag2pc_send_blocks(stream: &mut EmpStream, blocks: &[Block]) -> Result<()> {
+    stream.send_block(blocks).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn ag2pc_recv_blocks(stream: &mut EmpStream, len: usize) -> Result<Vec<Block>> {
+    Ok(stream.recv_block(len).await?)
+}
+
+async fn ag2pc_send_bool_vector(stream: &mut EmpStream, data: &[u8]) -> Result<()> {
+    stream.send_data(&ag2pc_pack_bools(data)).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn ag2pc_recv_bool_vector(stream: &mut EmpStream, len: usize) -> Result<Vec<u8>> {
+    let encoded = stream.recv_data(ag2pc_bool_wire_len(len)).await?;
+    Ok(ag2pc_unpack_bools(&encoded, len))
+}
+
+async fn ag2pc_send_two_bool_vectors(
+    stream: &mut EmpStream,
+    first: &[u8],
+    second: &[u8],
+) -> Result<()> {
+    stream.send_data(&ag2pc_pack_bools(first)).await?;
+    stream.send_data(&ag2pc_pack_bools(second)).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn ag2pc_recv_two_bool_vectors(
+    stream: &mut EmpStream,
+    len: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let first = ag2pc_recv_bool_vector(stream, len).await?;
+    let second = ag2pc_recv_bool_vector(stream, len).await?;
+    Ok((first, second))
+}
+
+fn ag2pc_bool_wire_len(len: usize) -> usize {
+    len.div_ceil(8)
+}
+
+fn ag2pc_pack_bools(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; ag2pc_bool_wire_len(data.len())];
+    for (i, bit) in data.iter().enumerate() {
+        if *bit != 0 {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
+fn ag2pc_unpack_bools(encoded: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        out.push((encoded[i / 8] >> (i % 8)) & 1);
+    }
+    out
+}
+
+async fn ag2pc_feq_check(
+    stream: &mut EmpStream,
+    party: Role,
+    local_digest: &[u8; HASH_DIGEST_BYTES],
+) -> Result<()> {
+    match party {
+        Role::Alice => {
+            let nonce = random_block()?;
+            let commitment = ag2pc_feq_commitment(local_digest, nonce);
+            stream.send_data(&commitment).await?;
+            let peer_digest: [u8; HASH_DIGEST_BYTES] = stream
+                .recv_data(HASH_DIGEST_BYTES)
+                .await?
+                .try_into()
+                .expect("digest length");
+            stream.send_data(local_digest).await?;
+            stream.send_block(&[nonce]).await?;
+            stream.flush().await?;
+            if peer_digest != *local_digest {
+                return Err(CompatError::FeqMismatch);
+            }
+        }
+        Role::Bob => {
+            let commitment: [u8; HASH_DIGEST_BYTES] = stream
+                .recv_data(HASH_DIGEST_BYTES)
+                .await?
+                .try_into()
+                .expect("digest length");
+            stream.send_data(local_digest).await?;
+            let peer_digest: [u8; HASH_DIGEST_BYTES] = stream
+                .recv_data(HASH_DIGEST_BYTES)
+                .await?
+                .try_into()
+                .expect("digest length");
+            let nonce = stream.recv_block(1).await?[0];
+            let expected = ag2pc_feq_commitment(&peer_digest, nonce);
+            if commitment != expected || peer_digest != *local_digest {
+                return Err(CompatError::FeqMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ag2pc_feq_commitment(digest: &[u8; HASH_DIGEST_BYTES], nonce: Block) -> [u8; 32] {
+    let mut data = Vec::with_capacity(HASH_DIGEST_BYTES + BLOCK_BYTES);
+    data.extend_from_slice(digest);
+    data.extend_from_slice(nonce.as_bytes());
+    hash_once(&data)
+}
+
 fn random_ag2pc_delta(party: Role) -> Result<Block> {
     let mut bytes = random_block()?.into_bytes();
     bytes[0] |= 1;
@@ -2087,6 +2623,14 @@ fn select_block(bit: u8) -> Block {
 
 fn block_lsb(block: Block) -> u8 {
     u8::from(block.get_lsb())
+}
+
+fn block_lsb1(block: Block) -> u8 {
+    (block.as_bytes()[0] >> 1) & 1
+}
+
+fn bit0_mask() -> Block {
+    Block::make(0, 1)
 }
 
 pub fn verify_ag2pc_share_relation(
@@ -4338,6 +4882,8 @@ mod tests {
     const LIVE_IKNP_LENGTH: usize = 2051;
     const LIVE_LEAKY_LENGTH: usize = 257;
     const LIVE_AG2PC_DRAW_LENGTH: usize = 257;
+    #[cfg(feature = "cpp-probes")]
+    const LIVE_AG2PC_COMPUTE_LENGTH: usize = 35;
     const LIVE_FPRE_REQUESTED_SIZE: usize = 321;
     const LIVE_FPRE_GENERATE_LENGTH: usize = 683;
     const LIVE_FPRE_CHECK_LENGTH: usize = 683;
@@ -4763,6 +5309,24 @@ mod tests {
     }
 
     #[test]
+    fn ag2pc_bool_packing_is_compact_lsb_first() {
+        for len in 0usize..20 {
+            let data: Vec<u8> = (0..len).map(|i| ((i * 5 + 1) & 1) as u8).collect();
+            let packed = ag2pc_pack_bools(&data);
+            assert_eq!(packed.len(), len.div_ceil(8));
+            assert_eq!(ag2pc_unpack_bools(&packed, len), data);
+            for i in len..packed.len() * 8 {
+                assert_eq!((packed[i / 8] >> (i % 8)) & 1, 0);
+            }
+        }
+
+        assert_eq!(
+            ag2pc_pack_bools(&[1, 0, 1, 1, 0, 0, 1, 0, 1]),
+            vec![0x4d, 0x01]
+        );
+    }
+
+    #[test]
     fn softspoken_helpers_match_cpp_fixture() {
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../../compat/ag2pc/softspoken-helper-v1.json"
@@ -4933,6 +5497,67 @@ mod tests {
             };
             assert_eq!(*block, expected, "CSW recovered[{i}]");
         }
+    }
+
+    #[test]
+    fn mitccrh_helper_matches_cpp_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../compat/ag2pc/mitccrh-helper-v1.json"
+        ))
+        .unwrap();
+        let seed = Block::make(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
+
+        let mut h8 = Mitccrh8::new(seed);
+        let mut hash_8x2: Vec<Block> = (0..16)
+            .map(|i| Block::make(0x1000_0000_0000_0000 | i, 0x2000_0000_0000_0000 | i))
+            .collect();
+        let mut hash_8x2_second: Vec<Block> = (0..16)
+            .map(|i| Block::make(0x3000_0000_0000_0000 | i, 0x4000_0000_0000_0000 | i))
+            .collect();
+        h8.hash(&mut hash_8x2, 8, 2);
+        h8.hash(&mut hash_8x2_second, 8, 2);
+
+        let mut h4 = Mitccrh8::new(seed);
+        let mut hash_4x2_first: Vec<Block> = (0..8)
+            .map(|i| Block::make(0x5000_0000_0000_0000 | i, 0x6000_0000_0000_0000 | i))
+            .collect();
+        let mut hash_4x2_second: Vec<Block> = (0..8)
+            .map(|i| Block::make(0x7000_0000_0000_0000 | i, 0x8000_0000_0000_0000 | i))
+            .collect();
+        h4.hash(&mut hash_4x2_first, 4, 2);
+        h4.hash(&mut hash_4x2_second, 4, 2);
+
+        let mut hc = Mitccrh8::new(seed);
+        let mut hash_cir_8x2: Vec<Block> = (0..16)
+            .map(|i| Block::make(0x9000_0000_0000_0000 | i, 0xa000_0000_0000_0000 | i))
+            .collect();
+        hc.hash_cir(&mut hash_cir_8x2, 8, 2);
+
+        assert_block_json_array(&fixture, "hash_8x2", &hash_8x2);
+        assert_block_json_array(&fixture, "hash_8x2_second", &hash_8x2_second);
+        assert_block_json_array(&fixture, "hash_4x2_first", &hash_4x2_first);
+        assert_block_json_array(&fixture, "hash_4x2_second", &hash_4x2_second);
+        assert_block_json_array(&fixture, "hash_cir_8x2", &hash_cir_8x2);
+        assert_eq!(
+            blocks_digest_json(&hash_8x2),
+            fixture["hash_8x2_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&hash_8x2_second),
+            fixture["hash_8x2_second_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&hash_4x2_first),
+            fixture["hash_4x2_first_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&hash_4x2_second),
+            fixture["hash_4x2_second_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            blocks_digest_json(&hash_cir_8x2),
+            fixture["hash_cir_8x2_digest"].as_str().unwrap()
+        );
     }
 
     #[test]
@@ -5424,6 +6049,75 @@ mod tests {
         assert_eq!(alice_out, vec![1, 0, 1, 1, 0, 1]);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rust_ag2pc_compute_inplace_random_masks_roundtrip() {
+        let port = free_port();
+        let alice = tokio::spawn(async move {
+            let mut streams =
+                Ag2pcStreams::open(Role::Alice, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    .await
+                    .unwrap();
+            let mut pool = Ag2pcTriplePool::setup(&mut streams, Role::Alice, 40)
+                .await
+                .unwrap();
+            let rep_a = pool
+                .draw(&mut streams, LIVE_AG2PC_DRAW_LENGTH)
+                .await
+                .unwrap();
+            let rep_b = pool
+                .draw(&mut streams, LIVE_AG2PC_DRAW_LENGTH)
+                .await
+                .unwrap();
+            let sigma = pool
+                .compute_inplace(&mut streams, &rep_a, &rep_b)
+                .await
+                .unwrap();
+            pool.flush_cot_check(&mut streams).await.unwrap();
+            (pool.delta(), rep_a, rep_b, sigma)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(async move {
+            let mut streams = Ag2pcStreams::open(Role::Bob, port, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .await
+                .unwrap();
+            let mut pool = Ag2pcTriplePool::setup(&mut streams, Role::Bob, 40)
+                .await
+                .unwrap();
+            let rep_a = pool
+                .draw(&mut streams, LIVE_AG2PC_DRAW_LENGTH)
+                .await
+                .unwrap();
+            let rep_b = pool
+                .draw(&mut streams, LIVE_AG2PC_DRAW_LENGTH)
+                .await
+                .unwrap();
+            let sigma = pool
+                .compute_inplace(&mut streams, &rep_a, &rep_b)
+                .await
+                .unwrap();
+            pool.flush_cot_check(&mut streams).await.unwrap();
+            (pool.delta(), rep_a, rep_b, sigma)
+        });
+        let ((alice_delta, alice_a, alice_b, alice_sigma), (bob_delta, bob_a, bob_b, bob_sigma)) =
+            timeout(LIVE_INTEROP_TIMEOUT, async {
+                (alice.await.unwrap(), bob.await.unwrap())
+            })
+            .await
+            .unwrap();
+        assert!(verify_ag2pc_share_relation(
+            &alice_sigma,
+            alice_delta,
+            &bob_sigma,
+            bob_delta
+        ));
+        for i in 0..LIVE_AG2PC_DRAW_LENGTH {
+            let a = block_lsb(alice_a[i].mac) ^ block_lsb(bob_a[i].mac);
+            let b = block_lsb(alice_b[i].mac) ^ block_lsb(bob_b[i].mac);
+            let sigma = block_lsb(alice_sigma[i].mac) ^ block_lsb(bob_sigma[i].mac);
+            assert_eq!(sigma, a & b, "sigma relation mismatch at {i}");
+        }
+    }
+
     #[cfg(feature = "cpp-probes")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cpp_csw_base_ot_interop() {
@@ -5460,6 +6154,15 @@ mod tests {
         let bin = cpp_ag2pc_protocol_probe();
         run_live_ag2pc_protocol_case(&bin, Role::Alice).await;
         run_live_ag2pc_protocol_case(&bin, Role::Bob).await;
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_cpp_ag2pc_compute_inplace_interop() {
+        let _guard = LIVE_CPP_INTEROP_LOCK.lock().await;
+        let bin = cpp_ag2pc_compute_probe();
+        run_live_ag2pc_compute_case(&bin, Role::Alice).await;
+        run_live_ag2pc_compute_case(&bin, Role::Bob).await;
     }
 
     async fn run_live_otco_case(bin: &Path, rust_transport: TestTransport, rust_role: TestOtRole) {
@@ -6702,6 +7405,83 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cpp-probes")]
+    async fn run_live_ag2pc_compute_case(bin: &Path, rust_role: Role) {
+        let port = free_port();
+        let cpp_role = opposite_role(rust_role);
+        let mut child = Command::new(bin)
+            .current_dir(repo_root())
+            .arg(cpp_role.party_id().to_string())
+            .arg(port.to_string())
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if rust_role == Role::Bob {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stream_result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            Ag2pcStreams::open(rust_role, port, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        let mut streams = match stream_result {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC compute stream open failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC compute stream open timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+        let result = timeout(
+            LIVE_INTEROP_TIMEOUT,
+            run_rust_ag2pc_compute_peer(&mut streams, rust_role),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC compute failed: {e}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Rust AG2PC compute timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "C++ AG2PC compute probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),
@@ -6739,9 +7519,9 @@ mod tests {
 
         let (peer_delta, peer) = if role == Role::Alice {
             send_ag2pc_bundle(&mut streams.main, pool.delta(), &local).await?;
-            recv_ag2pc_bundle(&mut streams.main).await?
+            recv_ag2pc_bundle(&mut streams.main, LIVE_AG2PC_DRAW_LENGTH).await?
         } else {
-            let peer = recv_ag2pc_bundle(&mut streams.main).await?;
+            let peer = recv_ag2pc_bundle(&mut streams.main, LIVE_AG2PC_DRAW_LENGTH).await?;
             send_ag2pc_bundle(&mut streams.main, pool.delta(), &local).await?;
             peer
         };
@@ -6794,6 +7574,52 @@ mod tests {
     }
 
     #[cfg(feature = "cpp-probes")]
+    async fn run_rust_ag2pc_compute_peer(streams: &mut Ag2pcStreams, role: Role) -> Result<()> {
+        let mut pool = Ag2pcTriplePool::setup(streams, role, 40).await?;
+        let rep_a = pool.draw(streams, LIVE_AG2PC_COMPUTE_LENGTH).await?;
+        let rep_b = pool.draw(streams, LIVE_AG2PC_COMPUTE_LENGTH).await?;
+        let sigma = pool.compute_inplace(streams, &rep_a, &rep_b).await?;
+        pool.flush_cot_check(streams).await?;
+
+        let (peer_delta, peer_a, peer_b, peer_sigma) = if role == Role::Alice {
+            send_ag2pc_compute_verification(
+                &mut streams.main,
+                pool.delta(),
+                &rep_a,
+                &rep_b,
+                &sigma,
+            )
+            .await?;
+            recv_ag2pc_compute_verification(&mut streams.main).await?
+        } else {
+            let peer = recv_ag2pc_compute_verification(&mut streams.main).await?;
+            send_ag2pc_compute_verification(
+                &mut streams.main,
+                pool.delta(),
+                &rep_a,
+                &rep_b,
+                &sigma,
+            )
+            .await?;
+            peer
+        };
+        assert!(verify_ag2pc_share_relation(
+            &sigma,
+            pool.delta(),
+            &peer_sigma,
+            peer_delta
+        ));
+        for i in 0..LIVE_AG2PC_COMPUTE_LENGTH {
+            let a = block_lsb(rep_a[i].mac) ^ block_lsb(peer_a[i].mac);
+            let b = block_lsb(rep_b[i].mac) ^ block_lsb(peer_b[i].mac);
+            let out = block_lsb(sigma[i].mac) ^ block_lsb(peer_sigma[i].mac);
+            assert_eq!(out, a & b, "cross-mode sigma mismatch at {i}");
+        }
+        pool.end(streams).await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cpp-probes")]
     async fn send_ag2pc_bundle(
         stream: &mut EmpStream,
         delta: Block,
@@ -6809,10 +7635,13 @@ mod tests {
     }
 
     #[cfg(feature = "cpp-probes")]
-    async fn recv_ag2pc_bundle(stream: &mut EmpStream) -> Result<(Block, Vec<AShareBundle>)> {
+    async fn recv_ag2pc_bundle(
+        stream: &mut EmpStream,
+        len: usize,
+    ) -> Result<(Block, Vec<AShareBundle>)> {
         let delta = stream.recv_block(1).await?[0];
-        let mac = stream.recv_block(LIVE_AG2PC_DRAW_LENGTH).await?;
-        let key = stream.recv_block(LIVE_AG2PC_DRAW_LENGTH).await?;
+        let mac = stream.recv_block(len).await?;
+        let key = stream.recv_block(len).await?;
         Ok((
             delta,
             mac.into_iter()
@@ -6820,6 +7649,64 @@ mod tests {
                 .map(|(mac, key)| AShareBundle { mac, key })
                 .collect(),
         ))
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn send_ag2pc_compute_verification(
+        stream: &mut EmpStream,
+        delta: Block,
+        rep_a: &[AShareBundle],
+        rep_b: &[AShareBundle],
+        sigma: &[AShareBundle],
+    ) -> Result<()> {
+        stream.send_block(&[delta]).await?;
+        send_ag2pc_bundle_without_delta(stream, rep_a).await?;
+        send_ag2pc_bundle_without_delta(stream, rep_b).await?;
+        send_ag2pc_bundle_without_delta(stream, sigma).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn recv_ag2pc_compute_verification(
+        stream: &mut EmpStream,
+    ) -> Result<(
+        Block,
+        Vec<AShareBundle>,
+        Vec<AShareBundle>,
+        Vec<AShareBundle>,
+    )> {
+        let delta = stream.recv_block(1).await?[0];
+        let rep_a = recv_ag2pc_bundle_without_delta(stream, LIVE_AG2PC_COMPUTE_LENGTH).await?;
+        let rep_b = recv_ag2pc_bundle_without_delta(stream, LIVE_AG2PC_COMPUTE_LENGTH).await?;
+        let sigma = recv_ag2pc_bundle_without_delta(stream, LIVE_AG2PC_COMPUTE_LENGTH).await?;
+        Ok((delta, rep_a, rep_b, sigma))
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn send_ag2pc_bundle_without_delta(
+        stream: &mut EmpStream,
+        bundle: &[AShareBundle],
+    ) -> Result<()> {
+        let mac: Vec<Block> = bundle.iter().map(|item| item.mac).collect();
+        let key: Vec<Block> = bundle.iter().map(|item| item.key).collect();
+        stream.send_block(&mac).await?;
+        stream.send_block(&key).await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    async fn recv_ag2pc_bundle_without_delta(
+        stream: &mut EmpStream,
+        len: usize,
+    ) -> Result<Vec<AShareBundle>> {
+        let mac = stream.recv_block(len).await?;
+        let key = stream.recv_block(len).await?;
+        Ok(mac
+            .into_iter()
+            .zip(key)
+            .map(|(mac, key)| AShareBundle { mac, key })
+            .collect())
     }
 
     fn assert_softspoken_relation(receiver_data: &[Block], delta: Block, sender_data: &[Block]) {
@@ -7678,6 +8565,28 @@ mod tests {
         assert!(
             bin.exists(),
             ".build/ag2pc_protocol_probe was not built by the Cargo build script or test setup"
+        );
+        bin
+    }
+
+    #[cfg(feature = "cpp-probes")]
+    fn cpp_ag2pc_compute_probe() -> PathBuf {
+        let root = repo_root();
+        let bin = root.join(".build/ag2pc_compute_probe");
+        if !bin.exists() {
+            let status = Command::new("make")
+                .arg(".build/ag2pc_compute_probe")
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "failed to build .build/ag2pc_compute_probe"
+            );
+        }
+        assert!(
+            bin.exists(),
+            ".build/ag2pc_compute_probe was not built by the Cargo build script or test setup"
         );
         bin
     }

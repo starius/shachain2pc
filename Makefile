@@ -45,13 +45,15 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
 EMP_BINS := $(BUILD)/party $(BUILD)/ag2pc_session_probe \
             $(BUILD)/ag2pc_transport_probe $(BUILD)/softspoken_probe \
             $(BUILD)/softspoken_helper_probe $(BUILD)/csw_helper_probe \
+            $(BUILD)/mitccrh_helper_probe \
             $(BUILD)/csw_probe $(BUILD)/ag2pc_triple_pool_probe \
-            $(BUILD)/ag2pc_protocol_probe
+            $(BUILD)/ag2pc_protocol_probe $(BUILD)/ag2pc_compute_probe
 
 .PHONY: all plain mpc clean test test-cache-tamper test-ag2pc-probe \
         test-softspoken-probe test-softspoken-helper-probe \
-        test-csw-helper-probe test-ag2pc-triple-pool-probe \
-        test-ag2pc-protocol-probe demo cheat
+        test-csw-helper-probe test-mitccrh-helper-probe \
+        test-ag2pc-triple-pool-probe test-ag2pc-protocol-probe \
+        test-ag2pc-compute-probe demo cheat
 all: plain mpc
 plain: $(PLAIN_BINS)
 mpc: $(EMP_BINS)
@@ -98,6 +100,10 @@ $(BUILD)/csw_helper_probe: tools/csw_helper_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
+$(BUILD)/mitccrh_helper_probe: tools/mitccrh_helper_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
 $(BUILD)/csw_probe: tools/csw_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
@@ -107,6 +113,10 @@ $(BUILD)/ag2pc_triple_pool_probe: tools/ag2pc_triple_pool_probe.cpp | $(BUILD)
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
 $(BUILD)/ag2pc_protocol_probe: tools/ag2pc_protocol_probe.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
+	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
+
+$(BUILD)/ag2pc_compute_probe: tools/ag2pc_compute_probe.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(EMP_CFLAGS) $(OPENSSL_CFLAGS) $< \
 	    $(EMP_LIBS) $(OPENSSL_LIBS) -o $@
 
@@ -174,6 +184,11 @@ test-csw-helper-probe: $(BUILD)/csw_helper_probe
 	diff -u compat/ag2pc/csw-helper-v1.json \
 	  $(BUILD)/csw_helper_probe.json
 
+test-mitccrh-helper-probe: $(BUILD)/mitccrh_helper_probe
+	./$(BUILD)/mitccrh_helper_probe >$(BUILD)/mitccrh_helper_probe.json
+	diff -u compat/ag2pc/mitccrh-helper-v1.json \
+	  $(BUILD)/mitccrh_helper_probe.json
+
 test-ag2pc-triple-pool-probe: $(BUILD)/ag2pc_triple_pool_probe
 	set -e; \
 	port=$$(python3 -c 'import random; print(random.randrange(20000, 60000))'); \
@@ -222,6 +237,30 @@ test-ag2pc-protocol-probe: $(BUILD)/ag2pc_protocol_probe
 	  assert all(r["process_input_calls"] == 1 for r in rs)' \
 	  $(BUILD)/ag2pc_protocol_probe_alice.json \
 	  $(BUILD)/ag2pc_protocol_probe_bob.json
+
+test-ag2pc-compute-probe: $(BUILD)/ag2pc_compute_probe
+	set -e; \
+	port=$$(python3 -c 'import random; print(random.randrange(20000, 60000))'); \
+	SHACHAIN2PC_TIMEOUT_SECS=60 ./$(BUILD)/ag2pc_compute_probe 1 $$port \
+	  >$(BUILD)/ag2pc_compute_probe_alice.json \
+	  2>$(BUILD)/ag2pc_compute_probe_alice.err & \
+	alice=$$!; \
+	sleep 0.2; \
+	SHACHAIN2PC_TIMEOUT_SECS=60 ./$(BUILD)/ag2pc_compute_probe 2 $$port \
+	  >$(BUILD)/ag2pc_compute_probe_bob.json \
+	  2>$(BUILD)/ag2pc_compute_probe_bob.err; \
+	bob=$$?; \
+	wait $$alice; \
+	alice_status=$$?; \
+	test $$alice_status -eq 0; \
+	test $$bob -eq 0; \
+	test ! -s $(BUILD)/ag2pc_compute_probe_alice.err; \
+	test ! -s $(BUILD)/ag2pc_compute_probe_bob.err; \
+	python3 -c 'import json,sys; \
+	  rs=[json.load(open(p)) for p in sys.argv[1:]]; \
+	  assert all(r["verified"] for r in rs)' \
+	  $(BUILD)/ag2pc_compute_probe_alice.json \
+	  $(BUILD)/ag2pc_compute_probe_bob.json
 
 test-cache-tamper: $(BUILD)/party $(BUILD)/ref_cli
 	./demo/cache_tamper_test.sh

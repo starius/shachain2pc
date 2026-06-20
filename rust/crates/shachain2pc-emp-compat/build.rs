@@ -15,9 +15,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../../tools/c2pc_online_probe.cpp");
     println!("cargo:rerun-if-env-changed=SHACHAIN2PC_BUILD_CPP_PROBES");
 
-    if env::var_os("CARGO_FEATURE_CPP_PROBES").is_none()
-        && env::var("SHACHAIN2PC_BUILD_CPP_PROBES").as_deref() != Ok("1")
-    {
+    if env::var("SHACHAIN2PC_BUILD_CPP_PROBES").as_deref() != Ok("1") {
         return;
     }
 

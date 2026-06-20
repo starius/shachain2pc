@@ -1,11 +1,13 @@
 use shachain2pc_circuit::{
-    batch_digest, build_chunk_circuit, build_circuit_for_index, check_chunk_circuit,
-    chunk_spec_digest, circuit_digest, load_bristol, split_chain_bits, to_emp_gate_array,
-    tree_digest, DEFAULT_SHA256_COMPRESS_PATH,
+    batch_digest, build_chunk_circuit, build_circuit_for_index, build_tile_circuit, cache_digest,
+    check_chunk_circuit, check_tile_circuit, chunk_spec_digest, circuit_digest, load_bristol,
+    split_chain_bits, to_emp_gate_array, tree_digest, Circuit, CACHE_TILE_HEIGHT,
+    CACHE_TILE_LEAVES, DEFAULT_SHA256_COMPRESS_PATH,
 };
 use shachain2pc_emp_compat::{AuthenticatedBits, C2pc, C2pcCircuit, CompatError};
 use shachain2pc_emp_wire::{EmpStream, EmpStreams, WireError};
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -193,7 +195,19 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
                 )
                 .await?
             }
-            RequestedMode::Chunked | RequestedMode::Cache => unreachable!("checked above"),
+            RequestedMode::Cache => {
+                let trunk_chunk_blocks = trunk_chunk_blocks_from_env(16);
+                run_derivation_cache(
+                    args.role,
+                    args.port,
+                    &indices,
+                    args.share,
+                    args.peer_ip,
+                    trunk_chunk_blocks,
+                )
+                .await?
+            }
+            RequestedMode::Chunked => unreachable!("checked above"),
         };
         return Ok(PartyOutput::Range(outputs));
     }
@@ -379,6 +393,224 @@ async fn run_derivation_tree(
     reveal_authenticated_values(&c2pc, &mut streams, &authenticated)
         .await
         .inspect(|_| timing.mark("tree_reveal"))
+}
+
+async fn run_derivation_cache(
+    role: Role,
+    port: u16,
+    indices: &[Index48],
+    share: Value32,
+    peer_ip: IpAddr,
+    trunk_chunk_blocks: i32,
+) -> Result<Vec<(Index48, Value32)>, PartyError> {
+    let lo = indices
+        .first()
+        .ok_or(PartyError::UnsupportedMode("range must not be empty"))?
+        .get();
+    let hi = indices
+        .last()
+        .ok_or(PartyError::UnsupportedMode("range must not be empty"))?
+        .get();
+    let mut timing = PhaseTiming::new(role, Index48::new(lo).expect("parser checked index"));
+    let sha = load_bristol(default_sha256_compress_path())?;
+    let (split, low_mask, high_mask) = range_split_masks(&[
+        Index48::new(lo).expect("parser checked index"),
+        Index48::new(hi).expect("parser checked index"),
+    ])?;
+    let trunk_groups = split_chain_bits(lo & high_mask, effective_chunk_size(trunk_chunk_blocks)?)?;
+    if trunk_groups.iter().map(Vec::len).sum::<usize>() == 0 {
+        return Err(PartyError::UnsupportedMode(
+            "shachain2pc: cache needs >=1 common high set bit (no shared trunk hash); use batch mode for this range",
+        ));
+    }
+
+    let mut trunk_circuits = Vec::with_capacity(trunk_groups.len());
+    let mut max_ands = 0usize;
+    for (chunk, bits) in trunk_groups.iter().enumerate() {
+        let circuit = build_chunk_circuit(&sha, bits, chunk == 0)?;
+        check_chunk_circuit(&circuit)?;
+        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
+        max_ands = max_ands.max(c2pc_circuit.num_ands());
+        trunk_circuits.push(c2pc_circuit);
+    }
+
+    let tile_circuit_raw = build_tile_circuit(&sha, CACHE_TILE_HEIGHT)?;
+    check_tile_circuit(&tile_circuit_raw, CACHE_TILE_HEIGHT)?;
+    let tile_circuit = C2pcCircuit::from_circuit(&tile_circuit_raw)?;
+    max_ands = max_ands.max(tile_circuit.num_ands());
+
+    let one_step_raw = build_chunk_circuit(&sha, &[0], false)?;
+    check_chunk_circuit(&one_step_raw)?;
+    let one_step_circuit = C2pcCircuit::from_circuit(&one_step_raw)?;
+    max_ands = max_ands.max(one_step_circuit.num_ands());
+
+    let digest = cache_digest(lo, hi, trunk_chunk_blocks, CACHE_TILE_HEIGHT as i32, &sha);
+    timing.mark("build_cache_circuits");
+
+    let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
+    timing.mark("open_streams");
+    let mut c2pc =
+        C2pc::new_with_setup_size(&mut streams, role, trunk_circuits[0].clone(), max_ands).await?;
+    streams.main.flush().await?;
+    timing.mark("c2pc_setup");
+
+    let mut input = clear_input_bits(role, share);
+    let mut trunk = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
+    input.zeroize();
+    timing.mark("cache_trunk_0");
+
+    for (chunk, circuit) in trunk_circuits.into_iter().enumerate().skip(1) {
+        c2pc.reset_circuit(circuit);
+        trunk = run_carried_authenticated_stage(&mut c2pc, &mut streams, &trunk).await?;
+        timing.mark(match chunk {
+            1 => "cache_trunk_1",
+            2 => "cache_trunk_2",
+            3 => "cache_trunk_3",
+            _ => "cache_trunk",
+        });
+    }
+
+    let mut stack_bits = Vec::new();
+    let mut stack_vals = vec![trunk];
+    let mut tile_outs: HashMap<u64, AuthenticatedBits> = HashMap::new();
+    let mut single_outs: HashMap<u64, AuthenticatedBits> = HashMap::new();
+    let tile_mask = (CACHE_TILE_LEAVES as u64) - 1;
+    let can_tile = split >= (CACHE_TILE_HEIGHT as i32 - 1);
+
+    let mut index = hi;
+    loop {
+        let tile_base = index & !tile_mask;
+        let full_tile = can_tile
+            && (index & tile_mask) == tile_mask
+            && tile_base >= lo
+            && tile_base + tile_mask <= hi;
+        if full_tile {
+            let prefix = set_bits_desc((tile_base & low_mask) & !tile_mask);
+            align_cache_stack(
+                &mut c2pc,
+                &mut streams,
+                &sha,
+                &one_step_circuit,
+                &mut stack_bits,
+                &mut stack_vals,
+                &prefix,
+            )
+            .await?;
+            c2pc.reset_circuit(tile_circuit.clone());
+            let tile = run_carried_authenticated_stage(
+                &mut c2pc,
+                &mut streams,
+                stack_vals.last().expect("stack has trunk"),
+            )
+            .await?;
+            tile_outs.insert(tile_base, tile);
+            timing.mark("cache_tile");
+
+            if tile_base == lo {
+                break;
+            }
+            index = tile_base - 1;
+            continue;
+        }
+
+        let low = set_bits_desc(index & low_mask);
+        align_cache_stack(
+            &mut c2pc,
+            &mut streams,
+            &sha,
+            &one_step_circuit,
+            &mut stack_bits,
+            &mut stack_vals,
+            &low,
+        )
+        .await?;
+        single_outs.insert(index, stack_vals.last().expect("stack has trunk").clone());
+        timing.mark("cache_single");
+        if index == lo {
+            break;
+        }
+        index -= 1;
+    }
+
+    let mut results = vec![None; (hi - lo + 1) as usize];
+    let mut reveal_index = hi;
+    loop {
+        let tile_base = reveal_index & !tile_mask;
+        if let Some(tile) = tile_outs.get(&tile_base) {
+            let slot = (reveal_index & tile_mask) as usize;
+            let leaf = tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?;
+            let bits = c2pc
+                .reveal_authenticated_public(&mut streams, &leaf)
+                .await?;
+            results[(reveal_index - lo) as usize] = Some(value_from_bits(&bits)?);
+        } else {
+            let wires = single_outs
+                .get(&reveal_index)
+                .ok_or(PartyError::UnsupportedMode(
+                    "shachain2pc: missing cached output",
+                ))?;
+            let bits = c2pc
+                .reveal_authenticated_public(&mut streams, wires)
+                .await?;
+            results[(reveal_index - lo) as usize] = Some(value_from_bits(&bits)?);
+        }
+        if reveal_index == lo {
+            break;
+        }
+        reveal_index -= 1;
+    }
+    streams.main.flush().await?;
+    timing.mark("cache_reveal");
+
+    indices
+        .iter()
+        .map(|index| {
+            let offset = (index.get() - lo) as usize;
+            Ok((
+                *index,
+                results[offset].ok_or(PartyError::UnsupportedMode(
+                    "shachain2pc: missing cached result",
+                ))?,
+            ))
+        })
+        .collect()
+}
+
+async fn align_cache_stack(
+    c2pc: &mut C2pc,
+    streams: &mut EmpStreams,
+    sha: &Circuit,
+    one_step_template: &C2pcCircuit,
+    stack_bits: &mut Vec<usize>,
+    stack_vals: &mut Vec<AuthenticatedBits>,
+    target: &[usize],
+) -> Result<(), PartyError> {
+    let mut prefix = 0usize;
+    while prefix < stack_bits.len() && prefix < target.len() && stack_bits[prefix] == target[prefix]
+    {
+        prefix += 1;
+    }
+    stack_bits.truncate(prefix);
+    stack_vals.truncate(prefix + 1);
+    for &bit in &target[prefix..] {
+        let circuit = if bit == 0 {
+            one_step_template.clone()
+        } else {
+            let raw = build_chunk_circuit(sha, &[bit], false)?;
+            check_chunk_circuit(&raw)?;
+            C2pcCircuit::from_circuit(&raw)?
+        };
+        c2pc.reset_circuit(circuit);
+        let next = run_carried_authenticated_stage(
+            c2pc,
+            streams,
+            stack_vals.last().expect("stack has trunk"),
+        )
+        .await?;
+        stack_vals.push(next);
+        stack_bits.push(bit);
+    }
+    Ok(())
 }
 
 async fn run_derivation_chunked(
@@ -640,9 +872,7 @@ fn ensure_mode_supported_for_now(
         (false, RequestedMode::Tree) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_TREE mode requires a range",
         )),
-        (true, RequestedMode::Cache) => Err(PartyError::UnsupportedMode(
-            "Rust SHACHAIN2PC_CACHE mode is not implemented until the session/carry sync phase",
-        )),
+        (true, RequestedMode::Cache) => Ok(()),
         (false, RequestedMode::Cache) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_CACHE mode requires a range",
         )),
@@ -1010,10 +1240,7 @@ mod tests {
             Err(PartyError::UnsupportedMode(msg)) if msg.contains("single-index")
         ));
         assert!(ensure_mode_supported_for_now(&range, RequestedMode::Tree).is_ok());
-        assert!(matches!(
-            ensure_mode_supported_for_now(&range, RequestedMode::Cache),
-            Err(PartyError::UnsupportedMode(msg)) if msg.contains("CACHE")
-        ));
+        assert!(ensure_mode_supported_for_now(&range, RequestedMode::Cache).is_ok());
     }
 
     #[test]
@@ -1046,6 +1273,25 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, PartyError::UnsupportedMode(msg) if msg.contains("shared-trunk")));
+        StdTcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_cache_without_shared_hash_refuses_before_socket() {
+        let port = free_port();
+        let lo = Index48::from_hex("1").unwrap();
+        let hi = Index48::from_hex("2").unwrap();
+        let err = run_derivation_cache(
+            Role::Alice,
+            port,
+            &[lo, hi],
+            Value32::from_hex(SHARE_A).unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            16,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PartyError::UnsupportedMode(msg) if msg.contains("cache needs")));
         StdTcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     }
 

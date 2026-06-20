@@ -3263,7 +3263,55 @@ fn random_block() -> Result<Block> {
     Ok(Block::from_bytes(bytes))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    // SAFETY: loadu/movemask/slli_epi64 are SSE2, baseline on x86_64.
+    unsafe { transpose_128_rows_simd(rows, row_bytes, output_len) }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    transpose_128_rows_soft(rows, row_bytes, output_len)
+}
+
+// SSE2 bit-matrix transpose of a 128-row matrix. For each input byte-column it
+// loads the 16 rows of a group into a vector, then peels off one output row per
+// bit: movemask extracts the MSB of all 16 bytes as a 16-bit column, and a
+// per-lane left shift brings the next bit to the MSB (the cross-byte/lane carry
+// only touches LSBs, which movemask ignores). Mirrors emp's sse_trans. Produces
+// the same OUT[col].bit(row) = (rows[row*rb + col/8] >> (col%8)) & 1 mapping as
+// transpose_128_rows_soft / the bit reference, gated by
+// tests::transpose_128_rows_matches_bit_reference.
+#[cfg(target_arch = "x86_64")]
+unsafe fn transpose_128_rows_simd(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    use core::arch::x86_64::*;
+    const ROWS: usize = 128;
+    debug_assert_eq!(output_len, row_bytes * 8);
+    debug_assert_eq!(rows.len(), ROWS * row_bytes);
+    let mut out = vec![[0u8; BLOCK_BYTES]; output_len];
+    let mut lane = [0u8; 16];
+    for source_byte in 0..row_bytes {
+        for group in 0..(ROWS / 16) {
+            let base = group * 16;
+            for (i, slot) in lane.iter_mut().enumerate() {
+                *slot = rows[(base + i) * row_bytes + source_byte];
+            }
+            let mut v = _mm_loadu_si128(lane.as_ptr().cast());
+            // bit runs 7,6,..,0; movemask reads the MSB (== current bit) of each byte.
+            for bit in (0..8).rev() {
+                let mask = _mm_movemask_epi8(v) as u32;
+                let out_row = source_byte * 8 + bit;
+                out[out_row][group * 2] = (mask & 0xff) as u8; // rows base..=base+7
+                out[out_row][group * 2 + 1] = ((mask >> 8) & 0xff) as u8; // rows base+8..=base+15
+                v = _mm_slli_epi64(v, 1);
+            }
+        }
+    }
+    out.into_iter().map(Block::from_bytes).collect()
+}
+
+#[cfg(any(test, not(target_arch = "x86_64")))]
+fn transpose_128_rows_soft(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
     debug_assert_eq!(output_len, row_bytes * 8);
     let mut out = vec![[0u8; BLOCK_BYTES]; output_len];
     for source_byte in 0..row_bytes {
@@ -3288,6 +3336,7 @@ fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<B
     out.into_iter().map(Block::from_bytes).collect()
 }
 
+#[cfg(any(test, not(target_arch = "x86_64")))]
 fn transpose_8x8(mut x: u64) -> u64 {
     let mut t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
     x ^= t ^ (t << 7);
@@ -3336,9 +3385,13 @@ mod tests {
             for (i, byte) in rows.iter_mut().enumerate() {
                 *byte = ((i * 37 + i / 7 + 0x5a) & 0xff) as u8;
             }
+            let reference = transpose_128_rows_bit_reference(&rows, row_bytes, output_len);
+            // transpose_128_rows dispatches to the SSE2 path on x86_64; compare it
+            // and the scalar fallback against the independent bit reference.
+            assert_eq!(transpose_128_rows(&rows, row_bytes, output_len), reference);
             assert_eq!(
-                transpose_128_rows(&rows, row_bytes, output_len),
-                transpose_128_rows_bit_reference(&rows, row_bytes, output_len)
+                transpose_128_rows_soft(&rows, row_bytes, output_len),
+                reference
             );
         }
     }

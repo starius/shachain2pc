@@ -1,6 +1,23 @@
 # Rust AG2PC backend transition plan
 
-Status: planning note for review. No implementation in this document.
+Status: implementation completed through Phase 6. Phase 7 remains open for
+broader measurement and final security review.
+
+Current implementation state:
+
+- Rust has a pure AG2PC backend compatible with the current C++
+  `AG2PCSession` stack: CSW base OT, SoftSpoken COT, AG2PC triple pool,
+  authenticated input/reveal, stored BooleanProgram execution, and carried
+  authenticated values.
+- `shachain2pc-party` uses the AG2PC session API for single-index, range,
+  chunked, tree, and recursive tiled cache modes.
+- Cross-mode smoke tests have passed locally in both role directions for
+  single-index `I=1`, multi-block `I=3`, range `1-3`, chunked `I=3`,
+  tree range `2-3`, and cache range `0x10-0x1f`.
+- The old Rust WRK17/C2PC runtime and its stale old-EMP tests have been removed
+  from the active Rust code/test path.
+- Active Rust/C++ compatibility tests now target only the current CSW,
+  SoftSpoken, and AG2PC helper/protocol probes.
 
 ## 1. Goal
 
@@ -89,6 +106,10 @@ is being proven; the final phase deletes the old backend.
 
 ## 4. Phase 0: freeze the new C++ compatibility surface
 
+Status: completed for the current AG2PC transition. The repository has
+deterministic helper fixtures and live AG2PC C++ probe tests for the surfaces
+used by the Rust port.
+
 Before porting Rust, add deterministic and live probes for the current C++
 `AG2PCSession` backend. These probes are the compatibility spec.
 
@@ -136,6 +157,9 @@ backend.
 
 ## 5. Phase 1: Rust transport parity
 
+Status: completed. Rust opens the AG2PC main and sibling streams in the same
+order as C++, and the active live C++ probe tests use this transport.
+
 Implement the current C++ transport shape in Rust:
 
 - one primary full-duplex TCP stream;
@@ -153,6 +177,9 @@ Tests:
 - no MPC yet.
 
 ## 6. Phase 2: SoftSpoken OT compatibility
+
+Status: completed. Rust/Rust and C++/Rust SoftSpoken live tests pass in both
+role directions.
 
 Port or reimplement the SoftSpoken OT path used by current C++.
 
@@ -176,6 +203,10 @@ Tests:
 Review gate: no AG2PC garbling until SoftSpoken cross-mode is stable.
 
 ## 7. Phase 3: authenticated wire/session core
+
+Status: completed. `Ag2pcProtocol` and `Ag2pcSession` authenticate inputs,
+carry authenticated wires, reveal public/party outputs, and check pending
+consistency state before returning.
 
 Implement the Rust equivalent of `AG2PCSession` state:
 
@@ -217,6 +248,10 @@ Tests:
 
 ## 8. Phase 4: garbling/check/reveal parity
 
+Status: completed for the stored-program runner. Rust/Rust program execution
+and active C++ AG2PC helper/protocol probes pass; party-level cross-mode smoke
+tests cover the real shachain circuits.
+
 Port the current C++ authenticated garbling backend:
 
 - BooleanProgram canonical wire layout;
@@ -241,6 +276,9 @@ Review gate: once this phase passes, the old Rust backend can be disconnected
 from `party` behind a feature or branch-local switch.
 
 ## 9. Phase 5: reconnect party modes to new backend
+
+Status: completed. The Rust `party` binary now uses the AG2PC session path for
+all current modes and no longer calls the old `C2pc` API.
 
 Move `shachain2pc-party` from the old `C2pc` API to the new `Session` API.
 
@@ -276,6 +314,10 @@ Tests:
 
 ## 10. Phase 6: remove old Rust backend
 
+Status: completed for active Rust code and tests. Historical planning text
+still names the old stack, but active production/runtime Rust code and active
+compatibility tests no longer depend on it.
+
 After Phase 5 is green:
 
 - delete old runtime backend code from `shachain2pc-emp-compat`;
@@ -297,6 +339,8 @@ Acceptance:
 - CI/build does not reference removed old Makefile probes.
 
 ## 11. Phase 7: measurement and security review
+
+Status: open. This is the next phase after the backend transition.
 
 Run measurements after backend replacement, not before.
 

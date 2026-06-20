@@ -3,11 +3,9 @@
 This older planning entry has been superseded by
 [`rust-ag2pc-transition-plan.md`](rust-ag2pc-transition-plan.md).
 
-The remaining sync work is no longer the shachain/cache application layer. Rust
-already has the current recursive-tile cache shape. The blocker for current
-C++/Rust cross-mode is the MPC backend: current C++ uses the rewritten
-`AG2PCSession`/SoftSpoken backend, while Rust still uses the older WRK17/C2PC
-backend.
+The shachain/cache application layer and the current C++ `AG2PCSession` /
+SoftSpoken backend have both been ported to Rust. The old Rust WRK17/C2PC backend
+has been removed from the active code path.
 
-Use the new transition plan for implementation and review. It explicitly includes
-removing the old Rust backend from active code once the new backend is in place.
+Use the new transition plan for implementation status, remaining measurement
+work, and security-review checklist.

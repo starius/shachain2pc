@@ -349,23 +349,23 @@ The measurements pin two useful points:
    therefore the dominant one; the deferred reveal optimization (Section 1)
    addresses the smaller ~0.05 s/secret term.
 
-### Rust/Rust comparison (50 ms emulated RTT)
+### Historical Rust/Rust comparison (50 ms emulated RTT)
 
-The current Rust/Rust implementation was measured with the same recursive-cache
-shape: aligned 1024-leaf range, fanout 16, trunk chunk 16, one secret revealed
-per leaf, and 50 ms emulated RTT. This is not a C++/Rust cross-mode result:
-current Rust still uses the older WRK17/C2PC backend, while current C++ uses the
-newer AG2PC/SoftSpoken backend.
+This row was measured before Rust was moved to the current AG2PC/SoftSpoken
+backend. It is kept only as a historical baseline for the older Rust WRK17/C2PC
+backend and should not be used as the current Rust performance claim. Re-run this
+measurement after the AG2PC transition when comparing current Rust/Rust,
+C++/C++, and cross-mode performance.
 
 | leaves | mode | branch instances | new hashes | wall s | preReveal s | preReveal s/secret | reveal s | reveal s/secret | peak RSS |
 |---:|:--|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1024 | recursive | 69 | 1023 | 333.23 | 281.81 | 0.275 | 51.74 | 0.051 | 737 MB |
 
-This is about 3.63 pre-reveal secrets/s and 19.79 reveal secrets/s. Compared to
-the C++/C++ 1024 recursive row above, Rust/Rust is about 2.2x slower on
-pre-reveal per secret (0.275 s vs 0.125 s) and uses about 3.0x peak RSS (737 MB
-vs 250 MB). The reveal term is essentially the same because it is dominated by
-one 50 ms round trip per secret.
+Historically this was about 3.63 pre-reveal secrets/s and 19.79 reveal
+secrets/s. Compared to the C++/C++ 1024 recursive row above, the older Rust
+backend was about 2.2x slower on pre-reveal per secret (0.275 s vs 0.125 s) and
+used about 3.0x peak RSS (737 MB vs 250 MB). The reveal term was essentially the
+same because it was dominated by one 50 ms round trip per secret.
 
 ## 10. Recommended sequencing
 

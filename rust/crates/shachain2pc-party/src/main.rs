@@ -1,9 +1,9 @@
 use shachain2pc_circuit::{
-    build_chunk_circuit, build_circuit_for_index, check_chunk_circuit, chunk_spec_digest,
-    circuit_digest, load_bristol, split_chain_bits, to_emp_gate_array,
+    batch_digest, build_chunk_circuit, build_circuit_for_index, check_chunk_circuit,
+    chunk_spec_digest, circuit_digest, load_bristol, split_chain_bits, to_emp_gate_array,
     DEFAULT_SHA256_COMPRESS_PATH,
 };
-use shachain2pc_emp_compat::{C2pc, C2pcCircuit, CompatError};
+use shachain2pc_emp_compat::{AuthenticatedBits, C2pc, C2pcCircuit, CompatError};
 use shachain2pc_emp_wire::{EmpStream, EmpStreams, WireError};
 use shachain2pc_types::{Index48, Role, Value32, VALUE_BITS};
 use std::env;
@@ -96,6 +96,17 @@ impl IndexSpec {
         matches!(self, Self::Range { .. })
     }
 
+    fn indices(&self) -> Option<Vec<Index48>> {
+        match self {
+            Self::Single(_) => None,
+            Self::Range { lo, hi } => Some(
+                (lo.get()..=hi.get())
+                    .map(|value| Index48::new(value).expect("range parser enforced 48-bit index"))
+                    .collect(),
+            ),
+        }
+    }
+
     fn contains_seed(&self) -> bool {
         match self {
             Self::Single(index) => index.get() == 0,
@@ -121,12 +132,22 @@ enum RequestedMode {
     Cache,
 }
 
+enum PartyOutput {
+    Single(Value32),
+    Range(Vec<(Index48, Value32)>),
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     match parse_args(env::args().collect()) {
-        Ok(args) => match run_derivation(args).await {
-            Ok(out) => {
+        Ok(args) => match run_party(args).await {
+            Ok(PartyOutput::Single(out)) => {
                 println!("RESULT {}", out.to_hex());
+            }
+            Ok(PartyOutput::Range(outputs)) => {
+                for (index, out) in outputs {
+                    println!("RESULT {} {}", index.to_hex12(), out.to_hex());
+                }
             }
             Err(e) => {
                 eprintln!("ABORT: {e}");
@@ -140,10 +161,26 @@ async fn main() {
     }
 }
 
+#[cfg(test)]
 async fn run_derivation(args: Args) -> Result<Value32, PartyError> {
+    match run_party(args).await? {
+        PartyOutput::Single(out) => Ok(out),
+        PartyOutput::Range(_) => Err(PartyError::UnsupportedMode(
+            "run_derivation returns one value; use run_party for ranges",
+        )),
+    }
+}
+
+async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
     ensure_index_allowed(&args.index_spec, args.allow_seed_reveal)?;
     let requested_mode = requested_mode_from_env(args.index_spec.is_range());
     ensure_mode_supported_for_now(&args.index_spec, requested_mode)?;
+    if let Some(indices) = args.index_spec.indices() {
+        return run_derivation_batch(args.role, args.port, &indices, args.share, args.peer_ip)
+            .await
+            .map(PartyOutput::Range);
+    }
+
     let index = args.index_spec.single_index()?;
     if requested_mode == RequestedMode::Chunked {
         let blocks_per_chunk = chunk_blocks_from_env().ok_or(PartyError::UnsupportedMode(
@@ -157,7 +194,8 @@ async fn run_derivation(args: Args) -> Result<Value32, PartyError> {
             args.peer_ip,
             blocks_per_chunk,
         )
-        .await;
+        .await
+        .map(PartyOutput::Single);
     }
 
     let mut timing = PhaseTiming::new(args.role, index);
@@ -193,7 +231,55 @@ async fn run_derivation(args: Args) -> Result<Value32, PartyError> {
     input.zeroize();
     streams.main.flush().await?;
     timing.mark("online");
-    Value32::from_bits_msb(&output).map_err(|e| PartyError::Parse(e.to_string()))
+    value_from_bits(&output).map(PartyOutput::Single)
+}
+
+async fn run_derivation_batch(
+    role: Role,
+    port: u16,
+    indices: &[Index48],
+    share: Value32,
+    peer_ip: IpAddr,
+) -> Result<Vec<(Index48, Value32)>, PartyError> {
+    let first_index = *indices
+        .first()
+        .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
+    let mut timing = PhaseTiming::new(role, first_index);
+    let sha = load_bristol(default_sha256_compress_path())?;
+    let mut circuits = Vec::with_capacity(indices.len());
+    let mut max_ands = 0usize;
+    for &index in indices {
+        let circuit = build_circuit_for_index(index, &sha)?;
+        let c2pc_circuit = C2pcCircuit::from_circuit(&circuit)?;
+        max_ands = max_ands.max(c2pc_circuit.num_ands());
+        circuits.push(c2pc_circuit);
+    }
+    let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
+    let digest = batch_digest(&index_values, &sha);
+    timing.mark("build_batch_circuits");
+
+    let mut streams = open_streams_after_digest(role, port, peer_ip, digest).await?;
+    timing.mark("open_streams");
+    let mut c2pc =
+        C2pc::new_with_setup_size(&mut streams, role, circuits[0].clone(), max_ands).await?;
+    streams.main.flush().await?;
+    timing.mark("c2pc_setup");
+
+    let mut input = clear_input_bits(role, share);
+    let mut authenticated = Vec::with_capacity(indices.len());
+    for (i, circuit) in circuits.into_iter().enumerate() {
+        if i != 0 {
+            c2pc.reset_circuit(circuit);
+        }
+        let out = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
+        authenticated.push((indices[i], out));
+        timing.mark("batch_item");
+    }
+    input.zeroize();
+
+    reveal_authenticated_values(&c2pc, &mut streams, &authenticated)
+        .await
+        .inspect(|_| timing.mark("batch_reveal"))
 }
 
 async fn run_derivation_chunked(
@@ -226,30 +312,14 @@ async fn run_derivation_chunked(
     streams.main.flush().await?;
     timing.mark("c2pc_setup");
 
-    let mut input = vec![0u8; 2 * VALUE_BITS];
-    let mut share_bits = share.to_bits_msb();
-    match role {
-        Role::Alice => input[VALUE_BITS..].copy_from_slice(&share_bits),
-        Role::Bob => input[..VALUE_BITS].copy_from_slice(&share_bits),
-    }
-    share_bits.zeroize();
-
-    c2pc.function_independent(&mut streams).await?;
-    c2pc.function_dependent(&mut streams).await?;
-    let mut carried = c2pc
-        .online_authenticated_clear(&mut streams, &input)
-        .await?;
+    let mut input = clear_input_bits(role, share);
+    let mut carried = run_clear_authenticated_stage(&mut c2pc, &mut streams, &input).await?;
     input.zeroize();
     timing.mark("chunk_0");
 
     for (chunk, circuit) in circuits.into_iter().enumerate().skip(1) {
         c2pc.reset_circuit(circuit);
-        c2pc.function_independent(&mut streams).await?;
-        c2pc.apply_carried_inputs(&carried)?;
-        c2pc.function_dependent_carried(&mut streams).await?;
-        carried = c2pc
-            .online_authenticated_carried(&mut streams, &carried)
-            .await?;
+        carried = run_carried_authenticated_stage(&mut c2pc, &mut streams, &carried).await?;
         timing.mark(match chunk {
             1 => "chunk_1",
             2 => "chunk_2",
@@ -263,7 +333,57 @@ async fn run_derivation_chunked(
         .await?;
     streams.main.flush().await?;
     timing.mark("reveal");
-    Value32::from_bits_msb(&output).map_err(|e| PartyError::Parse(e.to_string()))
+    value_from_bits(&output)
+}
+
+async fn run_clear_authenticated_stage(
+    c2pc: &mut C2pc,
+    streams: &mut EmpStreams,
+    input: &[u8],
+) -> Result<AuthenticatedBits, PartyError> {
+    c2pc.function_independent(streams).await?;
+    c2pc.function_dependent(streams).await?;
+    Ok(c2pc.online_authenticated_clear(streams, input).await?)
+}
+
+async fn run_carried_authenticated_stage(
+    c2pc: &mut C2pc,
+    streams: &mut EmpStreams,
+    carried: &AuthenticatedBits,
+) -> Result<AuthenticatedBits, PartyError> {
+    c2pc.function_independent(streams).await?;
+    c2pc.apply_carried_inputs(carried)?;
+    c2pc.function_dependent_carried(streams).await?;
+    Ok(c2pc.online_authenticated_carried(streams, carried).await?)
+}
+
+async fn reveal_authenticated_values(
+    c2pc: &C2pc,
+    streams: &mut EmpStreams,
+    authenticated: &[(Index48, AuthenticatedBits)],
+) -> Result<Vec<(Index48, Value32)>, PartyError> {
+    let mut outputs = Vec::with_capacity(authenticated.len());
+    for (index, wires) in authenticated {
+        let bits = c2pc.reveal_authenticated_public(streams, wires).await?;
+        outputs.push((*index, value_from_bits(&bits)?));
+    }
+    streams.main.flush().await?;
+    Ok(outputs)
+}
+
+fn clear_input_bits(role: Role, share: Value32) -> Vec<u8> {
+    let mut input = vec![0u8; 2 * VALUE_BITS];
+    let mut share_bits = share.to_bits_msb();
+    match role {
+        Role::Alice => input[VALUE_BITS..].copy_from_slice(&share_bits),
+        Role::Bob => input[..VALUE_BITS].copy_from_slice(&share_bits),
+    }
+    share_bits.zeroize();
+    input
+}
+
+fn value_from_bits(bits: &[u8]) -> Result<Value32, PartyError> {
+    Value32::from_bits_msb(bits).map_err(|e| PartyError::Parse(e.to_string()))
 }
 
 struct PhaseTiming {
@@ -360,18 +480,22 @@ fn ensure_mode_supported_for_now(
 ) -> Result<(), PartyError> {
     match (index_spec.is_range(), mode) {
         (false, RequestedMode::Full) => Ok(()),
-        (true, RequestedMode::Full) => Err(PartyError::UnsupportedMode(
-            "Rust range execution is not implemented until the session/carry sync phase",
-        )),
+        (true, RequestedMode::Full) => Ok(()),
         (false, RequestedMode::Chunked) => Ok(()),
         (_, RequestedMode::Chunked) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_CHUNK_BLOCKS mode is single-index only",
         )),
-        (_, RequestedMode::Tree) => Err(PartyError::UnsupportedMode(
+        (true, RequestedMode::Tree) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_TREE mode is not implemented until the session/carry sync phase",
         )),
-        (_, RequestedMode::Cache) => Err(PartyError::UnsupportedMode(
+        (false, RequestedMode::Tree) => Err(PartyError::UnsupportedMode(
+            "Rust SHACHAIN2PC_TREE mode requires a range",
+        )),
+        (true, RequestedMode::Cache) => Err(PartyError::UnsupportedMode(
             "Rust SHACHAIN2PC_CACHE mode is not implemented until the session/carry sync phase",
+        )),
+        (false, RequestedMode::Cache) => Err(PartyError::UnsupportedMode(
+            "Rust SHACHAIN2PC_CACHE mode requires a range",
         )),
     }
 }
@@ -713,23 +837,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rust_range_mode_refuses_before_socket_until_session_sync() {
-        let port = free_port();
-        let err = run_derivation(Args {
-            role: Role::Alice,
-            port,
-            index_spec: IndexSpec::Range {
-                lo: Index48::from_hex("64").unwrap(),
-                hi: Index48::from_hex("65").unwrap(),
-            },
-            share: Value32::from_hex(SHARE_A).unwrap(),
-            peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            allow_seed_reveal: false,
-        })
-        .await
-        .unwrap_err();
-        assert!(matches!(err, PartyError::UnsupportedMode(msg) if msg.contains("range execution")));
-        StdTcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    async fn rust_range_i0_honest_matches_reference() {
+        let index = Index48::from_hex("0").unwrap();
+        let (alice, bob) = run_pair_range(index, index, true, Duration::from_secs(60)).await;
+        let expected = vec![(index, generate_from_seed(combined_seed(), index))];
+        assert_eq!(alice.unwrap(), expected);
+        assert_eq!(bob.unwrap(), expected);
     }
 
     #[test]
@@ -741,10 +854,7 @@ mod tests {
         };
 
         assert!(ensure_mode_supported_for_now(&single, RequestedMode::Full).is_ok());
-        assert!(matches!(
-            ensure_mode_supported_for_now(&range, RequestedMode::Full),
-            Err(PartyError::UnsupportedMode(msg)) if msg.contains("range execution")
-        ));
+        assert!(ensure_mode_supported_for_now(&range, RequestedMode::Full).is_ok());
         assert!(ensure_mode_supported_for_now(&single, RequestedMode::Chunked).is_ok());
         assert!(matches!(
             ensure_mode_supported_for_now(&range, RequestedMode::Chunked),
@@ -834,6 +944,55 @@ mod tests {
         .unwrap()
     }
 
+    async fn run_pair_range(
+        lo: Index48,
+        hi: Index48,
+        allow_seed_reveal: bool,
+        timeout_duration: Duration,
+    ) -> (
+        Result<Vec<(Index48, Value32)>, PartyError>,
+        Result<Vec<(Index48, Value32)>, PartyError>,
+    ) {
+        let _guard = party_test_lock().lock().await;
+        let port = free_port();
+        let alice = tokio::spawn(run_party(test_range_args(
+            Role::Alice,
+            port,
+            lo,
+            hi,
+            SHARE_A,
+            allow_seed_reveal,
+        )));
+        sleep(Duration::from_millis(50)).await;
+        let bob = tokio::spawn(run_party(test_range_args(
+            Role::Bob,
+            port,
+            lo,
+            hi,
+            SHARE_B,
+            allow_seed_reveal,
+        )));
+        timeout(timeout_duration, async {
+            let alice = match alice.await.unwrap() {
+                Ok(PartyOutput::Range(outputs)) => Ok(outputs),
+                Ok(PartyOutput::Single(_)) => Err(PartyError::UnsupportedMode(
+                    "test expected range output, got single output",
+                )),
+                Err(e) => Err(e),
+            };
+            let bob = match bob.await.unwrap() {
+                Ok(PartyOutput::Range(outputs)) => Ok(outputs),
+                Ok(PartyOutput::Single(_)) => Err(PartyError::UnsupportedMode(
+                    "test expected range output, got single output",
+                )),
+                Err(e) => Err(e),
+            };
+            (alice, bob)
+        })
+        .await
+        .unwrap()
+    }
+
     fn test_args(
         role: Role,
         port: u16,
@@ -845,6 +1004,24 @@ mod tests {
             role,
             port,
             index_spec: IndexSpec::Single(index),
+            share: Value32::from_hex(share).unwrap(),
+            peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            allow_seed_reveal,
+        }
+    }
+
+    fn test_range_args(
+        role: Role,
+        port: u16,
+        lo: Index48,
+        hi: Index48,
+        share: &str,
+        allow_seed_reveal: bool,
+    ) -> Args {
+        Args {
+            role,
+            port,
+            index_spec: IndexSpec::Range { lo, hi },
             share: Value32::from_hex(share).unwrap(),
             peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             allow_seed_reveal,

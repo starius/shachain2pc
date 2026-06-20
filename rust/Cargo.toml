@@ -16,6 +16,7 @@ publish = false
 [workspace.dependencies]
 aes = { version = "0.8", features = ["zeroize"] }
 openssl = "0.10"
+p256 = { version = "0.13", features = ["arithmetic", "hash2curve"] }
 sha2 = "0.10"
 serde_json = "1"
 tokio = "1"

@@ -12,6 +12,7 @@ cpp-probes = []
 [dependencies]
 aes.workspace = true
 openssl.workspace = true
+p256.workspace = true
 sha2.workspace = true
 shachain2pc-circuit = { path = "../shachain2pc-circuit" }
 shachain2pc-emp-wire = { path = "../shachain2pc-emp-wire" }

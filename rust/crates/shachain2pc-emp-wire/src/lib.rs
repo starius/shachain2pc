@@ -55,6 +55,18 @@ impl Block {
         }
     }
 
+    /// Mutable byte view of a contiguous block slice, with no copy.
+    #[inline]
+    pub fn slice_as_mut_bytes(blocks: &mut [Block]) -> &mut [u8] {
+        // SAFETY: same layout argument as slice_as_bytes.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                blocks.as_mut_ptr().cast::<u8>(),
+                blocks.len() * BLOCK_BYTES,
+            )
+        }
+    }
+
     #[inline]
     pub fn into_bytes(self) -> [u8; BLOCK_BYTES] {
         self.0
@@ -385,23 +397,23 @@ impl EmpStream {
     }
 
     pub async fn send_block(&mut self, blocks: &[Block]) -> Result<()> {
-        if let [block] = blocks {
-            return self.send_data(block.as_bytes()).await;
-        }
-        let mut bytes = Vec::with_capacity(blocks.len() * BLOCK_BYTES);
-        for block in blocks {
-            bytes.extend_from_slice(block.as_bytes());
-        }
-        self.send_data(&bytes).await?;
-        Ok(())
+        self.send_data(Block::slice_as_bytes(blocks)).await
     }
 
     pub async fn recv_block(&mut self, count: usize) -> Result<Vec<Block>> {
-        let bytes = self.recv_data(count * BLOCK_BYTES).await?;
-        Ok(bytes
-            .chunks_exact(BLOCK_BYTES)
-            .map(|chunk| Block::from_bytes(chunk.try_into().expect("chunk length")))
-            .collect())
+        let len = count * BLOCK_BYTES;
+        self.recv_counter += len as u64;
+        if self.last_dir != LastDir::Recv {
+            self.rounds += 1;
+            self.last_dir = LastDir::Recv;
+        }
+        let mut out = vec![Block::zero(); count];
+        let bytes = Block::slice_as_mut_bytes(&mut out);
+        self.stream.read_exact(bytes).await?;
+        if let Some(fs_recv) = &mut self.fs_recv {
+            fs_recv.update(bytes);
+        }
+        Ok(out)
     }
 
     pub async fn send_bool_bytes(&mut self, bool_bytes: &[u8], ptr_mod8: usize) -> Result<()> {

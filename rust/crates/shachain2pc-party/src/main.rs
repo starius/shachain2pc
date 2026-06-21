@@ -254,9 +254,10 @@ async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
     let seed_inputs =
         authenticate_seed_inputs(&mut session, &mut streams, args.role, args.share).await?;
     timing.mark("input_auth");
-    let authenticated = session
+    let mut authenticated = session
         .run_program(&mut streams, &program, &seed_inputs)
         .await?;
+    authenticated.strip_labels_for_reveal();
     timing.mark("compute");
     let output = session.reveal_public(&mut streams, &authenticated).await?;
     session.end(&mut streams).await?;
@@ -296,9 +297,10 @@ async fn run_derivation_batch(
     timing.mark("input_auth");
     let mut authenticated = Vec::with_capacity(indices.len());
     for (i, program) in programs.into_iter().enumerate() {
-        let out = session
+        let mut out = session
             .run_program(&mut streams, &program, &seed_inputs)
             .await?;
+        out.strip_labels_for_reveal();
         authenticated.push((indices[i], out));
         timing.mark("batch_item");
     }
@@ -378,7 +380,8 @@ async fn run_derivation_tree(
 
     let mut authenticated = Vec::with_capacity(indices.len());
     for (i, program) in branch_programs.into_iter().enumerate() {
-        let out = session.run_program(&mut streams, &program, &trunk).await?;
+        let mut out = session.run_program(&mut streams, &program, &trunk).await?;
+        out.strip_labels_for_reveal();
         authenticated.push((indices[i], out));
         timing.mark("tree_branch");
     }
@@ -503,9 +506,10 @@ async fn run_derivation_cache(
                     } else {
                         &program
                     };
-                    let tile = session
+                    let mut tile = session
                         .run_program(&mut streams, program_ref, &root)
                         .await?;
+                    tile.strip_labels_for_reveal();
                     tiles.push(tile);
                     timing.mark("cache_tile");
                     tamper.advance();
@@ -618,9 +622,10 @@ async fn run_derivation_cache(
                     .as_ref()
                     .expect("full_tile requires tile_program")
             };
-            let tile = session
+            let mut tile = session
                 .run_program(&mut streams, tile_program_ref, stack.last())
                 .await?;
+            tile.strip_labels_for_reveal();
             tile_outs.insert(tile_base, tile);
             timing.mark("cache_tile");
             tamper.advance();
@@ -643,7 +648,9 @@ async fn run_derivation_cache(
             &mut tamper,
         )
         .await?;
-        single_outs.insert(index, stack.last().clone());
+        let mut out = stack.last().clone();
+        out.strip_labels_for_reveal();
+        single_outs.insert(index, out);
         timing.mark("cache_single");
         if index == lo {
             break;
@@ -813,6 +820,7 @@ async fn run_derivation_chunked(
         });
     }
 
+    carried.strip_labels_for_reveal();
     let output = session.reveal_public(&mut streams, &carried).await?;
     session.end(&mut streams).await?;
     streams.main.flush().await?;

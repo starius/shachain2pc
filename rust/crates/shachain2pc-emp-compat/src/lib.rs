@@ -1607,6 +1607,15 @@ impl Ag2pcSecureWires {
         }
         out
     }
+
+    pub fn strip_labels_for_reveal(&mut self) {
+        self.label0.zeroize();
+        self.eval_label.zeroize();
+        self.label0.clear();
+        self.eval_label.clear();
+        self.label0.shrink_to_fit();
+        self.eval_label.shrink_to_fit();
+    }
 }
 
 impl Drop for Ag2pcSecureWires {
@@ -2714,7 +2723,7 @@ impl Ag2pcProtocol {
         wires: &Ag2pcSecureWires,
         recipient: Ag2pcRevealRecipient,
     ) -> Result<Vec<u8>> {
-        self.check_secure_wires(wires)?;
+        self.check_reveal_wires(wires)?;
         match recipient {
             Ag2pcRevealRecipient::Public => {
                 let local = self.decode_to_party(streams, wires, Role::Bob).await?;
@@ -2816,6 +2825,13 @@ impl Ag2pcProtocol {
             Role::Bob if wires.eval_label.len() != n => Err(CompatError::BadAg2pcInputShape),
             _ => Ok(()),
         }
+    }
+
+    fn check_reveal_wires(&self, wires: &Ag2pcSecureWires) -> Result<()> {
+        if wires.wire_bundle.len() != wires.len() {
+            return Err(CompatError::BadAg2pcInputShape);
+        }
+        Ok(())
     }
 }
 

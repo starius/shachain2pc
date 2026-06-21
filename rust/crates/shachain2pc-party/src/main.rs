@@ -438,16 +438,9 @@ async fn run_derivation_cache(
     } else {
         None
     };
-    let mut recursive_programs = Vec::new();
-    if let Some(levels) = &recursive_levels {
-        recursive_programs.reserve(levels.len());
-        for &level in levels {
-            recursive_programs.push((
-                level,
-                build_tile_program(&sha, level.bit_offset, level.height, false)?,
-            ));
-        }
-    }
+    // Recursive-level tile circuits are built lazily, one level at a time, inside
+    // the tiling loop below (see the level loop), so only the current level's
+    // circuit is resident rather than all levels at once.
 
     // tile_program / one_step_program are built lazily below, after the recursive
     // path has had its chance to return -- the recursive case never uses them, so
@@ -487,10 +480,14 @@ async fn run_derivation_cache(
         });
     }
 
-    if !recursive_programs.is_empty() {
+    if let Some(levels) = &recursive_levels {
         let mut roots = vec![trunk.clone()];
-        for (level_index, (level, program)) in recursive_programs.iter().enumerate() {
-            let is_bottom = level_index + 1 == recursive_programs.len();
+        let n_levels = levels.len();
+        for (level_index, &level) in levels.iter().enumerate() {
+            // Build this level's tile circuit lazily; it is dropped at the end of
+            // the iteration, so only one level's circuit is resident at a time.
+            let program = build_tile_program(&sha, level.bit_offset, level.height, false)?;
+            let is_bottom = level_index + 1 == n_levels;
             if is_bottom {
                 let mut tiles = Vec::with_capacity(roots.len());
                 for root in roots {
@@ -504,7 +501,7 @@ async fn run_derivation_cache(
                         )?);
                         tampered_program.as_ref().expect("tampered program set")
                     } else {
-                        program
+                        &program
                     };
                     let tile = session
                         .run_program(&mut streams, program_ref, &root)
@@ -563,7 +560,7 @@ async fn run_derivation_cache(
                     )?);
                     tampered_program.as_ref().expect("tampered program set")
                 } else {
-                    program
+                    &program
                 };
                 let tile = session
                     .run_program(&mut streams, program_ref, &root)

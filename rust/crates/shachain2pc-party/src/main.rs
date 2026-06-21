@@ -449,13 +449,9 @@ async fn run_derivation_cache(
         }
     }
 
-    let tile_program = if tile_fanout >= 2 {
-        Some(build_tile_program(&sha, 0, CACHE_TILE_HEIGHT, false)?)
-    } else {
-        None
-    };
-
-    let one_step_program = chunk_program(&sha, &[0], false, false)?;
+    // tile_program / one_step_program are built lazily below, after the recursive
+    // path has had its chance to return -- the recursive case never uses them, so
+    // building them up front just wastes a large unused circuit.
 
     let digest = cache_digest(
         lo,
@@ -581,6 +577,15 @@ async fn run_derivation_cache(
             roots = next;
         }
     }
+
+    // Only reached when the recursive tiling did not apply; build the fallback
+    // programs now (kept out of the recursive case to save that RAM).
+    let tile_program = if tile_fanout >= 2 {
+        Some(build_tile_program(&sha, 0, CACHE_TILE_HEIGHT, false)?)
+    } else {
+        None
+    };
+    let one_step_program = chunk_program(&sha, &[0], false, false)?;
 
     let mut stack = CacheStack::new(trunk);
     let mut tile_outs: HashMap<u64, Ag2pcSecureWires> = HashMap::new();

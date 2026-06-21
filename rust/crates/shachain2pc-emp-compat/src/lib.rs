@@ -1935,7 +1935,6 @@ struct Ag2pcRunState {
     rep_a: Vec<AShareBundle>,
     rep_b: Vec<AShareBundle>,
     sigma: Vec<AShareBundle>,
-    m1_t: Vec<Block>,
     lambda_and: Vec<u8>,
     mitc: Mitccrh8,
 }
@@ -1959,7 +1958,6 @@ impl Ag2pcRunState {
             rep_a: Vec::new(),
             rep_b: Vec::new(),
             sigma: Vec::new(),
-            m1_t: Vec::new(),
             lambda_and: Vec::new(),
             mitc: Mitccrh8::new(Block::zero()),
         }
@@ -2063,7 +2061,6 @@ impl Ag2pcSession {
             .triple_pool
             .compute_inplace_owned(streams, rep_a, rep_b)
             .await?;
-        state.m1_t = vec![Block::zero(); state.num_ands.max(1)];
         state.lambda_and = vec![0; state.num_ands.max(1)];
         let seed = EmpRo::new("AG2PC half-gate", Block::zero())
             .absorb_block(streams.main.get_digest()?)
@@ -2308,8 +2305,7 @@ async fn ag2pc_garbler_path(
     }
     if state.num_ands > 0 {
         state.lambda_and = ag2pc_recv_bool_vector(&mut streams.main, state.num_ands).await?;
-        ag2pc_gamma_check_pass(state, program);
-        let digest = hash_once(Block::slice_as_bytes(&state.m1_t));
+        let digest = ag2pc_gamma_check_digest(state, program);
         streams.main.send_data(&digest).await?;
         streams.main.flush().await?;
     }
@@ -2365,6 +2361,7 @@ async fn ag2pc_evaluator_path(
     let mut chunk_b = Vec::with_capacity(chunk_ands);
     let mut chunk_pos = 0usize;
     let mut and_index = 0usize;
+    let mut gamma_hash = Sha256::new();
     for (gate_index, gate) in program.gates.iter().enumerate() {
         let out = program.gate_out(gate_index);
         match gate.typ() {
@@ -2395,7 +2392,7 @@ async fn ag2pc_evaluator_path(
                     chunk_b = b;
                     chunk_pos = 0;
                 }
-                ag2pc_evaluator_and_gate(
+                let m = ag2pc_evaluator_and_gate(
                     state,
                     gate,
                     out,
@@ -2404,6 +2401,7 @@ async fn ag2pc_evaluator_path(
                     chunk_g[2 * chunk_pos + 1],
                     chunk_b[chunk_pos],
                 );
+                gamma_hash.update(m.as_bytes());
                 and_index += 1;
                 chunk_pos += 1;
             }
@@ -2411,7 +2409,7 @@ async fn ag2pc_evaluator_path(
     }
     if state.num_ands > 0 {
         ag2pc_send_bool_vector(&mut streams.main, &state.lambda_and).await?;
-        let local = hash_once(Block::slice_as_bytes(&state.m1_t));
+        let local: [u8; HASH_DIGEST_BYTES] = gamma_hash.finalize().into();
         let peer: [u8; HASH_DIGEST_BYTES] = streams
             .main
             .recv_data(HASH_DIGEST_BYTES)
@@ -2433,7 +2431,7 @@ fn ag2pc_evaluator_and_gate(
     g0: Block,
     g1: Block,
     b: u8,
-) {
+) -> Block {
     let la = state.minp(gate.in0());
     let lb = state.minp(gate.in1());
     let wb_in0 = state.wslot(gate.in0());
@@ -2465,11 +2463,15 @@ fn ag2pc_evaluator_and_gate(
     m = m.xor(select_block(la).and(wb_in1.key));
     m = m.xor(select_block(lb).and(wb_in0.key));
     m = m.xor(sigma.key).xor(wb_out.key);
-    state.m1_t[and_index] = m;
+    m
 }
 
-fn ag2pc_gamma_check_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
+fn ag2pc_gamma_check_digest(
+    state: &mut Ag2pcRunState,
+    program: &Ag2pcProgram,
+) -> [u8; HASH_DIGEST_BYTES] {
     let mut and_index = 0usize;
+    let mut gamma_hash = Sha256::new();
     for (gate_index, gate) in program.gates.iter().enumerate() {
         let out = program.gate_out(gate_index);
         match gate.typ() {
@@ -2496,11 +2498,12 @@ fn ag2pc_gamma_check_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
                 let mut m = state.sigma[and_index].mac.xor(state.wslot(out).mac);
                 m = m.xor(select_block(la).and(state.wslot(gate.in1()).mac));
                 m = m.xor(select_block(lb).and(state.wslot(gate.in0()).mac));
-                state.m1_t[and_index] = m;
+                gamma_hash.update(m.as_bytes());
                 and_index += 1;
             }
         }
     }
+    gamma_hash.finalize().into()
 }
 
 fn ag2pc_gather_outputs(state: &Ag2pcRunState, program: &Ag2pcProgram) -> Result<Ag2pcSecureWires> {

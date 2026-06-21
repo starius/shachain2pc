@@ -15,7 +15,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, EmpStream, WireError, BLOCK_BYTES};
-use shachain2pc_types::Role;
+use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
 use std::sync::OnceLock;
 use zeroize::Zeroize;
@@ -1933,6 +1933,106 @@ impl Ag2pcProgram {
         })
     }
 
+    pub fn chunk_from_sha(sha: &Circuit, chain_bits: &[usize], first: bool) -> Result<Self> {
+        validate_sha_gadget("BuildChunkProgram", sha)?;
+        for &bit in chain_bits {
+            if bit >= INDEX_BITS as usize {
+                return Err(CompatError::BadAg2pcProgram(
+                    "BuildChunkProgram: chain bit exceeds 48 bits".to_owned(),
+                ));
+            }
+        }
+
+        let gate_capacity = 2
+            + if first { VALUE_BITS } else { 0 }
+            + chain_bits.len() * (sha.gates.len() + 1)
+            + VALUE_BITS;
+        let mut b = Ag2pcProgramBuilder::with_capacity(
+            if first { 2 * VALUE_BITS } else { VALUE_BITS },
+            gate_capacity,
+        );
+        let c0 = b.xor_w(0, 0)?;
+        let c1 = b.inv_w(c0)?;
+        let pad = ag2pc_padding_bits();
+
+        let mut p = Vec::with_capacity(VALUE_BITS);
+        if first {
+            for i in 0..VALUE_BITS {
+                p.push(b.xor_w(i as u32, (VALUE_BITS + i) as u32)?);
+            }
+        } else {
+            p.extend((0..VALUE_BITS).map(|wire| wire as u32));
+        }
+
+        for &bit in chain_bits {
+            let idx = ag2pc_flip_bit_index(bit);
+            p[idx] = b.inv_w(p[idx])?;
+            let mut block = vec![0u32; 512];
+            block[..VALUE_BITS].copy_from_slice(&p);
+            for i in 0..VALUE_BITS {
+                block[VALUE_BITS + i] = if pad[i] != 0 { c1 } else { c0 };
+            }
+            p = b.apply_gadget(sha, &block)?;
+        }
+
+        for wire in p.iter_mut().take(VALUE_BITS) {
+            *wire = b.xor_w(*wire, c0)?;
+        }
+        b.finish(VALUE_BITS)
+    }
+
+    pub fn tile_from_sha(sha: &Circuit, bit_offset: usize, tile_height: usize) -> Result<Self> {
+        if tile_height < 1 || tile_height > INDEX_BITS as usize {
+            return Err(CompatError::BadAg2pcProgram(
+                "BuildTileProgram: invalid tile height".to_owned(),
+            ));
+        }
+        if bit_offset + tile_height > INDEX_BITS as usize {
+            return Err(CompatError::BadAg2pcProgram(
+                "BuildTileProgram: bit window out of range".to_owned(),
+            ));
+        }
+        validate_sha_gadget("BuildTileProgram", sha)?;
+
+        let leaves = 1usize << tile_height;
+        let gate_capacity = 2 + (leaves - 1) * (sha.gates.len() + 1) + leaves * VALUE_BITS;
+        let mut b = Ag2pcProgramBuilder::with_capacity(VALUE_BITS, gate_capacity);
+        let c0 = b.xor_w(0, 0)?;
+        let c1 = b.inv_w(c0)?;
+        let pad = ag2pc_padding_bits();
+
+        let mut node = vec![Vec::new(); leaves];
+        node[0] = (0..VALUE_BITS).map(|wire| wire as u32).collect();
+
+        for depth in 1..=tile_height {
+            for suffix in 1..leaves {
+                if suffix.count_ones() as usize != depth {
+                    continue;
+                }
+                let bit = bit_offset + suffix.trailing_zeros() as usize;
+                let parent = suffix & (suffix - 1);
+                let mut p = node[parent].clone();
+                let idx = ag2pc_flip_bit_index(bit);
+                p[idx] = b.inv_w(p[idx])?;
+
+                let mut block = vec![0u32; 512];
+                block[..VALUE_BITS].copy_from_slice(&p);
+                for i in 0..VALUE_BITS {
+                    block[VALUE_BITS + i] = if pad[i] != 0 { c1 } else { c0 };
+                }
+                node[suffix] = b.apply_gadget(sha, &block)?;
+            }
+        }
+
+        for leaf in node.iter().take(leaves) {
+            for &wire in leaf.iter().take(VALUE_BITS) {
+                let _ = b.xor_w(wire, c0)?;
+            }
+        }
+
+        b.finish(VALUE_BITS * leaves)
+    }
+
     pub fn num_inputs(&self) -> usize {
         self.num_inputs
     }
@@ -1951,6 +2051,146 @@ impl Ag2pcProgram {
     fn gate_out(&self, gate_index: usize) -> usize {
         self.num_inputs + gate_index
     }
+}
+
+struct Ag2pcProgramBuilder {
+    num_inputs: usize,
+    gates: Vec<Ag2pcProgramGate>,
+}
+
+impl Ag2pcProgramBuilder {
+    fn with_capacity(num_inputs: usize, gate_capacity: usize) -> Self {
+        Self {
+            num_inputs,
+            gates: Vec::with_capacity(gate_capacity),
+        }
+    }
+
+    fn and_w(&mut self, in0: u32, in1: u32) -> Result<u32> {
+        self.push_gate(Ag2pcGateType::And, in0, in1)
+    }
+
+    fn xor_w(&mut self, in0: u32, in1: u32) -> Result<u32> {
+        self.push_gate(Ag2pcGateType::Xor, in0, in1)
+    }
+
+    fn inv_w(&mut self, in0: u32) -> Result<u32> {
+        self.push_gate(Ag2pcGateType::Inv, in0, 0)
+    }
+
+    fn push_gate(&mut self, typ: Ag2pcGateType, in0: u32, in1: u32) -> Result<u32> {
+        let out = self.num_inputs + self.gates.len();
+        if out >= AG2PC_GATE_WIRE_LIMIT {
+            return Err(CompatError::BadAg2pcProgram(
+                "AG2PC direct program is too large".to_owned(),
+            ));
+        }
+        self.gates.push(Ag2pcProgramGate::new(typ, in0, in1));
+        Ok(out as u32)
+    }
+
+    fn apply_gadget(&mut self, gadget: &Circuit, inputs: &[u32]) -> Result<Vec<u32>> {
+        let gin = checked_nonnegative("gadget inputs", gadget.n1 + gadget.n2)?;
+        let num_wire = checked_nonnegative("gadget num_wire", gadget.num_wire)?;
+        let n3 = checked_nonnegative("gadget n3", gadget.n3)?;
+        if inputs.len() != gin || n3 > num_wire {
+            return Err(CompatError::BadAg2pcProgram(
+                "ApplyAg2pcGadget: wrong gadget shape".to_owned(),
+            ));
+        }
+
+        const UNMAPPED: u32 = u32::MAX;
+        let mut map = vec![UNMAPPED; num_wire];
+        map[..gin].copy_from_slice(inputs);
+
+        for gate in &gadget.gates {
+            let typ = match gate.typ {
+                GateType::And => Ag2pcGateType::And,
+                GateType::Xor => Ag2pcGateType::Xor,
+                GateType::Inv => Ag2pcGateType::Inv,
+            };
+            let in0 = resolve_direct_wire(&map, gate.in0)?;
+            let in1 = if typ == Ag2pcGateType::Inv {
+                0
+            } else {
+                resolve_direct_wire(&map, gate.in1)?
+            };
+            let out = match typ {
+                Ag2pcGateType::And => self.and_w(in0, in1)?,
+                Ag2pcGateType::Xor => self.xor_w(in0, in1)?,
+                Ag2pcGateType::Inv => self.inv_w(in0)?,
+            };
+            let out_wire = checked_wire("gadget out", gate.out, num_wire)?;
+            map[out_wire] = out;
+        }
+
+        let start = num_wire - n3;
+        if map[start..start + n3].contains(&UNMAPPED) {
+            return Err(CompatError::BadAg2pcProgram(
+                "ApplyAg2pcGadget: output wire is not defined".to_owned(),
+            ));
+        }
+        Ok(map[start..start + n3].to_vec())
+    }
+
+    fn finish(self, output_len: usize) -> Result<Ag2pcProgram> {
+        if output_len > self.gates.len() + self.num_inputs {
+            return Err(CompatError::BadAg2pcProgram(
+                "AG2PC direct output length exceeds wire count".to_owned(),
+            ));
+        }
+        let num_wires = self.num_inputs + self.gates.len();
+        let output_start = num_wires - output_len;
+        let outputs = (output_start..num_wires).map(|wire| wire as u32).collect();
+        Ok(Ag2pcProgram {
+            num_inputs: self.num_inputs,
+            num_wires,
+            outputs,
+            gates: self.gates,
+        })
+    }
+}
+
+fn resolve_direct_wire(map: &[u32], wire: i32) -> Result<u32> {
+    let wire = checked_wire("gadget wire", wire, map.len())?;
+    let resolved = map[wire];
+    if resolved == u32::MAX {
+        Err(CompatError::BadAg2pcProgram(
+            "ApplyAg2pcGadget: input wire is not defined".to_owned(),
+        ))
+    } else {
+        Ok(resolved)
+    }
+}
+
+fn validate_sha_gadget(name: &'static str, sha: &Circuit) -> Result<()> {
+    if sha.n1 + sha.n2 != 512 || sha.n3 != VALUE_BITS as i32 {
+        return Err(CompatError::BadAg2pcProgram(format!(
+            "{name}: gadget is not 512->256"
+        )));
+    }
+    Ok(())
+}
+
+fn ag2pc_padding_bits() -> [u8; VALUE_BITS] {
+    let mut pad = [0u8; 32];
+    pad[0] = 0x80;
+    pad[30] = 0x01;
+    let mut bits = [0u8; VALUE_BITS];
+    for j in 0..32 {
+        for k in 0..8 {
+            bits[8 * j + k] = (pad[j] >> (7 - k)) & 1;
+        }
+    }
+    bits
+}
+
+fn ag2pc_msb_bit_index(byte: usize, lsb: usize) -> usize {
+    8 * byte + (7 - lsb)
+}
+
+fn ag2pc_flip_bit_index(bit: usize) -> usize {
+    ag2pc_msb_bit_index(bit / 8, bit % 8)
 }
 
 struct Ag2pcRunState {
@@ -3747,7 +3987,9 @@ fn point_bytes(group: &EcGroup, point: &EcPointRef, ctx: &mut BigNumContext) -> 
 mod tests {
     use super::*;
     use serde_json::Value;
-    use shachain2pc_circuit::Gate;
+    use shachain2pc_circuit::{
+        build_chunk_circuit, build_tile_circuit, sha256_compress_gadget, Gate, CACHE_TILE_HEIGHT,
+    };
     use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -4583,6 +4825,32 @@ mod tests {
     #[test]
     fn ag2pc_program_gate_stays_packed() {
         assert_eq!(std::mem::size_of::<Ag2pcProgramGate>(), 8);
+    }
+
+    #[test]
+    fn ag2pc_direct_chunk_program_matches_circuit_path() {
+        let sha = sha256_compress_gadget().unwrap();
+        for (bits, first) in [
+            (vec![47usize], true),
+            (vec![47usize, 46, 45], true),
+            (vec![3usize, 1], false),
+        ] {
+            let circuit = build_chunk_circuit(&sha, &bits, first).unwrap();
+            let via_circuit = Ag2pcProgram::from_circuit(&circuit).unwrap();
+            let direct = Ag2pcProgram::chunk_from_sha(&sha, &bits, first).unwrap();
+            assert_eq!(direct, via_circuit);
+        }
+    }
+
+    #[test]
+    fn ag2pc_direct_tile_program_matches_circuit_path() {
+        let sha = sha256_compress_gadget().unwrap();
+        for (offset, height) in [(0usize, 1usize), (0, CACHE_TILE_HEIGHT), (8, 3)] {
+            let circuit = build_tile_circuit(&sha, offset, height).unwrap();
+            let via_circuit = Ag2pcProgram::from_circuit(&circuit).unwrap();
+            let direct = Ag2pcProgram::tile_from_sha(&sha, offset, height).unwrap();
+            assert_eq!(direct, via_circuit);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

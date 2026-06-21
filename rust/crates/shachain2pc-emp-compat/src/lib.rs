@@ -1756,18 +1756,35 @@ pub struct Ag2pcProgram {
     gates: Vec<Ag2pcProgramGate>,
 }
 
-// Wire indices are stored as u32 (circuits have far fewer than 2^32 wires); this
-// halves the gate record vs usize, the dominant per-circuit allocation. Use the
-// in0()/in1()/out() accessors at index sites.
+const AG2PC_GATE_TYPE_SHIFT: u32 = 30;
+const AG2PC_GATE_WIRE_MASK: u32 = (1 << AG2PC_GATE_TYPE_SHIFT) - 1;
+const AG2PC_GATE_WIRE_LIMIT: usize = 1 << AG2PC_GATE_TYPE_SHIFT;
+
+// Wire indices are stored as u32, with the 2-bit gate type packed into the high
+// bits of out_and_typ. Real circuits have far fewer than 2^30 wires; packing the
+// type trims each gate record from 16 bytes to 12 bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Ag2pcProgramGate {
-    typ: Ag2pcGateType,
     in0: u32,
     in1: u32,
-    out: u32,
+    out_and_typ: u32,
 }
 
 impl Ag2pcProgramGate {
+    fn new(typ: Ag2pcGateType, in0: u32, in1: u32, out: u32) -> Self {
+        debug_assert!(out <= AG2PC_GATE_WIRE_MASK);
+        Self {
+            in0,
+            in1,
+            out_and_typ: out | (typ.code() << AG2PC_GATE_TYPE_SHIFT),
+        }
+    }
+
+    #[inline]
+    fn typ(&self) -> Ag2pcGateType {
+        Ag2pcGateType::from_code(self.out_and_typ >> AG2PC_GATE_TYPE_SHIFT)
+    }
+
     #[inline]
     fn in0(&self) -> usize {
         self.in0 as usize
@@ -1778,7 +1795,7 @@ impl Ag2pcProgramGate {
     }
     #[inline]
     fn out(&self) -> usize {
-        self.out as usize
+        (self.out_and_typ & AG2PC_GATE_WIRE_MASK) as usize
     }
 }
 
@@ -1789,13 +1806,33 @@ enum Ag2pcGateType {
     Inv,
 }
 
+impl Ag2pcGateType {
+    fn code(self) -> u32 {
+        match self {
+            Self::And => 0,
+            Self::Xor => 1,
+            Self::Inv => 2,
+        }
+    }
+
+    fn from_code(code: u32) -> Self {
+        match code {
+            0 => Self::And,
+            1 => Self::Xor,
+            2 => Self::Inv,
+            _ => unreachable!("gate type is packed into two bits"),
+        }
+    }
+}
+
 impl Ag2pcProgram {
     pub fn from_circuit(circuit: &Circuit) -> Result<Self> {
         let num_wire = checked_nonnegative("num_wire", circuit.num_wire)?;
         let n1 = checked_nonnegative("n1", circuit.n1)?;
         let n2 = checked_nonnegative("n2", circuit.n2)?;
         let n3 = checked_nonnegative("n3", circuit.n3)?;
-        if num_wire == 0 || n1 + n2 > num_wire || n3 > num_wire || num_wire >= u32::MAX as usize {
+        if num_wire == 0 || n1 + n2 > num_wire || n3 > num_wire || num_wire >= AG2PC_GATE_WIRE_LIMIT
+        {
             return Err(CompatError::BadAg2pcProgram(
                 "inconsistent circuit header".to_owned(),
             ));
@@ -1838,12 +1875,12 @@ impl Ag2pcProgram {
                 let in1_old = checked_wire("in1", gate.in1, num_wire)?;
                 resolve(in1_old)?
             };
-            gates.push(Ag2pcProgramGate {
+            gates.push(Ag2pcProgramGate::new(
                 typ,
                 in0,
                 in1,
-                out: (num_inputs + i) as u32,
-            });
+                (num_inputs + i) as u32,
+            ));
         }
 
         let mut outputs = Vec::with_capacity(n3);
@@ -1871,7 +1908,7 @@ impl Ag2pcProgram {
     pub fn num_ands(&self) -> usize {
         self.gates
             .iter()
-            .filter(|gate| gate.typ == Ag2pcGateType::And)
+            .filter(|gate| gate.typ() == Ag2pcGateType::And)
             .count()
     }
 }
@@ -2062,12 +2099,12 @@ fn ag2pc_liveness_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
         state.persist[i] = true;
     }
     for (gate_index, gate) in program.gates.iter().enumerate() {
-        state.persist[gate.out()] = gate.typ == Ag2pcGateType::And;
+        state.persist[gate.out()] = gate.typ() == Ag2pcGateType::And;
         state.last_use[gate.in0()] = gate_index as i32;
-        if gate.typ != Ag2pcGateType::Inv {
+        if gate.typ() != Ag2pcGateType::Inv {
             state.last_use[gate.in1()] = gate_index as i32;
         }
-        if gate.typ == Ag2pcGateType::And {
+        if gate.typ() == Ag2pcGateType::And {
             state.num_ands += 1;
         }
     }
@@ -2103,7 +2140,7 @@ async fn ag2pc_slot_mask_pass(
     let mut lg_off = 0usize;
 
     for (gate_index, gate) in program.gates.iter().enumerate() {
-        match gate.typ {
+        match gate.typ() {
             Ag2pcGateType::And => {
                 state.rep_a.push(state.wslot(gate.in0()));
                 state.rep_b.push(state.wslot(gate.in1()));
@@ -2134,7 +2171,7 @@ async fn ag2pc_slot_mask_pass(
             }
         }
         ag2pc_free_if_dead(state, gate.in0(), gate_index, &mut freelist);
-        if gate.typ != Ag2pcGateType::Inv && gate.in1() != gate.in0() {
+        if gate.typ() != Ag2pcGateType::Inv && gate.in1() != gate.in0() {
             ag2pc_free_if_dead(state, gate.in1(), gate_index, &mut freelist);
         }
     }
@@ -2171,7 +2208,7 @@ fn ag2pc_slot_capacity(state: &Ag2pcRunState, program: &Ag2pcProgram) -> usize {
         phys[out] = slot as u32;
 
         ag2pc_capacity_free_if_dead(state, &phys, gate.in0(), gate_index, &mut freelist);
-        if gate.typ != Ag2pcGateType::Inv && gate.in1() != gate.in0() {
+        if gate.typ() != Ag2pcGateType::Inv && gate.in1() != gate.in0() {
             ag2pc_capacity_free_if_dead(state, &phys, gate.in1(), gate_index, &mut freelist);
         }
     }
@@ -2229,7 +2266,7 @@ async fn ag2pc_garbler_path(
     let mut chunk_b = Vec::with_capacity(chunk_ands);
     let mut and_index = 0usize;
     for gate in &program.gates {
-        match gate.typ {
+        match gate.typ() {
             Ag2pcGateType::Xor => {
                 let lhs = state.wslot(gate.in0());
                 let rhs = state.wslot(gate.in1());
@@ -2322,7 +2359,7 @@ async fn ag2pc_evaluator_path(
     let mut chunk_pos = 0usize;
     let mut and_index = 0usize;
     for gate in &program.gates {
-        match gate.typ {
+        match gate.typ() {
             Ag2pcGateType::Xor => {
                 let lhs = state.wslot(gate.in0());
                 let rhs = state.wslot(gate.in1());
@@ -2424,7 +2461,7 @@ fn ag2pc_evaluator_and_gate(
 fn ag2pc_gamma_check_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
     let mut and_index = 0usize;
     for gate in &program.gates {
-        match gate.typ {
+        match gate.typ() {
             Ag2pcGateType::Xor => {
                 let lhs = state.wslot(gate.in0());
                 let rhs = state.wslot(gate.in1());
@@ -4484,6 +4521,11 @@ mod tests {
             let sigma = block_lsb(alice_sigma[i].mac) ^ block_lsb(bob_sigma[i].mac);
             assert_eq!(sigma, a & b, "sigma relation mismatch at {i}");
         }
+    }
+
+    #[test]
+    fn ag2pc_program_gate_stays_packed() {
+        assert_eq!(std::mem::size_of::<Ag2pcProgramGate>(), 12);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

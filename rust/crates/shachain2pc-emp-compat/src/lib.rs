@@ -2215,7 +2215,6 @@ async fn ag2pc_slot_mask_pass(
         }
     }
 
-    state.sigma = vec![AShareBundle::default(); state.num_ands.max(1)];
     match state.party {
         Role::Alice => state.label_slot.resize(state.num_slots, Block::zero()),
         Role::Bob => state.eval_slot.resize(state.num_slots, Block::zero()),

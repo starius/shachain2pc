@@ -1842,6 +1842,15 @@ impl Ag2pcProgram {
             ));
         }
         let num_inputs = n1 + n2;
+        if num_wire == num_inputs + circuit.gates.len()
+            && circuit
+                .gates
+                .iter()
+                .enumerate()
+                .all(|(i, gate)| gate.out >= 0 && gate.out as usize == num_inputs + i)
+        {
+            return Self::from_ordered_circuit(circuit, num_inputs, n3);
+        }
         // remap[old wire] -> new topological index as u32 (UNMAPPED = u32::MAX):
         // 4 bytes/wire instead of 16 for a Vec<Option<usize>> scratch.
         const UNMAPPED: u32 = u32::MAX;
@@ -1891,6 +1900,34 @@ impl Ag2pcProgram {
         Ok(Self {
             num_inputs,
             num_wires: num_inputs + gates.len(),
+            outputs,
+            gates,
+        })
+    }
+
+    fn from_ordered_circuit(circuit: &Circuit, num_inputs: usize, n3: usize) -> Result<Self> {
+        let mut gates = Vec::with_capacity(circuit.gates.len());
+        for (i, gate) in circuit.gates.iter().enumerate() {
+            let max_wire = num_inputs + i;
+            let typ = match gate.typ {
+                GateType::And => Ag2pcGateType::And,
+                GateType::Xor => Ag2pcGateType::Xor,
+                GateType::Inv => Ag2pcGateType::Inv,
+            };
+            let in0 = checked_wire("in0", gate.in0, max_wire)?;
+            let in1 = if typ == Ag2pcGateType::Inv {
+                0
+            } else {
+                checked_wire("in1", gate.in1, max_wire)?
+            };
+            gates.push(Ag2pcProgramGate::new(typ, in0 as u32, in1 as u32));
+        }
+        let num_wires = num_inputs + gates.len();
+        let output_start = num_wires - n3;
+        let outputs = (output_start..num_wires).map(|wire| wire as u32).collect();
+        Ok(Self {
+            num_inputs,
+            num_wires,
             outputs,
             gates,
         })

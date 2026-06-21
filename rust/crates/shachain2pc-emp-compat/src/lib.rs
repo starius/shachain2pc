@@ -438,10 +438,14 @@ fn aes_dm(key: &Prp, counter: u64, tweak: Block) -> Block {
     key.permute_one(pt).xor(pt)
 }
 
+// Scalar GF(2^128) helpers used by the soft gf_mul / gf_pack reference paths
+// (and their differential tests); the CLMUL/SIMD paths don't need them.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
 fn block_to_u128(block: Block) -> u128 {
     u128::from_le_bytes(block.into_bytes())
 }
 
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
 fn u128_to_block(value: u128) -> Block {
     Block::from_bytes(value.to_le_bytes())
 }
@@ -506,6 +510,7 @@ unsafe fn gf_mul_clmul(a: Block, b: Block) -> Block {
     Block::from_bytes(out)
 }
 
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
 fn xor_shifted_u128(dst: &mut [u64; 4], value: u128, shift: usize) {
     let lo = value as u64;
     let hi = (value >> 64) as u64;
@@ -523,14 +528,17 @@ fn xor_shifted_u128(dst: &mut [u64; 4], value: u128, shift: usize) {
     }
 }
 
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
 fn gf_bit(words: &[u64; 4], bit: usize) -> bool {
     ((words[bit / 64] >> (bit % 64)) & 1) != 0
 }
 
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
 fn gf_flip(words: &mut [u64; 4], bit: usize) {
     words[bit / 64] ^= 1u64 << (bit % 64);
 }
 
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
 fn gf_reduce(mut product: [u64; 4]) -> Block {
     for bit in (128..256).rev() {
         if gf_bit(&product, bit) {
@@ -553,13 +561,106 @@ fn gf_inner_product(a: &[Block], b: &[Block]) -> Block {
         .fold(Block::zero(), |acc, (lhs, rhs)| acc.xor(gf_mul(*lhs, *rhs)))
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
 fn gf_pack_128(data: &[Block]) -> Block {
+    // SAFETY: target_feature(pclmulqdq) (and sse2) guarantee the intrinsics.
+    unsafe { gf_pack_128_clmul(data) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+fn gf_pack_128(data: &[Block]) -> Block {
+    gf_pack_128_soft(data)
+}
+
+// Reference packing: sum_i data[i]*x^i, accumulated as a 256-bit value then
+// reduced once. Non-x86 fallback and the differential oracle for the CLMUL path
+// (tests::gf_pack_128_clmul_matches_soft).
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn gf_pack_128_soft(data: &[Block]) -> Block {
     assert_eq!(data.len(), 128);
     let mut product = [0u64; 4];
     for (shift, block) in data.iter().enumerate() {
         xor_shifted_u128(&mut product, block_to_u128(*block), shift);
     }
     gf_reduce(product)
+}
+
+// SIMD packing (mirrors emp's GaloisFieldPacking): split each block's shift i into
+// a bit part (0..7, done with constant-immediate _mm_slli/_srli_epi64) and a byte
+// part (BYTE_OFF, done once per 8-block group with constant-immediate
+// _mm_slli_si128), accumulate the 256-bit product in (lo, hi), then fold mod
+// x^128 + x^7 + x^2 + x + 1 (g = 0x87) with two clmul steps. Every shift amount
+// is a literal so it lowers to a constant-immediate SSE shift.
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+unsafe fn gf_pack_128_clmul(data: &[Block]) -> Block {
+    use core::arch::x86_64::*;
+    assert_eq!(data.len(), 128);
+    let ld = |i: usize| _mm_loadu_si128(data[i].as_bytes().as_ptr().cast());
+    let mut lo = _mm_setzero_si128();
+    let mut hi = _mm_setzero_si128();
+    // Fold one block at bit shift `base + $b` (b in 1..=7) into (clo, chi).
+    macro_rules! bit {
+        ($base:expr, $b:literal, $clo:ident, $chi:ident) => {{
+            let d = ld($base + $b);
+            let s = _mm_slli_epi64(d, $b);
+            let c = _mm_srli_epi64(d, 64 - $b);
+            $clo = _mm_xor_si128($clo, _mm_xor_si128(s, _mm_slli_si128(c, 8)));
+            $chi = _mm_xor_si128($chi, _mm_srli_si128(c, 8));
+        }};
+    }
+    // Accumulate the 8-block group at byte offset $boff, then shift it left by
+    // $boff bytes into (lo, hi).
+    macro_rules! pack_byte {
+        ($boff:literal) => {{
+            let base = $boff * 8;
+            let mut clo = ld(base);
+            let mut chi = _mm_setzero_si128();
+            bit!(base, 1, clo, chi);
+            bit!(base, 2, clo, chi);
+            bit!(base, 3, clo, chi);
+            bit!(base, 4, clo, chi);
+            bit!(base, 5, clo, chi);
+            bit!(base, 6, clo, chi);
+            bit!(base, 7, clo, chi);
+            if $boff == 0 {
+                lo = _mm_xor_si128(lo, clo);
+                hi = _mm_xor_si128(hi, chi);
+            } else {
+                lo = _mm_xor_si128(lo, _mm_slli_si128(clo, $boff));
+                hi = _mm_xor_si128(
+                    hi,
+                    _mm_xor_si128(_mm_srli_si128(clo, 16 - $boff), _mm_slli_si128(chi, $boff)),
+                );
+            }
+        }};
+    }
+    pack_byte!(0);
+    pack_byte!(1);
+    pack_byte!(2);
+    pack_byte!(3);
+    pack_byte!(4);
+    pack_byte!(5);
+    pack_byte!(6);
+    pack_byte!(7);
+    pack_byte!(8);
+    pack_byte!(9);
+    pack_byte!(10);
+    pack_byte!(11);
+    pack_byte!(12);
+    pack_byte!(13);
+    pack_byte!(14);
+    pack_byte!(15);
+    // Reduce the 256-bit product (lo | hi) mod the field polynomial.
+    let g = _mm_set_epi64x(0, 0x87);
+    let c0 = _mm_clmulepi64_si128(hi, g, 0x00);
+    let c1 = _mm_clmulepi64_si128(hi, g, 0x01);
+    let q_lo = _mm_xor_si128(c0, _mm_slli_si128(c1, 8));
+    let q_hi = _mm_srli_si128(c1, 8);
+    let e = _mm_clmulepi64_si128(q_hi, g, 0x00);
+    let res = _mm_xor_si128(_mm_xor_si128(lo, q_lo), e);
+    let mut out = [0u8; 16];
+    _mm_storeu_si128(out.as_mut_ptr().cast(), res);
+    Block::from_bytes(out)
 }
 
 pub fn sfvole_sender_butterfly(
@@ -3858,6 +3959,26 @@ mod tests {
             for &b in &[Block::zero(), one, ones, hi] {
                 assert_eq!(gf_mul(a, b), gf_mul_soft(a, b));
             }
+        }
+    }
+
+    #[test]
+    fn gf_pack_128_clmul_matches_soft() {
+        // gf_pack_128 (SIMD+CLMUL on x86) must equal the scalar reference.
+        let mut prg = Prg::new(Block::make(0x1234_5678, 0x9abc_def0), 0);
+        for _ in 0..200 {
+            let data = prg.random_block(128);
+            assert_eq!(gf_pack_128(&data), gf_pack_128_soft(&data));
+        }
+        let zero = vec![Block::zero(); 128];
+        assert_eq!(gf_pack_128(&zero), gf_pack_128_soft(&zero));
+        let ones = vec![Block::make(u64::MAX, u64::MAX); 128];
+        assert_eq!(gf_pack_128(&ones), gf_pack_128_soft(&ones));
+        // One block set at a time exercises each shift position i = 0..127.
+        for i in 0..128 {
+            let mut data = vec![Block::zero(); 128];
+            data[i] = Block::make(u64::MAX, u64::MAX);
+            assert_eq!(gf_pack_128(&data), gf_pack_128_soft(&data));
         }
     }
 

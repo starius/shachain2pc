@@ -695,17 +695,24 @@ pub fn sfvole_sender_butterfly(
         key.permute_block(&mut r);
         for (rx, inp) in r.iter_mut().zip(&inputs) {
             *rx = rx.xor(*inp);
-            u[j] = u[j].xor(*rx);
         }
-        for plane in 0..k {
+        // Recursive halving butterfly: v_b = XOR of r[x] with bit b set, for all
+        // b, in O(q) (vs O(k*q) marginal sums) and branchlessly. Each round folds
+        // r[y] = r[2y] ^ r[2y+1] in place; after k rounds r[0] = XOR of all = u.
+        let mut n = q;
+        for b in 0..k {
+            let half = n >> 1;
             let mut acc = Block::zero();
-            for (x, value) in r.iter().enumerate() {
-                if ((x >> plane) & 1) != 0 {
-                    acc = acc.xor(*value);
-                }
+            for y in 0..half {
+                let lo = r[2 * y];
+                let hi = r[2 * y + 1];
+                acc = acc.xor(hi);
+                r[y] = lo.xor(hi);
             }
-            v[plane * bs + j] = acc;
+            v[b * bs + j] = acc;
+            n = half;
         }
+        u[j] = r[0];
     }
     (u, v)
 }
@@ -736,14 +743,21 @@ pub fn sfvole_receiver_butterfly(
         for (rx, inp) in r.iter_mut().zip(&inputs) {
             *rx = rx.xor(*inp);
         }
-        for plane in 0..k {
+        // Same recursive halving butterfly as the sender (over the y = alpha^x
+        // permuted r), computing w_b for all b in O(q), branchlessly. r[0] folds
+        // to the (receiver-discarded) u byproduct.
+        let mut n = q;
+        for b in 0..k {
+            let half = n >> 1;
             let mut acc = Block::zero();
-            for (y, value) in r.iter().enumerate() {
-                if ((y >> plane) & 1) != 0 {
-                    acc = acc.xor(*value);
-                }
+            for y in 0..half {
+                let lo = r[2 * y];
+                let hi = r[2 * y + 1];
+                acc = acc.xor(hi);
+                r[y] = lo.xor(hi);
             }
-            w[plane * bs + j] = acc;
+            w[b * bs + j] = acc;
+            n = half;
         }
     }
     w

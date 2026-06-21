@@ -1883,8 +1883,10 @@ struct Ag2pcRunState {
     num_ands: usize,
     num_wires: usize,
     num_slots: usize,
-    phys: Vec<usize>,
-    last_use: Vec<isize>,
+    // Per-wire metadata as u32/i32 (circuits have < 2^32 wires/gates): half the
+    // size of usize/isize, and these are num_wires-long.
+    phys: Vec<u32>,
+    last_use: Vec<i32>,
     persist: Vec<bool>,
     wire_slot: Vec<AShareBundle>,
     mask_input: Vec<u8>,
@@ -1924,7 +1926,7 @@ impl Ag2pcRunState {
     }
 
     fn slot(&self, wire: usize) -> usize {
-        self.phys[wire]
+        self.phys[wire] as usize
     }
 
     fn wslot(&self, wire: usize) -> AShareBundle {
@@ -2059,9 +2061,9 @@ fn ag2pc_liveness_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
     }
     for (gate_index, gate) in program.gates.iter().enumerate() {
         state.persist[gate.out()] = gate.typ == Ag2pcGateType::And;
-        state.last_use[gate.in0()] = gate_index as isize;
+        state.last_use[gate.in0()] = gate_index as i32;
         if gate.typ != Ag2pcGateType::Inv {
-            state.last_use[gate.in1()] = gate_index as isize;
+            state.last_use[gate.in1()] = gate_index as i32;
         }
         if gate.typ == Ag2pcGateType::And {
             state.num_ands += 1;
@@ -2078,9 +2080,9 @@ async fn ag2pc_slot_mask_pass(
     triple_pool: &mut Ag2pcTriplePool,
     streams: &mut Ag2pcStreams,
 ) -> Result<()> {
-    state.phys = vec![usize::MAX; program.num_wires];
+    state.phys = vec![u32::MAX; program.num_wires];
     for i in 0..state.num_inputs {
-        state.phys[i] = i;
+        state.phys[i] = i as u32;
     }
     state.rep_a.clear();
     state.rep_b.clear();
@@ -2142,7 +2144,7 @@ fn ag2pc_alloc_slot(state: &mut Ag2pcRunState, wire: usize, freelist: &mut Vec<u
     } else {
         ag2pc_push_slot(state)
     };
-    state.phys[wire] = slot;
+    state.phys[wire] = slot as u32;
     slot
 }
 
@@ -2160,7 +2162,7 @@ fn ag2pc_free_if_dead(
     gate_index: usize,
     freelist: &mut Vec<usize>,
 ) {
-    if !state.persist[wire] && state.last_use[wire] == gate_index as isize {
+    if !state.persist[wire] && state.last_use[wire] == gate_index as i32 {
         freelist.push(state.slot(wire));
     }
 }

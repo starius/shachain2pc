@@ -1018,10 +1018,11 @@ fn chunk_program(
     first: bool,
     tamper: bool,
 ) -> Result<Ag2pcProgram, PartyError> {
-    let mut circuit = build_chunk_circuit(sha, bits, first)?;
-    if tamper {
-        tamper_first_flip(&mut circuit);
+    if !tamper {
+        return Ag2pcProgram::chunk_from_sha(sha, bits, first).map_err(PartyError::from);
     }
+    let mut circuit = build_chunk_circuit(sha, bits, first)?;
+    tamper_first_flip(&mut circuit);
     check_chunk_circuit(&circuit)?;
     Ag2pcProgram::from_circuit(&circuit).map_err(PartyError::from)
 }
@@ -1032,10 +1033,11 @@ fn build_tile_program(
     tile_height: usize,
     tamper: bool,
 ) -> Result<Ag2pcProgram, PartyError> {
-    let mut circuit = build_tile_circuit(sha, bit_offset, tile_height)?;
-    if tamper {
-        tamper_first_flip(&mut circuit);
+    if !tamper {
+        return Ag2pcProgram::tile_from_sha(sha, bit_offset, tile_height).map_err(PartyError::from);
     }
+    let mut circuit = build_tile_circuit(sha, bit_offset, tile_height)?;
+    tamper_first_flip(&mut circuit);
     check_tile_circuit(&circuit, tile_height)?;
     Ag2pcProgram::from_circuit(&circuit).map_err(PartyError::from)
 }

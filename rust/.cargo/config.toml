@@ -1,2 +1,8 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+# Enable the unstable `portable_simd` feature (used by the emp-compat bit-matrix
+# transpose) on the pinned stable toolchain, instead of switching the whole
+# project to a nondeterministic nightly. Same std::simd codegen; one line.
+[env]
+RUSTC_BOOTSTRAP = "1"

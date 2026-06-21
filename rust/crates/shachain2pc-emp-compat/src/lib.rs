@@ -1,3 +1,8 @@
+// std::simd (portable SIMD) powers the bit-matrix transpose; it is unstable, so
+// the crate enables it via the portable_simd feature gate. RUSTC_BOOTSTRAP=1 (set
+// in rust/.cargo/config.toml) unlocks it on the pinned stable toolchain.
+#![feature(portable_simd)]
+
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use openssl::bn::{BigNum, BigNumContext, BigNumRef};
@@ -3362,54 +3367,122 @@ fn random_block() -> Result<Block> {
     Ok(Block::from_bytes(bytes))
 }
 
-#[cfg(target_arch = "x86_64")]
 fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
-    // SAFETY: loadu/movemask/slli_epi64 are SSE2, baseline on x86_64.
-    unsafe { transpose_128_rows_simd(rows, row_bytes, output_len) }
+    transpose_128_rows_simd(rows, row_bytes, output_len)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
-    transpose_128_rows_soft(rows, row_bytes, output_len)
+// Transpose a 16x16 byte tile held as 16 rows of u8x16, via 4 interleave stages
+// (epi8/16/32/64). On 128-bit vectors std::simd's interleave is a single-lane
+// zip, i.e. exactly _mm_unpacklo/_mm_unpackhi, so this mirrors emp's SSE tile
+// transpose; the transmutes are same-size 128-bit reinterprets to change the
+// interleave granularity.
+#[inline]
+fn transpose_16x16_bytes(m: [core::simd::u8x16; 16]) -> [core::simd::u8x16; 16] {
+    use core::simd::{u16x8, u32x4, u64x2, u8x16};
+    let mut t = [u8x16::splat(0); 16];
+    for i in 0..8 {
+        let (lo, hi) = m[2 * i].interleave(m[2 * i + 1]);
+        t[2 * i] = lo;
+        t[2 * i + 1] = hi;
+    }
+    // SAFETY: u8x16/u16x8/u32x4/u64x2 are all 128-bit repr(simd); the [_; 16]
+    // arrays have identical size and alignment, so the bitcasts are sound.
+    let t16: [u16x8; 16] = unsafe { core::mem::transmute(t) };
+    let mut u = [u16x8::splat(0); 16];
+    for i in 0..4 {
+        let (lo, hi) = t16[4 * i].interleave(t16[4 * i + 2]);
+        u[4 * i] = lo;
+        u[4 * i + 1] = hi;
+        let (lo, hi) = t16[4 * i + 1].interleave(t16[4 * i + 3]);
+        u[4 * i + 2] = lo;
+        u[4 * i + 3] = hi;
+    }
+    let u32v: [u32x4; 16] = unsafe { core::mem::transmute(u) };
+    let mut v = [u32x4::splat(0); 16];
+    for i in 0..2 {
+        for k in 0..4 {
+            let (lo, hi) = u32v[8 * i + k].interleave(u32v[8 * i + k + 4]);
+            v[8 * i + 2 * k] = lo;
+            v[8 * i + 2 * k + 1] = hi;
+        }
+    }
+    let v64: [u64x2; 16] = unsafe { core::mem::transmute(v) };
+    let mut r = [u64x2::splat(0); 16];
+    for k in 0..8 {
+        let (lo, hi) = v64[k].interleave(v64[k + 8]);
+        r[2 * k] = lo;
+        r[2 * k + 1] = hi;
+    }
+    unsafe { core::mem::transmute(r) }
 }
 
-// SSE2 bit-matrix transpose of a 128-row matrix. For each input byte-column it
-// loads the 16 rows of a group into a vector, then peels off one output row per
-// bit: movemask extracts the MSB of all 16 bytes as a 16-bit column, and a
-// per-lane left shift brings the next bit to the MSB (the cross-byte/lane carry
-// only touches LSBs, which movemask ignores). Mirrors emp's sse_trans. Produces
-// the same OUT[col].bit(row) = (rows[row*rb + col/8] >> (col%8)) & 1 mapping as
-// transpose_128_rows_soft / the bit reference, gated by
-// tests::transpose_128_rows_matches_bit_reference.
-#[cfg(target_arch = "x86_64")]
-unsafe fn transpose_128_rows_simd(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
-    use core::arch::x86_64::*;
+// Emit the 8 output rows for one source byte-column of a 16-row group: peel off
+// one bit per movemask (simd_ge(0x80).to_bitmask()), MSB-first, advancing with a
+// per-byte left shift. `col` holds that column's byte for the 16 rows of the group.
+#[inline]
+fn transpose_emit_column(
+    out: &mut [Block],
+    mut col: core::simd::u8x16,
+    source_byte: usize,
+    row_group: usize,
+) {
+    use core::simd::cmp::SimdPartialOrd;
+    use core::simd::u8x16;
+    let msb = u8x16::splat(0x80);
+    let one = u8x16::splat(1);
+    for bit in (0..8).rev() {
+        let mask = col.simd_ge(msb).to_bitmask() as u16;
+        let ob = out[source_byte * 8 + bit].as_mut_bytes();
+        ob[row_group * 2] = mask as u8;
+        ob[row_group * 2 + 1] = (mask >> 8) as u8;
+        col <<= one;
+    }
+}
+
+// Portable-SIMD bit-matrix transpose of a 128-row matrix (std::simd, so the same
+// code targets AVX2 on x86_64 and NEON on aarch64). It loads 16 contiguous bytes
+// per row, transposes each 16x16 byte tile in registers (transpose_16x16_bytes),
+// then peels off the bits with movemask -- avoiding the strided per-byte gather of
+// the naive form. Produces the same OUT[col].bit(row) =
+// (rows[row*rb + col/8] >> (col%8)) & 1 mapping as the scalar reference
+// (tests::transpose_128_rows_matches_bit_reference).
+fn transpose_128_rows_simd(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    use core::simd::u8x16;
     const ROWS: usize = 128;
+    const ROW_GROUPS: usize = ROWS / 16;
     debug_assert_eq!(output_len, row_bytes * 8);
     debug_assert_eq!(rows.len(), ROWS * row_bytes);
     let mut out = vec![Block::zero(); output_len];
+    let col_tiles = row_bytes / 16;
+    for rg in 0..ROW_GROUPS {
+        for cg in 0..col_tiles {
+            let mut m = [u8x16::splat(0); 16];
+            for (r, slot) in m.iter_mut().enumerate() {
+                let off = (rg * 16 + r) * row_bytes + cg * 16;
+                *slot = u8x16::from_slice(&rows[off..off + 16]);
+            }
+            let cols = transpose_16x16_bytes(m);
+            for (c, col) in cols.into_iter().enumerate() {
+                transpose_emit_column(&mut out, col, cg * 16 + c, rg);
+            }
+        }
+    }
+    // Tail: any columns past the last full 16-byte tile (only hit when row_bytes
+    // is not a multiple of 16, e.g. the row_bytes=1 unit test). Gather per column.
     let mut lane = [0u8; 16];
-    for source_byte in 0..row_bytes {
-        for group in 0..(ROWS / 16) {
-            let base = group * 16;
+    for source_byte in (col_tiles * 16)..row_bytes {
+        for rg in 0..ROW_GROUPS {
+            let base = rg * 16;
             for (i, slot) in lane.iter_mut().enumerate() {
                 *slot = rows[(base + i) * row_bytes + source_byte];
             }
-            let mut v = _mm_loadu_si128(lane.as_ptr().cast());
-            // bit runs 7,6,..,0; movemask reads the MSB (== current bit) of each byte.
-            for bit in (0..8).rev() {
-                let mask = _mm_movemask_epi8(v) as u32;
-                let ob = out[source_byte * 8 + bit].as_mut_bytes();
-                ob[group * 2] = (mask & 0xff) as u8; // rows base..=base+7
-                ob[group * 2 + 1] = ((mask >> 8) & 0xff) as u8; // rows base+8..=base+15
-                v = _mm_slli_epi64(v, 1);
-            }
+            transpose_emit_column(&mut out, u8x16::from_array(lane), source_byte, rg);
         }
     }
     out
 }
 
-#[cfg(any(test, not(target_arch = "x86_64")))]
+#[cfg(test)]
 fn transpose_128_rows_soft(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
     debug_assert_eq!(output_len, row_bytes * 8);
     let mut out = vec![Block::zero(); output_len];
@@ -3435,7 +3508,7 @@ fn transpose_128_rows_soft(rows: &[u8], row_bytes: usize, output_len: usize) -> 
     out
 }
 
-#[cfg(any(test, not(target_arch = "x86_64")))]
+#[cfg(test)]
 fn transpose_8x8(mut x: u64) -> u64 {
     let mut t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
     x ^= t ^ (t << 7);
@@ -3485,8 +3558,8 @@ mod tests {
                 *byte = ((i * 37 + i / 7 + 0x5a) & 0xff) as u8;
             }
             let reference = transpose_128_rows_bit_reference(&rows, row_bytes, output_len);
-            // transpose_128_rows dispatches to the SSE2 path on x86_64; compare it
-            // and the scalar fallback against the independent bit reference.
+            // transpose_128_rows is the portable-SIMD path; compare it and the
+            // scalar reference against the independent bit reference.
             assert_eq!(transpose_128_rows(&rows, row_bytes, output_len), reference);
             assert_eq!(
                 transpose_128_rows_soft(&rows, row_bytes, output_len),

@@ -2016,10 +2016,12 @@ impl Ag2pcSession {
         let mut state = Ag2pcRunState::new(self.party(), self.protocol.delta(), inputs);
         ag2pc_liveness_pass(&mut state, program);
         ag2pc_slot_mask_pass(&mut state, program, &mut self.protocol.triple_pool, streams).await?;
+        let rep_a = std::mem::take(&mut state.rep_a);
+        let rep_b = std::mem::take(&mut state.rep_b);
         state.sigma = self
             .protocol
             .triple_pool
-            .compute_inplace(streams, &state.rep_a, &state.rep_b)
+            .compute_inplace_owned(streams, rep_a, rep_b)
             .await?;
         state.m1_t = vec![Block::zero(); state.num_ands.max(1)];
         state.lambda_and = vec![0; state.num_ands.max(1)];
@@ -2213,7 +2215,7 @@ async fn ag2pc_garbler_path(
     if state.num_ands > 0 {
         state.lambda_and = ag2pc_recv_bool_vector(&mut streams.main, state.num_ands).await?;
         ag2pc_gamma_check_pass(state, program);
-        let digest = hash_once(&blocks_to_bytes(&state.m1_t));
+        let digest = hash_once(Block::slice_as_bytes(&state.m1_t));
         streams.main.send_data(&digest).await?;
         streams.main.flush().await?;
     }
@@ -2311,7 +2313,7 @@ async fn ag2pc_evaluator_path(
     }
     if state.num_ands > 0 {
         ag2pc_send_bool_vector(&mut streams.main, &state.lambda_and).await?;
-        let local = hash_once(&blocks_to_bytes(&state.m1_t));
+        let local = hash_once(Block::slice_as_bytes(&state.m1_t));
         let peer: [u8; HASH_DIGEST_BYTES] = streams
             .main
             .recv_data(HASH_DIGEST_BYTES)
@@ -2823,6 +2825,16 @@ impl Ag2pcTriplePool {
         rep_a: &[AShareBundle],
         rep_b: &[AShareBundle],
     ) -> Result<Vec<AShareBundle>> {
+        self.compute_inplace_owned(streams, rep_a.to_vec(), rep_b.to_vec())
+            .await
+    }
+
+    pub async fn compute_inplace_owned(
+        &mut self,
+        streams: &mut Ag2pcStreams,
+        mut rep_a: Vec<AShareBundle>,
+        mut rep_b: Vec<AShareBundle>,
+    ) -> Result<Vec<AShareBundle>> {
         if rep_a.len() != rep_b.len() {
             return Err(CompatError::BadAg2pcInputShape);
         }
@@ -2847,15 +2859,27 @@ impl Ag2pcTriplePool {
 
         let mut acc_mac = vec![Block::zero(); 3 * l];
         let mut acc_key = vec![Block::zero(); 3 * l];
+        let mut rep_a_lsb = Vec::with_capacity(l);
+        let mut rep_b_lsb = Vec::with_capacity(l);
         for i in 0..l {
             acc_mac[i] = rep_a[i].mac;
             acc_key[i] = rep_a[i].key;
             acc_mac[l + i] = rep_b[i].mac;
             acc_key[l + i] = rep_b[i].key;
+            rep_a_lsb.push(block_lsb(rep_a[i].mac));
+            rep_b_lsb.push(block_lsb(rep_b[i].mac));
         }
-        let (r_mac, r_key) = self.gen_cot_shares(streams, l).await?;
+        rep_a.zeroize();
+        rep_b.zeroize();
+        drop(rep_a);
+        drop(rep_b);
+        let (mut r_mac, mut r_key) = self.gen_cot_shares(streams, l).await?;
         acc_mac[2 * l..3 * l].copy_from_slice(&r_mac);
         acc_key[2 * l..3 * l].copy_from_slice(&r_key);
+        r_mac.zeroize();
+        r_key.zeroize();
+        drop(r_mac);
+        drop(r_key);
         self.leaky_and_halfgate(streams, &mut acc_mac, &mut acc_key, l, &mut hashes)
             .await?;
         self.layered_bucket_into_acc(streams, &mut acc_mac, &mut acc_key, bucket, l, &mut hashes)
@@ -2867,8 +2891,8 @@ impl Ag2pcTriplePool {
         let mut xb_me = vec![0u8; l];
         let mut yb_me = vec![0u8; l];
         for i in 0..l {
-            xb_me[i] = block_lsb(rep_a[i].mac) ^ block_lsb(acc_mac[i]);
-            yb_me[i] = block_lsb(rep_b[i].mac) ^ block_lsb(acc_mac[l + i]);
+            xb_me[i] = rep_a_lsb[i] ^ block_lsb(acc_mac[i]);
+            yb_me[i] = rep_b_lsb[i] ^ block_lsb(acc_mac[l + i]);
         }
         let (xb_peer, yb_peer) = self
             .exchange_two_bool_vectors(streams, &xb_me, &yb_me, l)
@@ -2967,7 +2991,9 @@ impl Ag2pcTriplePool {
                 g_blocks.push(pad[2 * j].xor(pad[2 * j + 1]).xor(c));
             }
         }
-        let w_blocks = self.exchange_blocks(streams, &g_blocks, l).await?;
+        let mut w_blocks = self.exchange_blocks(streams, &g_blocks, l).await?;
+        g_blocks.zeroize();
+        drop(g_blocks);
 
         let mut sout = vec![Block::zero(); l];
         for k0 in (0..l).step_by(8) {
@@ -2998,6 +3024,9 @@ impl Ag2pcTriplePool {
             }
         }
 
+        w_blocks.zeroize();
+        drop(w_blocks);
+
         let s_me: Vec<u8> = sout.iter().map(|block| block_lsb1(*block)).collect();
         let s_peer = self.exchange_bool_vector(streams, &s_me, l).await?;
         let dxor = self.delta.xor(bit0_mask());
@@ -3011,7 +3040,7 @@ impl Ag2pcTriplePool {
             }
             sout[k] = sout[k].xor(self.delta.and(mask));
         }
-        hashes.feq.update(blocks_to_bytes(&sout));
+        hashes.feq.update(Block::slice_as_bytes(&sout));
         Ok(())
     }
 

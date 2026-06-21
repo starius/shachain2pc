@@ -278,11 +278,6 @@ async fn run_derivation_batch(
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
     let mut timing = PhaseTiming::new(role, first_index);
     let sha = sha256_compress_gadget()?;
-    let mut programs = Vec::with_capacity(indices.len());
-    for &index in indices {
-        let circuit = build_circuit_for_index(index, &sha)?;
-        programs.push(Ag2pcProgram::from_circuit(&circuit)?);
-    }
     let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
     let digest = batch_digest(&index_values, &sha);
     timing.mark("build_batch_circuits");
@@ -296,7 +291,9 @@ async fn run_derivation_batch(
     let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
     timing.mark("input_auth");
     let mut authenticated = Vec::with_capacity(indices.len());
-    for (i, program) in programs.into_iter().enumerate() {
+    for (i, &index) in indices.iter().enumerate() {
+        let circuit = build_circuit_for_index(index, &sha)?;
+        let program = Ag2pcProgram::from_circuit(&circuit)?;
         let mut out = session
             .run_program(&mut streams, &program, &seed_inputs)
             .await?;
@@ -337,20 +334,6 @@ async fn run_derivation_tree(
     }
     let tamper_branch = tamper_step_from_env();
 
-    let mut trunk_programs = Vec::with_capacity(trunk_groups.len());
-    let mut branch_programs = Vec::with_capacity(indices.len());
-    for (chunk, bits) in trunk_groups.iter().enumerate() {
-        trunk_programs.push(chunk_program(&sha, bits, chunk == 0, false)?);
-    }
-    for (branch, &index) in indices.iter().enumerate() {
-        let bits = set_bits_desc(index.get() & low_mask);
-        branch_programs.push(chunk_program(
-            &sha,
-            &bits,
-            false,
-            branch as i64 == tamper_branch,
-        )?);
-    }
     let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
     let digest = tree_digest(&index_values, trunk_chunk_blocks, &sha);
     timing.mark("build_tree_circuits");
@@ -363,12 +346,15 @@ async fn run_derivation_tree(
 
     let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
     timing.mark("input_auth");
+    let first_trunk_program = chunk_program(&sha, &trunk_groups[0], true, false)?;
     let mut trunk = session
-        .run_program(&mut streams, &trunk_programs[0], &seed_inputs)
+        .run_program(&mut streams, &first_trunk_program, &seed_inputs)
         .await?;
+    drop(first_trunk_program);
     timing.mark("tree_trunk_0");
 
-    for (chunk, program) in trunk_programs.into_iter().enumerate().skip(1) {
+    for (chunk, bits) in trunk_groups.iter().enumerate().skip(1) {
+        let program = chunk_program(&sha, bits, false, false)?;
         trunk = session.run_program(&mut streams, &program, &trunk).await?;
         timing.mark(match chunk {
             1 => "tree_trunk_1",
@@ -379,7 +365,9 @@ async fn run_derivation_tree(
     }
 
     let mut authenticated = Vec::with_capacity(indices.len());
-    for (i, program) in branch_programs.into_iter().enumerate() {
+    for (i, &index) in indices.iter().enumerate() {
+        let bits = set_bits_desc(index.get() & low_mask);
+        let program = chunk_program(&sha, &bits, false, i as i64 == tamper_branch)?;
         let mut out = session.run_program(&mut streams, &program, &trunk).await?;
         out.strip_labels_for_reveal();
         authenticated.push((indices[i], out));
@@ -425,11 +413,6 @@ async fn run_derivation_cache(
     }
     let mut tamper = TamperCursor::from_env();
 
-    let mut trunk_programs = Vec::with_capacity(trunk_groups.len());
-    for (chunk, bits) in trunk_groups.iter().enumerate() {
-        trunk_programs.push(chunk_program(&sha, bits, chunk == 0, false)?);
-    }
-
     let depth = if split < 0 {
         0usize
     } else {
@@ -468,12 +451,15 @@ async fn run_derivation_cache(
 
     let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
     timing.mark("input_auth");
+    let first_trunk_program = chunk_program(&sha, &trunk_groups[0], true, false)?;
     let mut trunk = session
-        .run_program(&mut streams, &trunk_programs[0], &seed_inputs)
+        .run_program(&mut streams, &first_trunk_program, &seed_inputs)
         .await?;
+    drop(first_trunk_program);
     timing.mark("cache_trunk_0");
 
-    for (chunk, program) in trunk_programs.into_iter().enumerate().skip(1) {
+    for (chunk, bits) in trunk_groups.iter().enumerate().skip(1) {
+        let program = chunk_program(&sha, bits, false, false)?;
         trunk = session.run_program(&mut streams, &program, &trunk).await?;
         timing.mark(match chunk {
             1 => "cache_trunk_1",
@@ -783,15 +769,6 @@ async fn run_derivation_chunked(
     let sha = sha256_compress_gadget()?;
     let groups = split_chain_bits(index.get(), blocks_per_chunk)?;
     let tamper_chunk = tamper_step_from_env();
-    let mut programs = Vec::with_capacity(groups.len());
-    for (chunk, bits) in groups.iter().enumerate() {
-        programs.push(chunk_program(
-            &sha,
-            bits,
-            chunk == 0,
-            chunk as i64 == tamper_chunk,
-        )?);
-    }
     let digest = chunk_spec_digest(index.get(), blocks_per_chunk as i32, &sha);
     timing.mark("build_chunk_circuits");
 
@@ -803,12 +780,15 @@ async fn run_derivation_chunked(
 
     let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
     timing.mark("input_auth");
+    let first_program = chunk_program(&sha, &groups[0], true, tamper_chunk == 0)?;
     let mut carried = session
-        .run_program(&mut streams, &programs[0], &seed_inputs)
+        .run_program(&mut streams, &first_program, &seed_inputs)
         .await?;
+    drop(first_program);
     timing.mark("chunk_0");
 
-    for (chunk, program) in programs.into_iter().enumerate().skip(1) {
+    for (chunk, bits) in groups.iter().enumerate().skip(1) {
+        let program = chunk_program(&sha, bits, false, chunk as i64 == tamper_chunk)?;
         carried = session
             .run_program(&mut streams, &program, &carried)
             .await?;

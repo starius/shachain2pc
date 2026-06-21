@@ -2082,14 +2082,21 @@ async fn ag2pc_slot_mask_pass(
     triple_pool: &mut Ag2pcTriplePool,
     streams: &mut Ag2pcStreams,
 ) -> Result<()> {
+    let slot_capacity = ag2pc_slot_capacity(state, program);
+    state
+        .wire_slot
+        .reserve_exact(slot_capacity.saturating_sub(state.wire_slot.len()));
+    state
+        .mask_input
+        .reserve_exact(slot_capacity.saturating_sub(state.mask_input.len()));
     state.phys = vec![u32::MAX; program.num_wires];
     for i in 0..state.num_inputs {
         state.phys[i] = i as u32;
     }
     state.rep_a.clear();
     state.rep_b.clear();
-    state.rep_a.reserve(state.num_ands);
-    state.rep_b.reserve(state.num_ands);
+    state.rep_a.reserve_exact(state.num_ands);
+    state.rep_b.reserve_exact(state.num_ands);
 
     let mut freelist = Vec::new();
     let mut lg_buf = Vec::new();
@@ -2140,6 +2147,49 @@ async fn ag2pc_slot_mask_pass(
     Ok(())
 }
 
+fn ag2pc_slot_capacity(state: &Ag2pcRunState, program: &Ag2pcProgram) -> usize {
+    let mut phys = vec![u32::MAX; program.num_wires];
+    for (wire, slot) in phys.iter_mut().take(state.num_inputs).enumerate() {
+        *slot = wire as u32;
+    }
+
+    let mut num_slots = state.num_inputs;
+    let mut freelist = Vec::new();
+    for (gate_index, gate) in program.gates.iter().enumerate() {
+        let out = gate.out();
+        let slot = if !state.persist[out] {
+            freelist.pop().unwrap_or_else(|| {
+                let slot = num_slots;
+                num_slots += 1;
+                slot
+            })
+        } else {
+            let slot = num_slots;
+            num_slots += 1;
+            slot
+        };
+        phys[out] = slot as u32;
+
+        ag2pc_capacity_free_if_dead(state, &phys, gate.in0(), gate_index, &mut freelist);
+        if gate.typ != Ag2pcGateType::Inv && gate.in1() != gate.in0() {
+            ag2pc_capacity_free_if_dead(state, &phys, gate.in1(), gate_index, &mut freelist);
+        }
+    }
+    num_slots
+}
+
+fn ag2pc_capacity_free_if_dead(
+    state: &Ag2pcRunState,
+    phys: &[u32],
+    wire: usize,
+    gate_index: usize,
+    freelist: &mut Vec<usize>,
+) {
+    if !state.persist[wire] && state.last_use[wire] == gate_index as i32 {
+        freelist.push(phys[wire] as usize);
+    }
+}
+
 fn ag2pc_alloc_slot(state: &mut Ag2pcRunState, wire: usize, freelist: &mut Vec<usize>) -> usize {
     let slot = if !state.persist[wire] {
         freelist.pop().unwrap_or_else(|| ag2pc_push_slot(state))
@@ -2174,8 +2224,9 @@ async fn ag2pc_garbler_path(
     program: &Ag2pcProgram,
     streams: &mut Ag2pcStreams,
 ) -> Result<()> {
-    let mut chunk_g = Vec::new();
-    let mut chunk_b = Vec::new();
+    let chunk_ands = state.num_ands.min(AG2PC_GARBLE_CHUNK_ANDS);
+    let mut chunk_g = Vec::with_capacity(2 * chunk_ands);
+    let mut chunk_b = Vec::with_capacity(chunk_ands);
     let mut and_index = 0usize;
     for gate in &program.gates {
         match gate.typ {
@@ -2265,8 +2316,9 @@ async fn ag2pc_evaluator_path(
     program: &Ag2pcProgram,
     streams: &mut Ag2pcStreams,
 ) -> Result<()> {
-    let mut chunk_g = Vec::new();
-    let mut chunk_b = Vec::new();
+    let chunk_ands = state.num_ands.min(AG2PC_GARBLE_CHUNK_ANDS);
+    let mut chunk_g = Vec::with_capacity(2 * chunk_ands);
+    let mut chunk_b = Vec::with_capacity(chunk_ands);
     let mut chunk_pos = 0usize;
     let mut and_index = 0usize;
     for gate in &program.gates {

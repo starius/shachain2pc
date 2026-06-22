@@ -201,12 +201,14 @@ struct JobRecord {
     kind: String,
     state: String,
     planned_checked_units: u64,
+    worker_slot: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PeerFrontierConfig {
     channel_enabled: bool,
     precompute: u64,
+    workers: u32,
     ssp_target: u32,
     delta_lifetime_checked_units_cap: u64,
 }
@@ -593,6 +595,7 @@ impl PeerService for PeerApi {
                 precompute: 0,
                 ssp_target: 0,
                 delta_lifetime_checked_units_cap: 0,
+                workers: inner.cfg.workers,
             }));
         };
         let nodes = channel
@@ -611,6 +614,7 @@ impl PeerService for PeerApi {
             precompute: channel.precompute_target,
             ssp_target: channel.ssp_target,
             delta_lifetime_checked_units_cap: channel.delta_lifetime_checked_units_cap,
+            workers: inner.cfg.workers,
         }))
     }
 }
@@ -723,7 +727,10 @@ impl DaemonState {
                 .next_missing_frontier(channel_index, effective_precompute)
                 .await?
             {
-                let _ = self.precompute_path(channel_index, target).await;
+                let state = self.clone();
+                tokio::spawn(async move {
+                    let _ = state.precompute_path(channel_index, target).await;
+                });
             }
         }
         Ok(())
@@ -732,6 +739,9 @@ impl DaemonState {
     async fn scheduler_candidates(&self) -> Vec<u64> {
         let inner = self.inner.lock().await;
         if inner.cfg.workers == 0 || inner.cfg.precompute == 0 {
+            return Vec::new();
+        }
+        if inner.active_jobs.len() >= inner.cfg.workers as usize {
             return Vec::new();
         }
         inner
@@ -824,7 +834,22 @@ impl DaemonState {
         target_index: u64,
     ) -> Result<pb::PrecomputeResponse> {
         let index = Index48::new(target_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
-        let job = match self.begin_precompute_job(channel_index, index).await? {
+        let peer = match self.peer_frontier(channel_index).await {
+            Ok(Some(peer)) => {
+                if !peer.channel_enabled {
+                    return Err(DaemonError::Refused(
+                        "peer has not enabled this channel".to_owned(),
+                    ));
+                }
+                Some(peer)
+            }
+            Ok(None) => None,
+            Err(e) => return Err(e),
+        };
+        let job = match self
+            .begin_precompute_job(channel_index, index, peer)
+            .await?
+        {
             PrecomputeStart::AlreadyStored => {
                 return Ok(pb::PrecomputeResponse {
                     channel_index,
@@ -835,24 +860,11 @@ impl DaemonState {
             }
             PrecomputeStart::Run(job) => job,
         };
-        match self.peer_frontier(channel_index).await {
-            Ok(Some(peer)) => {
-                if !peer.channel_enabled {
-                    self.finish_job(&job.job_id, true).await;
-                    return Err(DaemonError::Refused(
-                        "peer has not enabled this channel".to_owned(),
-                    ));
-                }
-                if let Err(e) = self
-                    .validate_peer_security_params(channel_index, peer)
-                    .await
-                {
-                    self.finish_job(&job.job_id, true).await;
-                    return Err(e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
+        if let Some(peer) = peer {
+            if let Err(e) = self
+                .validate_peer_security_params(channel_index, peer)
+                .await
+            {
                 self.finish_job(&job.job_id, true).await;
                 return Err(e);
             }
@@ -1023,6 +1035,7 @@ impl DaemonState {
         &self,
         channel_index: u64,
         index: Index48,
+        peer: Option<PeerFrontierConfig>,
     ) -> Result<PrecomputeStart> {
         let planned_checked_units = set_bits_desc(index.get()).len() as u64;
         let mut inner = self.inner.lock().await;
@@ -1043,11 +1056,34 @@ impl DaemonState {
         }) {
             return Ok(PrecomputeStart::AlreadyStored);
         }
-        if !inner.active_jobs.is_empty() {
+        if inner
+            .active_jobs
+            .values()
+            .any(|job| job.channel_index == channel_index)
+        {
             return Err(DaemonError::Refused(
-                "daemon already has an active MPC job".to_owned(),
+                "channel already has an active precompute job".to_owned(),
             ));
         }
+        let peer_workers = peer.map_or(inner.cfg.workers, |peer| peer.workers);
+        let worker_count =
+            effective_precompute_workers(inner.cfg.mpc_port, inner.cfg.workers, peer_workers);
+        if worker_count == 0 {
+            return Err(DaemonError::Refused(
+                "no precompute worker port is available".to_owned(),
+            ));
+        }
+        let worker_slot = precompute_worker_slot(channel_index, index.get(), worker_count);
+        if inner
+            .active_jobs
+            .values()
+            .any(|job| job.worker_slot == worker_slot)
+        {
+            return Err(DaemonError::Refused(format!(
+                "precompute worker slot {worker_slot} is busy"
+            )));
+        }
+        let port = precompute_worker_port(inner.cfg.mpc_port, worker_slot)?;
         let reserved: u64 = inner
             .active_jobs
             .values()
@@ -1075,7 +1111,7 @@ impl DaemonState {
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let endpoint = MpcTcpEndpoint {
             role: inner.cfg.role,
-            port: inner.cfg.mpc_port,
+            port,
             peer_ip,
         };
         let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
@@ -1096,8 +1132,9 @@ impl DaemonState {
             JobRecord {
                 channel_index,
                 kind: "precompute".to_owned(),
-                state: format!("target={}", index.get()),
+                state: format!("target={} slot={} port={}", index.get(), worker_slot, port),
                 planned_checked_units,
+                worker_slot,
             },
         );
         inner.save()?;
@@ -1216,6 +1253,7 @@ impl DaemonState {
         let config = PeerFrontierConfig {
             channel_enabled: response.channel_enabled,
             precompute: response.precompute,
+            workers: response.workers,
             ssp_target: response.ssp_target,
             delta_lifetime_checked_units_cap: response.delta_lifetime_checked_units_cap,
         };
@@ -1475,6 +1513,26 @@ fn ssp_effective(ssp_target: u32, cap: u64) -> usize {
         u64::BITS - (cap - 1).leading_zeros()
     };
     (ssp_target + cap_log) as usize
+}
+
+fn effective_precompute_workers(base_port: u16, local_workers: u32, peer_workers: u32) -> u32 {
+    let available_ports = u16::MAX as u32 - base_port as u32;
+    local_workers.min(peer_workers).min(available_ports)
+}
+
+fn precompute_worker_slot(channel_index: u64, target_index: u64, worker_count: u32) -> u32 {
+    debug_assert!(worker_count > 0);
+    ((channel_index ^ target_index) % worker_count as u64) as u32
+}
+
+fn precompute_worker_port(base_port: u16, worker_slot: u32) -> Result<u16> {
+    let port = base_port as u32 + 1 + worker_slot;
+    if port > u16::MAX as u32 {
+        return Err(DaemonError::Refused(
+            "precompute worker port exceeds 65535".to_owned(),
+        ));
+    }
+    Ok(port as u16)
 }
 
 fn set_bits_desc(value: u64) -> Vec<usize> {

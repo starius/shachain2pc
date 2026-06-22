@@ -98,10 +98,14 @@ cleartext intermediates.
   parties. The daemon enforces the configured cap for precompute requests, but
   the cap itself must still be chosen conservatively because DB rollback can
   erase the local monitor.
-- Background precompute currently runs through the existing single MPC TCP port,
-  so the scheduler starts at most one active MPC job per daemon. The worker
-  setting still gates background work, but true parallel MPC jobs require
-  separate per-worker transports.
+- Background precompute currently runs through deterministic per-worker raw TCP
+  ports derived from the configured MPC base port. Precompute worker slot `n`
+  uses `mpc_port + 1 + n`; the base `mpc_port` remains reserved for the
+  existing one-shot reveal/full-derivation paths. Both daemons must therefore
+  reserve the same contiguous worker-port range.
+- The plan's gRPC JobStream transport is still a future transport swap. The
+  current per-worker TCP transport makes parallel daemon workers real without
+  changing the MPC transcript or touching the import/re-label crypto gate.
 - The local API currently uses loopback TCP plus a cookie. Peer API TLS/mTLS is
   still a production hardening item from the plan.
 - Peer gRPC is not yet the raw MPC transport. The daemon still coordinates jobs

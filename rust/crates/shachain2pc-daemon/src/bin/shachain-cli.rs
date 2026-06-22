@@ -103,19 +103,18 @@ async fn real_main() -> Result<(), DaemonError> {
             println!("max_ram_bytes={}", out.max_ram_bytes);
         }
         [cmd, sub, channel] if cmd == "channel" && sub == "enable" => {
-            let out = client
-                .enable_channel(with_cookie(
-                    EnableChannelRequest {
-                        channel_index: parse_u64(channel, "channel")?,
-                        precompute: 0,
-                        ssp_target: 40,
-                        delta_lifetime_checked_units_cap: 1,
-                    },
-                    &cookie,
-                )?)
-                .await?
-                .into_inner();
-            println!("channel={} enabled={}", out.channel_index, out.enabled);
+            enable_channel(&mut client, &cookie, channel, 0, 0, 0).await?;
+        }
+        [cmd, sub, channel, precompute, ssp_target, cap] if cmd == "channel" && sub == "enable" => {
+            enable_channel(
+                &mut client,
+                &cookie,
+                channel,
+                parse_u64(precompute, "precompute")?,
+                parse_u32(ssp_target, "ssp-target")?,
+                parse_u64(cap, "delta-lifetime-checked-units-cap")?,
+            )
+            .await?;
         }
         [cmd, sub, channel] if cmd == "channel" && sub == "disable" => {
             let out = client
@@ -210,6 +209,30 @@ async fn reveal(
     Ok(())
 }
 
+async fn enable_channel(
+    client: &mut ControlServiceClient<tonic::transport::Channel>,
+    cookie: &str,
+    channel: &str,
+    precompute: u64,
+    ssp_target: u32,
+    delta_lifetime_checked_units_cap: u64,
+) -> Result<(), DaemonError> {
+    let out = client
+        .enable_channel(with_cookie(
+            EnableChannelRequest {
+                channel_index: parse_u64(channel, "channel")?,
+                precompute,
+                ssp_target,
+                delta_lifetime_checked_units_cap,
+            },
+            cookie,
+        )?)
+        .await?
+        .into_inner();
+    println!("channel={} enabled={}", out.channel_index, out.enabled);
+    Ok(())
+}
+
 fn with_cookie<T>(msg: T, cookie: &str) -> Result<Request<T>, DaemonError> {
     let mut req = Request::new(msg);
     let value = MetadataValue::try_from(cookie)
@@ -238,6 +261,6 @@ fn parse_index(input: &str) -> Result<u64, DaemonError> {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} --control-file <path> status|channels|jobs|config <workers|precompute|max-ram-mb> <value>|channel <enable|disable> <id>|precompute <channel> <index>|reveal <channel> <index> <expected-next> [--allow-seed-reveal]"
+        "usage: {program} --control-file <path> status|channels|jobs|config <workers|precompute|max-ram-mb> <value>|channel enable <id> [precompute ssp-target cap]|channel disable <id>|precompute <channel> <index>|reveal <channel> <index> <expected-next> [--allow-seed-reveal]"
     )
 }

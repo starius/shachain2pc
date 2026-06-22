@@ -47,6 +47,11 @@ durable node, and stores the authenticated nodes encrypted in the DB. A later
 daemon process can reveal an exact persisted node because public reveal checks
 only the MAC/lambda authenticated value and does not need session-local labels.
 
+Precompute reserves checked-unit budget before starting MPC. A request that
+would exceed the configured fixed-Delta lifetime cap is refused before the
+precompute job is opened, and a repeated precompute for an already stored exact
+node is a no-op.
+
 If an exact persisted node is unavailable, nonzero reveal still falls back to
 the already verified full derivation path. This keeps the tool correct and
 fund-safe while the background scheduler is not implemented.
@@ -78,7 +83,9 @@ cleartext intermediates.
   randomness must stay fresh for every computation.
 - The Delta lifetime budget counter is monitoring-only. Safety must come from a
   conservatively sized static cap and matching security parameters on both
-  parties.
+  parties. The daemon enforces the configured cap for precompute requests, but
+  the cap itself must still be chosen conservatively because DB rollback can
+  erase the local monitor.
 - The local API currently uses loopback TCP plus a cookie. Peer API TLS/mTLS is
   still a production hardening item from the plan.
 - Peer gRPC is not yet the raw MPC transport. The daemon still coordinates jobs

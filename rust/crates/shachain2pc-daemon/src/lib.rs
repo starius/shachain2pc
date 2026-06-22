@@ -148,6 +148,7 @@ struct Inner {
     store: EncryptedStore,
     db: PlainDb,
     active_jobs: BTreeMap<String, JobRecord>,
+    next_job_id: u64,
 }
 
 struct SecretBytes(Vec<u8>);
@@ -194,6 +195,21 @@ struct JobRecord {
     channel_index: u64,
     kind: String,
     state: String,
+    planned_checked_units: u64,
+}
+
+struct PrecomputeJob {
+    job_id: String,
+    endpoint: MpcTcpEndpoint,
+    delta: Block,
+    ssp: usize,
+    share: Value32,
+    planned_checked_units: u64,
+}
+
+enum PrecomputeStart {
+    AlreadyStored,
+    Run(PrecomputeJob),
 }
 
 struct EncryptedStore {
@@ -312,6 +328,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             store,
             db,
             active_jobs: BTreeMap::new(),
+            next_job_id: 0,
         })),
     })
 }
@@ -499,7 +516,7 @@ impl ControlService for ControlApi {
             .map(|(id, job)| pb::JobInfo {
                 job_id: id.clone(),
                 channel_index: job.channel_index,
-                kind: job.kind.clone(),
+                kind: format!("{} checked={}", job.kind, job.planned_checked_units),
                 state: job.state.clone(),
             })
             .collect();
@@ -661,26 +678,57 @@ impl DaemonState {
         target_index: u64,
     ) -> Result<pb::PrecomputeResponse> {
         let index = Index48::new(target_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
-        self.reconcile_with_peer(channel_index).await?;
-        let (endpoint, delta, ssp, share) = self.precompute_context(channel_index).await?;
-        let digest = job_digest(channel_index, "precompute-path", 0, index.get(), ssp as u32);
-        let nodes = run_precompute_path_job(endpoint, share, index, delta, digest, ssp).await?;
-        let checked_units = nodes.iter().filter(|(mask, _)| *mask != 0).count() as u64;
-        for (mask, node) in &nodes {
-            self.store_node(channel_index, *mask, node).await?;
+        let job = match self.begin_precompute_job(channel_index, index).await? {
+            PrecomputeStart::AlreadyStored => {
+                return Ok(pb::PrecomputeResponse {
+                    channel_index,
+                    target_index: index.get(),
+                    nodes_stored: 0,
+                    checked_units: 0,
+                });
+            }
+            PrecomputeStart::Run(job) => job,
+        };
+        if let Err(e) = self.reconcile_with_peer(channel_index).await {
+            self.finish_job(&job.job_id).await;
+            return Err(e);
         }
-        let mut inner = self.inner.lock().await;
-        if let Some(channel) = inner.db.channels.get_mut(&channel_key(channel_index)) {
-            channel.estimated_checked_units = channel
-                .estimated_checked_units
-                .saturating_add(checked_units);
+        let digest = job_digest(
+            channel_index,
+            "precompute-path",
+            0,
+            index.get(),
+            job.ssp as u32,
+        );
+        let nodes = match run_precompute_path_job(
+            job.endpoint,
+            job.share,
+            index,
+            job.delta,
+            digest,
+            job.ssp,
+        )
+        .await
+        {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                self.finish_job(&job.job_id).await;
+                return Err(e.into());
+            }
+        };
+        let nodes_stored = nodes.len() as u64;
+        if let Err(e) = self
+            .store_precomputed_nodes_and_finish_job(channel_index, &job, nodes)
+            .await
+        {
+            self.finish_job(&job.job_id).await;
+            return Err(e);
         }
-        inner.save()?;
         Ok(pb::PrecomputeResponse {
             channel_index,
             target_index: index.get(),
-            nodes_stored: nodes.len() as u64,
-            checked_units,
+            nodes_stored,
+            checked_units: job.planned_checked_units,
         })
     }
 
@@ -803,18 +851,48 @@ impl DaemonState {
         Ok((endpoint, delta, ssp))
     }
 
-    async fn precompute_context(
+    async fn begin_precompute_job(
         &self,
         channel_index: u64,
-    ) -> Result<(MpcTcpEndpoint, Block, usize, Value32)> {
-        let inner = self.inner.lock().await;
+        index: Index48,
+    ) -> Result<PrecomputeStart> {
+        let planned_checked_units = set_bits_desc(index.get()).len() as u64;
+        let mut inner = self.inner.lock().await;
+        let key = channel_key(channel_index);
+        let key_node = node_key(index.get());
         let channel = inner
             .db
             .channels
-            .get(&channel_key(channel_index))
+            .get(&key)
             .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
         if !channel.enabled {
             return Err(DaemonError::Refused("channel is disabled".to_owned()));
+        }
+        let (public, local) = binding_pair(&inner, channel_index, index.get());
+        if channel.frontier_nodes.get(&key_node).is_some_and(|record| {
+            record.public_binding_hex == to_hex(&public)
+                && record.local_binding_hex == to_hex(&local)
+        }) {
+            return Ok(PrecomputeStart::AlreadyStored);
+        }
+        let reserved: u64 = inner
+            .active_jobs
+            .values()
+            .filter(|job| job.channel_index == channel_index)
+            .map(|job| job.planned_checked_units)
+            .sum();
+        let used = channel
+            .estimated_checked_units
+            .saturating_add(reserved)
+            .saturating_add(planned_checked_units);
+        if used > channel.delta_lifetime_checked_units_cap {
+            return Err(DaemonError::Refused(format!(
+                "precompute would exceed Delta lifetime checked-unit cap: estimated={} reserved={} requested={} cap={}",
+                channel.estimated_checked_units,
+                reserved,
+                planned_checked_units,
+                channel.delta_lifetime_checked_units_cap
+            )));
         }
         let peer_ip = inner
             .cfg
@@ -830,7 +908,25 @@ impl DaemonState {
         let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
         let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
         let share = channel_seed_share(&inner.master_secret.0, channel_index);
-        Ok((endpoint, delta, ssp, share))
+        inner.next_job_id = inner.next_job_id.saturating_add(1);
+        let job_id = format!("precompute-{}-{}", channel_index, inner.next_job_id);
+        inner.active_jobs.insert(
+            job_id.clone(),
+            JobRecord {
+                channel_index,
+                kind: "precompute".to_owned(),
+                state: format!("target={}", index.get()),
+                planned_checked_units,
+            },
+        );
+        Ok(PrecomputeStart::Run(PrecomputeJob {
+            job_id,
+            endpoint,
+            delta,
+            ssp,
+            share,
+            planned_checked_units,
+        }))
     }
 
     async fn channel_share(&self, channel_index: u64) -> Result<Value32> {
@@ -877,6 +973,44 @@ impl DaemonState {
             },
         );
         inner.save()
+    }
+
+    async fn store_precomputed_nodes_and_finish_job(
+        &self,
+        channel_index: u64,
+        job: &PrecomputeJob,
+        nodes: Vec<(u64, Ag2pcSecureWires)>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let key = channel_key(channel_index);
+        for (mask, wires) in nodes {
+            let (public, local) = binding_pair(&inner, channel_index, mask);
+            let channel = inner
+                .db
+                .channels
+                .get_mut(&key)
+                .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+            channel.frontier_nodes.insert(
+                node_key(mask),
+                WireRecord {
+                    public_binding_hex: to_hex(&public),
+                    local_binding_hex: to_hex(&local),
+                    wires: SerializableWires::from_secure_wires(&wires),
+                },
+            );
+        }
+        if let Some(channel) = inner.db.channels.get_mut(&key) {
+            channel.estimated_checked_units = channel
+                .estimated_checked_units
+                .saturating_add(job.planned_checked_units);
+        }
+        inner.active_jobs.remove(&job.job_id);
+        inner.save()
+    }
+
+    async fn finish_job(&self, job_id: &str) {
+        let mut inner = self.inner.lock().await;
+        inner.active_jobs.remove(job_id);
     }
 
     async fn reconcile_with_peer(&self, channel_index: u64) -> Result<()> {

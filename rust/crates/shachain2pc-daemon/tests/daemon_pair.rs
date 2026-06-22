@@ -100,6 +100,17 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
         .any(|window| window == expected.to_hex().as_bytes()));
 
     let pair = DaemonPair::restart(pair).await;
+    let alice_precompute_again = pair
+        .cli(&pair.alice_control, &["precompute", "13", "1"])
+        .await;
+    assert!(
+        alice_precompute_again.contains("nodes=0"),
+        "{alice_precompute_again}"
+    );
+    assert!(
+        alice_precompute_again.contains("checked=0"),
+        "{alice_precompute_again}"
+    );
     let (alice, bob) = tokio::join!(
         pair.cli(&pair.alice_control, &["reveal", "13", "1", "1"]),
         pair.cli(&pair.bob_control, &["reveal", "13", "1", "1"])
@@ -108,6 +119,33 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
     assert_eq!(parse_result(&bob), expected.to_hex());
     assert_eq!(parse_cache(&alice), Some(true));
     assert_eq!(parse_cache(&bob), Some(true));
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
+    let pair = DaemonPair::start().await;
+    pair.cli(
+        &pair.alice_control,
+        &["channel", "enable", "17", "0", "40", "1"],
+    )
+    .await;
+    pair.cli(
+        &pair.bob_control,
+        &["channel", "enable", "17", "0", "40", "1"],
+    )
+    .await;
+    let (alice, bob) = tokio::join!(
+        pair.cli_maybe_fail(&pair.alice_control, &["precompute", "17", "3"]),
+        pair.cli_maybe_fail(&pair.bob_control, &["precompute", "17", "3"])
+    );
+    assert!(!alice.status.success());
+    assert!(!bob.status.success());
+    assert!(
+        String::from_utf8_lossy(&alice.stderr).contains("Delta lifetime checked-unit cap"),
+        "{}",
+        String::from_utf8_lossy(&alice.stderr)
+    );
     pair.stop().await;
 }
 

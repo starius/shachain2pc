@@ -1,7 +1,7 @@
 use shachain2pc_daemon::pb::control_service_client::ControlServiceClient;
 use shachain2pc_daemon::pb::{
     DisableChannelRequest, EnableChannelRequest, ListChannelsRequest, ListJobsRequest,
-    RevealRequest, SetConfigRequest, StatusRequest,
+    PrecomputeRequest, RevealRequest, SetConfigRequest, StatusRequest,
 };
 use shachain2pc_daemon::{read_control_file, DaemonError};
 use std::env;
@@ -129,6 +129,22 @@ async fn real_main() -> Result<(), DaemonError> {
                 .into_inner();
             println!("channel={} enabled={}", out.channel_index, out.enabled);
         }
+        [cmd, channel, index] if cmd == "precompute" => {
+            let out = client
+                .precompute(with_cookie(
+                    PrecomputeRequest {
+                        channel_index: parse_u64(channel, "channel")?,
+                        target_index: parse_index(index)?,
+                    },
+                    &cookie,
+                )?)
+                .await?
+                .into_inner();
+            println!(
+                "PRECOMPUTED channel={} target={} nodes={} checked={}",
+                out.channel_index, out.target_index, out.nodes_stored, out.checked_units
+            );
+        }
         [cmd] if cmd == "channels" => {
             let out = client
                 .list_channels(with_cookie(ListChannelsRequest {}, &cookie)?)
@@ -190,6 +206,7 @@ async fn reveal(
         .await?
         .into_inner();
     println!("RESULT {}", out.secret_hex);
+    println!("CACHE {}", out.from_cache);
     Ok(())
 }
 
@@ -221,6 +238,6 @@ fn parse_index(input: &str) -> Result<u64, DaemonError> {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} --control-file <path> status|channels|jobs|config <workers|precompute|max-ram-mb> <value>|channel <enable|disable> <id>|reveal <channel> <index> <expected-next> [--allow-seed-reveal]"
+        "usage: {program} --control-file <path> status|channels|jobs|config <workers|precompute|max-ram-mb> <value>|channel <enable|disable> <id>|precompute <channel> <index>|reveal <channel> <index> <expected-next> [--allow-seed-reveal]"
     )
 }

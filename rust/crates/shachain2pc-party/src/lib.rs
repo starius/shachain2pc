@@ -296,6 +296,67 @@ pub async fn run_one_hash_job(
     Ok(child)
 }
 
+pub async fn run_precompute_path_job(
+    endpoint: MpcTcpEndpoint,
+    share: Value32,
+    index: Index48,
+    delta: shachain2pc_emp_wire::Block,
+    digest: [u8; 32],
+    ssp: usize,
+) -> Result<Vec<(u64, Ag2pcSecureWires)>, PartyError> {
+    let sha = sha256_compress_gadget()?;
+    let mut streams =
+        open_ag2pc_streams_after_digest(endpoint.role, endpoint.port, endpoint.peer_ip, digest)
+            .await?;
+    let mut session =
+        Ag2pcSession::setup_with_delta(&mut streams, endpoint.role, ssp, delta).await?;
+    streams.main.flush().await?;
+
+    let seed_inputs =
+        authenticate_seed_inputs(&mut session, &mut streams, endpoint.role, share).await?;
+    let bits = set_bits_desc(index.get());
+    let mut out = Vec::with_capacity(bits.len().max(1));
+    if bits.is_empty() {
+        let root_program = Ag2pcProgram::chunk_from_sha(&sha, &[], true)?;
+        let mut root = session
+            .run_program(&mut streams, &root_program, &seed_inputs)
+            .await?;
+        root.strip_labels_for_reveal();
+        out.push((0, root));
+        session.end(&mut streams).await?;
+        streams.main.flush().await?;
+        return Ok(out);
+    }
+
+    let mut bits_iter = bits.into_iter();
+    let first_bit = bits_iter
+        .next()
+        .expect("non-empty bit vector has a first bit");
+    let mut mask = 1u64 << first_bit;
+    let first_program = Ag2pcProgram::chunk_from_sha(&sha, &[first_bit], true)?;
+    let mut carried = session
+        .run_program(&mut streams, &first_program, &seed_inputs)
+        .await?;
+    let mut persisted = carried.clone();
+    persisted.strip_labels_for_reveal();
+    out.push((mask, persisted));
+
+    for bit in bits_iter {
+        mask |= 1u64 << bit;
+        let program = Ag2pcProgram::chunk_from_sha(&sha, &[bit], false)?;
+        carried = session
+            .run_program(&mut streams, &program, &carried)
+            .await?;
+        let mut persisted = carried.clone();
+        persisted.strip_labels_for_reveal();
+        out.push((mask, persisted));
+    }
+
+    session.end(&mut streams).await?;
+    streams.main.flush().await?;
+    Ok(out)
+}
+
 pub async fn reveal_node_job(
     endpoint: MpcTcpEndpoint,
     node: &Ag2pcSecureWires,

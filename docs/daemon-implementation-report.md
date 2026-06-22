@@ -19,7 +19,7 @@ This report records the implementation state of the daemon and CLI work.
   - mandatory `expected_next_index` gating for non-local reveals;
   - `I=0` seed reveal refusal unless `allow_seed_reveal` is requested;
   - persisted revealed shachain leaves and local derivation from later leaves.
-  - explicit path precompute for authenticated frontier nodes.
+  - explicit and background path precompute for authenticated frontier nodes.
 
 ## Integration Coverage
 
@@ -34,6 +34,9 @@ with the real CLI. It verifies:
 - matching outputs against the reference derivation;
 - local cache reuse for already revealed values;
 - refusal when `expected_next_index` does not match.
+- automatic background precompute to the shared local/peer target;
+- cap refusal without consuming the monitoring counters;
+- failed precompute attempts being recorded for monitoring.
 
 ## Frontier State
 
@@ -52,9 +55,18 @@ would exceed the configured fixed-Delta lifetime cap is refused before the
 precompute job is opened, and a repeated precompute for an already stored exact
 node is a no-op.
 
+The daemon also records attempted checked units and failed precompute jobs as
+monitoring data. These counters are not safety-critical, because the DB can be
+deleted or rolled back, but they make crash loops and repeated failed
+precompute attempts visible.
+
 If an exact persisted node is unavailable, nonzero reveal still falls back to
 the already verified full derivation path. This keeps the tool correct and
-fund-safe while the background scheduler is not implemented.
+fund-safe while import/re-label is not implemented. The current fallback uses a
+fresh one-shot AG2PC Delta, not the fixed per-channel Delta, so it does not
+consume the fixed-Delta lifetime cap. If the fallback is later changed to reuse
+the fixed channel Delta, it must reserve and account for the same checked-unit
+budget as precompute.
 
 ## Remaining Limitation
 
@@ -86,6 +98,10 @@ cleartext intermediates.
   parties. The daemon enforces the configured cap for precompute requests, but
   the cap itself must still be chosen conservatively because DB rollback can
   erase the local monitor.
+- Background precompute currently runs through the existing single MPC TCP port,
+  so the scheduler starts at most one active MPC job per daemon. The worker
+  setting still gates background work, but true parallel MPC jobs require
+  separate per-worker transports.
 - The local API currently uses loopback TCP plus a cookie. Peer API TLS/mTLS is
   still a production hardening item from the plan.
 - Peer gRPC is not yet the raw MPC transport. The daemon still coordinates jobs

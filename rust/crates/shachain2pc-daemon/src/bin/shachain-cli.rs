@@ -151,11 +151,14 @@ async fn real_main() -> Result<(), DaemonError> {
                 .into_inner();
             for channel in out.channels {
                 println!(
-                    "channel={} enabled={} frontier={} known={}",
+                    "channel={} enabled={} frontier={} known={} estimated={} attempted={} failed={}",
                     channel.channel_index,
                     channel.enabled,
                     channel.frontier_nodes,
-                    channel.known_secrets
+                    channel.known_secrets,
+                    channel.estimated_checked_units,
+                    channel.attempted_checked_units,
+                    channel.failed_precompute_jobs
                 );
             }
         }

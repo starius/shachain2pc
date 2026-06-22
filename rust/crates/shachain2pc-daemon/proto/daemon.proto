@@ -63,6 +63,9 @@ message ChannelResponse {
   uint64 delta_lifetime_checked_units_cap = 5;
   uint64 frontier_nodes = 6;
   uint64 known_secrets = 7;
+  uint64 estimated_checked_units = 8;
+  uint64 attempted_checked_units = 9;
+  uint64 failed_precompute_jobs = 10;
 }
 
 message PrecomputeRequest {
@@ -141,4 +144,8 @@ message FrontierNode {
 
 message GetFrontierResponse {
   repeated FrontierNode nodes = 1;
+  bool channel_enabled = 2;
+  uint64 precompute = 3;
+  uint32 ssp_target = 4;
+  uint64 delta_lifetime_checked_units_cap = 5;
 }

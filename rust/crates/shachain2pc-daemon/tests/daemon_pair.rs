@@ -3,6 +3,7 @@ use shachain2pc_types::Index48;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
@@ -10,6 +11,7 @@ use tokio::time::{sleep, timeout};
 
 const MASTER_A: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const MASTER_B: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+static NEXT_PORT: AtomicUsize = AtomicUsize::new(23_000);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_seed_reveal_restart_and_local_cache() {
@@ -123,6 +125,36 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_background_precomputes_to_shared_target() {
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["config", "precompute", "1"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "1"])
+        .await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "15"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "15"])
+        .await;
+
+    pair.wait_channel_contains(&pair.alice_control, 15, "frontier=1")
+        .await;
+    pair.wait_channel_contains(&pair.bob_control, 15, "frontier=1")
+        .await;
+
+    let expected =
+        reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 15, Index48::new(1).unwrap());
+    let (alice, bob) = tokio::join!(
+        pair.cli(&pair.alice_control, &["reveal", "15", "1", "1"]),
+        pair.cli(&pair.bob_control, &["reveal", "15", "1", "1"])
+    );
+    assert_eq!(parse_result(&alice), expected.to_hex());
+    assert_eq!(parse_result(&bob), expected.to_hex());
+    assert_eq!(parse_cache(&alice), Some(true));
+    assert_eq!(parse_cache(&bob), Some(true));
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
     let pair = DaemonPair::start().await;
     pair.cli(
@@ -146,6 +178,40 @@ async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
         "{}",
         String::from_utf8_lossy(&alice.stderr)
     );
+    let channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    assert!(channels.contains("estimated=0"), "{channels}");
+    assert!(channels.contains("attempted=0"), "{channels}");
+    assert!(channels.contains("failed=0"), "{channels}");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_failed_precompute_attempt_is_counted() {
+    let pair = DaemonPair::start().await;
+    pair.cli(
+        &pair.alice_control,
+        &["channel", "enable", "19", "0", "40", "100"],
+    )
+    .await;
+    pair.cli(
+        &pair.bob_control,
+        &["channel", "enable", "19", "0", "41", "100"],
+    )
+    .await;
+
+    let alice = pair
+        .cli_maybe_fail(&pair.alice_control, &["precompute", "19", "1"])
+        .await;
+    assert!(!alice.status.success());
+    assert!(
+        String::from_utf8_lossy(&alice.stderr).contains("security parameters do not match"),
+        "{}",
+        String::from_utf8_lossy(&alice.stderr)
+    );
+    let channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    assert!(channels.contains("estimated=0"), "{channels}");
+    assert!(channels.contains("attempted=1"), "{channels}");
+    assert!(channels.contains("failed=1"), "{channels}");
     pair.stop().await;
 }
 
@@ -256,6 +322,24 @@ impl DaemonPair {
         }
     }
 
+    async fn wait_channel_contains(&self, control: &Path, channel: u64, needle: &str) -> String {
+        timeout(Duration::from_secs(120), async {
+            loop {
+                let channels = self.cli(control, &["channels"]).await;
+                let prefix = format!("channel={channel} ");
+                if channels
+                    .lines()
+                    .any(|line| line.starts_with(&prefix) && line.contains(needle))
+                {
+                    return channels;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
     async fn cli(&self, control: &Path, args: &[&str]) -> String {
         let out = self.cli_maybe_fail(control, args).await;
         assert!(
@@ -338,6 +422,13 @@ fn parse_cache(output: &str) -> Option<bool> {
 }
 
 fn free_port() -> u16 {
+    for _ in 0..20_000 {
+        let candidate = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        let port = 20_000 + (candidate % 40_000) as u16;
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
         .local_addr()

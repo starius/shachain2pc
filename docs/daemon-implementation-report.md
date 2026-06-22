@@ -19,6 +19,7 @@ This report records the implementation state of the daemon and CLI work.
   - mandatory `expected_next_index` gating for non-local reveals;
   - `I=0` seed reveal refusal unless `allow_seed_reveal` is requested;
   - persisted revealed shachain leaves and local derivation from later leaves.
+  - explicit path precompute for authenticated frontier nodes.
 
 ## Integration Coverage
 
@@ -28,32 +29,46 @@ with the real CLI. It verifies:
 - paired seed reveal with `allow_seed_reveal`;
 - encrypted DB persistence across daemon restart;
 - nonzero reveal through the full MPC path;
+- precompute of a nonzero frontier node, daemon restart, and reveal from the
+  persisted authenticated node without storing the clear secret;
 - matching outputs against the reference derivation;
 - local cache reuse for already revealed values;
 - refusal when `expected_next_index` does not match.
 
-## Current Limitation
+## Frontier State
 
-Persisted authenticated frontier nodes are implemented as encrypted DB records,
-but they are not used for nonzero reveal yet. A direct experiment that computed
-the seed root in one session, persisted the authenticated wires, then loaded
-them as the parent for a fresh one-H session failed the AG2PC equality check.
+Persisted authenticated frontier nodes contain only `lambda` and the IT-MAC
+`mac/key` bundles. Labels are deliberately not serialized because garbled labels
+are session-local randomness.
 
-This means that "same fixed Delta plus serialized authenticated wires" is not
-yet enough to safely resume the one-H frontier across fresh sessions. There is
-likely another session-local invariant in the current AG2PC representation, or
-the resumed node needs an explicit refresh/translation protocol before it can be
-used as a parent for new authenticated computation.
+Path precompute opens one AG2PC session, authenticates the seed, computes the
+requested shachain path inside that same session, strips labels from each
+durable node, and stores the authenticated nodes encrypted in the DB. A later
+daemon process can reveal an exact persisted node because public reveal checks
+only the MAC/lambda authenticated value and does not need session-local labels.
 
-The daemon therefore uses the already verified full derivation path for nonzero
-reveals. This keeps the tool correct and fund-safe while preserving the DB
-format and API shape needed for the future frontier work. Seed-root persistence
-works and is covered by the restart integration test.
+If an exact persisted node is unavailable, nonzero reveal still falls back to
+the already verified full derivation path. This keeps the tool correct and
+fund-safe while the background scheduler is not implemented.
 
-Before enabling persistent one-H frontier use, add a dedicated protocol/test
-that proves a persisted authenticated node can be consumed by a later job
-without equality-check failure and without revealing or re-inputting cleartext
-intermediates.
+## Remaining Limitation
+
+A direct experiment that computed the seed root in one session, persisted the
+authenticated wires, then loaded them as the parent for a fresh one-H session
+failed the AG2PC equality check. This is expected: the persisted node has a
+Delta-bound MAC representation but no fresh-session garbled labels.
+
+Therefore persisted nodes are revealable after restart, but they are not yet
+usable as parents for further H applications after restart. Extending the
+frontier after a restart must re-warm from the seed root inside a new live
+session, or use a future import/re-label protocol that assigns fresh labels
+while binding them to the carried MAC without revealing the cleartext
+intermediate.
+
+Before enabling restart-resumed frontier extension, add a dedicated
+protocol/test that proves a persisted authenticated node can be consumed by a
+later job without equality-check failure and without revealing or re-inputting
+cleartext intermediates.
 
 ## Security Notes
 

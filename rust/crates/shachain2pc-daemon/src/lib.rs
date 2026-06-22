@@ -13,8 +13,8 @@ use shachain2pc_circuit::generate_from_seed;
 use shachain2pc_emp_compat::{normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires};
 use shachain2pc_emp_wire::{Block, BLOCK_BYTES};
 use shachain2pc_party::{
-    reveal_node_job, run_one_hash_job, run_party, run_seed_root_job, Args as PartyArgs, IndexSpec,
-    MpcTcpEndpoint, PartyOutput,
+    reveal_node_job, run_party, run_precompute_path_job, run_seed_root_job, Args as PartyArgs,
+    IndexSpec, MpcTcpEndpoint, PartyOutput,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
 use std::collections::{BTreeMap, HashMap};
@@ -187,8 +187,6 @@ struct SerializableWires {
     lambda: Vec<u8>,
     mac: Vec<[u8; BLOCK_BYTES]>,
     key: Vec<[u8; BLOCK_BYTES]>,
-    label0: Vec<[u8; BLOCK_BYTES]>,
-    eval_label: Vec<[u8; BLOCK_BYTES]>,
 }
 
 #[derive(Clone, Debug)]
@@ -437,6 +435,20 @@ impl ControlService for ControlApi {
         Ok(Response::new(response))
     }
 
+    async fn precompute(
+        &self,
+        request: Request<pb::PrecomputeRequest>,
+    ) -> std::result::Result<Response<pb::PrecomputeResponse>, Status> {
+        self.state.check_cookie(&request).map_err(|e| *e)?;
+        let req = request.into_inner();
+        let out = self
+            .state
+            .precompute_path(req.channel_index, req.target_index)
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(out))
+    }
+
     async fn reveal(
         &self,
         request: Request<pb::RevealRequest>,
@@ -603,29 +615,81 @@ impl DaemonState {
                     .to_owned(),
             ));
         }
-        if index.get() != 0 {
-            let secret = self.run_full_derivation(channel_index, index).await?;
-            let mut inner = self.inner.lock().await;
-            let key = channel_key(channel_index);
-            let channel = inner
-                .db
-                .channels
-                .get_mut(&key)
-                .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
-            channel
-                .known_secrets
-                .insert(index.get().to_string(), secret.to_hex());
-            channel.last_observed_next_reveal_index = Some(expected_next_index.saturating_sub(1));
-            inner.save()?;
+        self.reconcile_with_peer(channel_index).await?;
+        if let Some(node) = self.load_node(channel_index, index.get()).await? {
+            let secret = self
+                .reveal_persisted_node(channel_index, index, &node)
+                .await?;
+            self.store_known_secret(channel_index, index, expected_next_index, secret)
+                .await?;
             return Ok(pb::RevealResponse {
                 channel_index,
                 index: index.get(),
                 secret_hex: secret.to_hex(),
-                from_cache,
+                from_cache: true,
             });
         }
+        if index.get() == 0 {
+            let node = self.ensure_root(channel_index).await?;
+            let secret = self
+                .reveal_persisted_node(channel_index, index, &node)
+                .await?;
+            self.store_known_secret(channel_index, index, expected_next_index, secret)
+                .await?;
+            Ok(pb::RevealResponse {
+                channel_index,
+                index: index.get(),
+                secret_hex: secret.to_hex(),
+                from_cache,
+            })
+        } else {
+            let secret = self.run_full_derivation(channel_index, index).await?;
+            self.store_known_secret(channel_index, index, expected_next_index, secret)
+                .await?;
+            Ok(pb::RevealResponse {
+                channel_index,
+                index: index.get(),
+                secret_hex: secret.to_hex(),
+                from_cache,
+            })
+        }
+    }
+
+    async fn precompute_path(
+        &self,
+        channel_index: u64,
+        target_index: u64,
+    ) -> Result<pb::PrecomputeResponse> {
+        let index = Index48::new(target_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
         self.reconcile_with_peer(channel_index).await?;
-        let node = self.ensure_path(channel_index, index).await?;
+        let (endpoint, delta, ssp, share) = self.precompute_context(channel_index).await?;
+        let digest = job_digest(channel_index, "precompute-path", 0, index.get(), ssp as u32);
+        let nodes = run_precompute_path_job(endpoint, share, index, delta, digest, ssp).await?;
+        let checked_units = nodes.iter().filter(|(mask, _)| *mask != 0).count() as u64;
+        for (mask, node) in &nodes {
+            self.store_node(channel_index, *mask, node).await?;
+        }
+        let mut inner = self.inner.lock().await;
+        if let Some(channel) = inner.db.channels.get_mut(&channel_key(channel_index)) {
+            channel.estimated_checked_units = channel
+                .estimated_checked_units
+                .saturating_add(checked_units);
+        }
+        inner.save()?;
+        Ok(pb::PrecomputeResponse {
+            channel_index,
+            target_index: index.get(),
+            nodes_stored: nodes.len() as u64,
+            checked_units,
+        })
+    }
+
+    async fn reveal_persisted_node(
+        &self,
+        channel_index: u64,
+        index: Index48,
+        node: &Ag2pcSecureWires,
+    ) -> Result<Value32> {
         let (endpoint, delta, ssp) = self.job_context(channel_index).await?;
         let digest = job_digest(
             channel_index,
@@ -634,7 +698,18 @@ impl DaemonState {
             index.get(),
             ssp as u32,
         );
-        let secret = reveal_node_job(endpoint, &node, delta, digest, ssp).await?;
+        reveal_node_job(endpoint, node, delta, digest, ssp)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn store_known_secret(
+        &self,
+        channel_index: u64,
+        index: Index48,
+        expected_next_index: u64,
+        secret: Value32,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().await;
         let key = channel_key(channel_index);
         let channel = inner
@@ -646,13 +721,7 @@ impl DaemonState {
             .known_secrets
             .insert(index.get().to_string(), secret.to_hex());
         channel.last_observed_next_reveal_index = Some(expected_next_index.saturating_sub(1));
-        inner.save()?;
-        Ok(pb::RevealResponse {
-            channel_index,
-            index: index.get(),
-            secret_hex: secret.to_hex(),
-            from_cache,
-        })
+        inner.save()
     }
 
     async fn run_full_derivation(&self, channel_index: u64, index: Index48) -> Result<Value32> {
@@ -696,41 +765,6 @@ impl DaemonState {
         }
     }
 
-    async fn ensure_path(&self, channel_index: u64, index: Index48) -> Result<Ag2pcSecureWires> {
-        let bits = set_bits_desc(index.get());
-        let mut mask = 0u64;
-        let mut parent = self.ensure_root(channel_index).await?;
-        for bit in bits {
-            mask |= 1u64 << bit;
-            let key = node_key(mask);
-            if let Some(node) = self.load_node(channel_index, mask).await? {
-                parent = node;
-                continue;
-            }
-            let (endpoint, delta, ssp) = self.job_context(channel_index).await?;
-            let digest = job_digest(
-                channel_index,
-                "hash",
-                mask & !(1u64 << bit),
-                mask,
-                ssp as u32,
-            );
-            let child = run_one_hash_job(endpoint, &parent, bit, delta, digest, ssp).await?;
-            self.store_node(channel_index, mask, &child).await?;
-            let mut inner = self.inner.lock().await;
-            if let Some(channel) = inner.db.channels.get_mut(&channel_key(channel_index)) {
-                channel.estimated_checked_units = channel.estimated_checked_units.saturating_add(1);
-            }
-            inner.save()?;
-            drop(inner);
-            parent = self
-                .load_node(channel_index, mask)
-                .await?
-                .ok_or_else(|| DaemonError::NotFound(format!("node {key} missing after store")))?;
-        }
-        Ok(parent)
-    }
-
     async fn ensure_root(&self, channel_index: u64) -> Result<Ag2pcSecureWires> {
         if let Some(node) = self.load_node(channel_index, 0).await? {
             return Ok(node);
@@ -767,6 +801,36 @@ impl DaemonState {
         let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
         let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
         Ok((endpoint, delta, ssp))
+    }
+
+    async fn precompute_context(
+        &self,
+        channel_index: u64,
+    ) -> Result<(MpcTcpEndpoint, Block, usize, Value32)> {
+        let inner = self.inner.lock().await;
+        let channel = inner
+            .db
+            .channels
+            .get(&channel_key(channel_index))
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        if !channel.enabled {
+            return Err(DaemonError::Refused("channel is disabled".to_owned()));
+        }
+        let peer_ip = inner
+            .cfg
+            .peer_url
+            .as_deref()
+            .and_then(peer_ip_from_url)
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let endpoint = MpcTcpEndpoint {
+            role: inner.cfg.role,
+            port: inner.cfg.mpc_port,
+            peer_ip,
+        };
+        let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
+        let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
+        let share = channel_seed_share(&inner.master_secret.0, channel_index);
+        Ok((endpoint, delta, ssp, share))
     }
 
     async fn channel_share(&self, channel_index: u64) -> Result<Value32> {
@@ -897,12 +961,6 @@ impl SerializableWires {
                 .iter()
                 .map(|bundle| *bundle.key.as_bytes())
                 .collect(),
-            label0: wires.label0.iter().map(|block| *block.as_bytes()).collect(),
-            eval_label: wires
-                .eval_label
-                .iter()
-                .map(|block| *block.as_bytes())
-                .collect(),
         }
     }
 
@@ -918,16 +976,8 @@ impl SerializableWires {
                     key: Block::from_bytes(*key),
                 })
                 .collect(),
-            label0: self
-                .label0
-                .iter()
-                .map(|block| Block::from_bytes(*block))
-                .collect(),
-            eval_label: self
-                .eval_label
-                .iter()
-                .map(|block| Block::from_bytes(*block))
-                .collect(),
+            label0: Vec::new(),
+            eval_label: Vec::new(),
         }
     }
 }
@@ -1297,6 +1347,25 @@ mod tests {
         let (_, loaded) = EncryptedStore::open(path.clone(), &master).unwrap();
         assert!(loaded.channels.contains_key("1"));
         assert!(EncryptedStore::open(path, &[2u8; 32]).is_err());
+    }
+
+    #[test]
+    fn durable_wires_do_not_serialize_session_labels() {
+        let wires = Ag2pcSecureWires {
+            lambda: vec![1],
+            wire_bundle: vec![AShareBundle {
+                mac: Block::make(1, 2),
+                key: Block::make(3, 4),
+            }],
+            label0: vec![Block::make(5, 6)],
+            eval_label: vec![Block::make(7, 8)],
+        };
+        let durable = SerializableWires::from_secure_wires(&wires);
+        let loaded = durable.to_secure_wires();
+        assert_eq!(loaded.lambda, wires.lambda);
+        assert_eq!(loaded.wire_bundle, wires.wire_bundle);
+        assert!(loaded.label0.is_empty());
+        assert!(loaded.eval_label.is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ service ControlService {
   rpc SetConfig(SetConfigRequest) returns (SetConfigResponse);
   rpc EnableChannel(EnableChannelRequest) returns (ChannelResponse);
   rpc DisableChannel(DisableChannelRequest) returns (ChannelResponse);
+  rpc Precompute(PrecomputeRequest) returns (PrecomputeResponse);
   rpc Reveal(RevealRequest) returns (RevealResponse);
   rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
@@ -62,6 +63,18 @@ message ChannelResponse {
   uint64 delta_lifetime_checked_units_cap = 5;
   uint64 frontier_nodes = 6;
   uint64 known_secrets = 7;
+}
+
+message PrecomputeRequest {
+  uint64 channel_index = 1;
+  uint64 target_index = 2;
+}
+
+message PrecomputeResponse {
+  uint64 channel_index = 1;
+  uint64 target_index = 2;
+  uint64 nodes_stored = 3;
+  uint64 checked_units = 4;
 }
 
 message RevealRequest {

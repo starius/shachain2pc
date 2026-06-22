@@ -75,6 +75,43 @@ async fn daemon_pair_nonzero_reveal_matches_reference() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_precomputed_frontier_survives_restart() {
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "13"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "13"])
+        .await;
+
+    let (alice_precompute, bob_precompute) = tokio::join!(
+        pair.cli(&pair.alice_control, &["precompute", "13", "1"]),
+        pair.cli(&pair.bob_control, &["precompute", "13", "1"])
+    );
+    assert!(alice_precompute.contains("nodes=1"), "{alice_precompute}");
+    assert!(alice_precompute.contains("checked=1"), "{alice_precompute}");
+    assert!(bob_precompute.contains("nodes=1"), "{bob_precompute}");
+    let channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    assert!(channels.contains("frontier=1"), "{channels}");
+
+    let expected =
+        reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 13, Index48::new(1).unwrap());
+    assert!(!std::fs::read(pair.dir.path().join("alice.db"))
+        .unwrap()
+        .windows(expected.to_hex().len())
+        .any(|window| window == expected.to_hex().as_bytes()));
+
+    let pair = DaemonPair::restart(pair).await;
+    let (alice, bob) = tokio::join!(
+        pair.cli(&pair.alice_control, &["reveal", "13", "1", "1"]),
+        pair.cli(&pair.bob_control, &["reveal", "13", "1", "1"])
+    );
+    assert_eq!(parse_result(&alice), expected.to_hex());
+    assert_eq!(parse_result(&bob), expected.to_hex());
+    assert_eq!(parse_cache(&alice), Some(true));
+    assert_eq!(parse_cache(&bob), Some(true));
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_rejects_ahead_reveal_without_expected_index() {
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "11"])
@@ -252,6 +289,14 @@ fn parse_result(output: &str) -> String {
         .find_map(|line| line.strip_prefix("RESULT "))
         .unwrap_or_else(|| panic!("missing RESULT in {output:?}"))
         .to_owned()
+}
+
+fn parse_cache(output: &str) -> Option<bool> {
+    output.lines().find_map(|line| match line {
+        "CACHE true" => Some(true),
+        "CACHE false" => Some(false),
+        _ => None,
+    })
 }
 
 fn free_port() -> u16 {

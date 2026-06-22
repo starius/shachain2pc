@@ -97,6 +97,7 @@
             gnumake
             git
             openssl
+            protobuf
             pkg-config
             python3
             cargo

@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package shachain2pc.daemon.v1;
+
+service ControlService {
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc SetConfig(SetConfigRequest) returns (SetConfigResponse);
+  rpc EnableChannel(EnableChannelRequest) returns (ChannelResponse);
+  rpc DisableChannel(DisableChannelRequest) returns (ChannelResponse);
+  rpc Reveal(RevealRequest) returns (RevealResponse);
+  rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+}
+
+service PeerService {
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  rpc Config(ConfigUpdate) returns (ConfigUpdate);
+  rpc GetFrontier(GetFrontierRequest) returns (GetFrontierResponse);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint32 role = 1;
+  string local_addr = 2;
+  string peer_addr = 3;
+  uint64 max_ram_bytes = 4;
+  uint32 workers = 5;
+  uint64 precompute = 6;
+  uint64 channel_count = 7;
+  uint64 active_job_count = 8;
+}
+
+message SetConfigRequest {
+  optional uint64 max_ram_bytes = 1;
+  optional uint32 workers = 2;
+  optional uint64 precompute = 3;
+}
+
+message SetConfigResponse {
+  uint64 max_ram_bytes = 1;
+  uint32 workers = 2;
+  uint64 precompute = 3;
+}
+
+message EnableChannelRequest {
+  uint64 channel_index = 1;
+  uint64 precompute = 2;
+  uint32 ssp_target = 3;
+  uint64 delta_lifetime_checked_units_cap = 4;
+}
+
+message DisableChannelRequest {
+  uint64 channel_index = 1;
+}
+
+message ChannelResponse {
+  uint64 channel_index = 1;
+  bool enabled = 2;
+  uint64 precompute = 3;
+  uint32 ssp_target = 4;
+  uint64 delta_lifetime_checked_units_cap = 5;
+  uint64 frontier_nodes = 6;
+  uint64 known_secrets = 7;
+}
+
+message RevealRequest {
+  uint64 channel_index = 1;
+  uint64 requested_index = 2;
+  uint64 expected_next_index = 3;
+  bool allow_seed_reveal = 4;
+}
+
+message RevealResponse {
+  uint64 channel_index = 1;
+  uint64 index = 2;
+  string secret_hex = 3;
+  bool from_cache = 4;
+}
+
+message ListChannelsRequest {}
+
+message ListChannelsResponse {
+  repeated ChannelResponse channels = 1;
+}
+
+message ListJobsRequest {}
+
+message JobInfo {
+  string job_id = 1;
+  uint64 channel_index = 2;
+  string kind = 3;
+  string state = 4;
+}
+
+message ListJobsResponse {
+  repeated JobInfo jobs = 1;
+}
+
+message HelloRequest {
+  uint32 role = 1;
+  string daemon_id = 2;
+  uint32 protocol_version = 3;
+}
+
+message HelloResponse {
+  uint32 role = 1;
+  string daemon_id = 2;
+  uint32 protocol_version = 3;
+}
+
+message ConfigUpdate {
+  uint64 max_ram_bytes = 1;
+  uint32 workers = 2;
+  uint64 precompute = 3;
+  uint32 ssp_target = 4;
+  uint64 delta_lifetime_checked_units_cap = 5;
+}
+
+message GetFrontierRequest {
+  uint64 channel_index = 1;
+}
+
+message FrontierNode {
+  uint64 mask = 1;
+  string public_binding_hex = 2;
+}
+
+message GetFrontierResponse {
+  repeated FrontierNode nodes = 1;
+}

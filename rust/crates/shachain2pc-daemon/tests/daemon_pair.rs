@@ -155,6 +155,39 @@ async fn daemon_pair_background_precomputes_to_shared_target() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_precomputes_two_channels_on_worker_ports() {
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["config", "workers", "2"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "workers", "2"])
+        .await;
+    for channel in ["20", "21"] {
+        pair.cli(&pair.alice_control, &["channel", "enable", channel])
+            .await;
+        pair.cli(&pair.bob_control, &["channel", "enable", channel])
+            .await;
+    }
+
+    let (alice_20, bob_20, alice_21, bob_21) = tokio::join!(
+        pair.cli(&pair.alice_control, &["precompute", "20", "1"]),
+        pair.cli(&pair.bob_control, &["precompute", "20", "1"]),
+        pair.cli(&pair.alice_control, &["precompute", "21", "1"]),
+        pair.cli(&pair.bob_control, &["precompute", "21", "1"])
+    );
+    for output in [alice_20, bob_20, alice_21, bob_21] {
+        assert!(output.contains("nodes=1"), "{output}");
+        assert!(output.contains("checked=1"), "{output}");
+    }
+
+    let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    assert_channel_contains(&alice_channels, 20, "frontier=1");
+    assert_channel_contains(&alice_channels, 21, "frontier=1");
+    assert_channel_contains(&alice_channels, 20, "attempted=1");
+    assert_channel_contains(&alice_channels, 21, "attempted=1");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
     let pair = DaemonPair::start().await;
     pair.cli(
@@ -268,7 +301,7 @@ impl DaemonPair {
             alice_peer: free_port(),
             bob_local: free_port(),
             bob_peer: free_port(),
-            mpc: free_port(),
+            mpc: free_port_range(16),
         };
         Self::start_with_dir_and_ports(dir, ports).await
     }
@@ -419,6 +452,31 @@ fn parse_cache(output: &str) -> Option<bool> {
         "CACHE false" => Some(false),
         _ => None,
     })
+}
+
+fn assert_channel_contains(channels: &str, channel: u64, needle: &str) {
+    let prefix = format!("channel={channel} ");
+    assert!(
+        channels
+            .lines()
+            .any(|line| line.starts_with(&prefix) && line.contains(needle)),
+        "missing {needle:?} for channel {channel} in {channels:?}"
+    );
+}
+
+fn free_port_range(width: u16) -> u16 {
+    for _ in 0..20_000 {
+        let candidate = NEXT_PORT.fetch_add(width as usize, Ordering::Relaxed);
+        let port = 20_000 + (candidate % 40_000) as u16;
+        let listeners: Vec<_> = (0..width)
+            .map(|offset| TcpListener::bind((Ipv4Addr::LOCALHOST, port + offset)))
+            .collect::<std::result::Result<_, _>>()
+            .unwrap_or_default();
+        if listeners.len() == width as usize {
+            return port;
+        }
+    }
+    free_port()
 }
 
 fn free_port() -> u16 {

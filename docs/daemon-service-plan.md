@@ -19,8 +19,10 @@ does not include the abandoned experimental windowing work.
   a channel index.
 - Persist only durable, droppable state. Losing or rolling back the DB must cause
   recomputation, not permanent protocol failure or unsafe reveal.
-- Treat unrevealed authenticated precompute as epoch-scoped MPC state. The first
-  daemon version keeps this frontier in memory and rewarms it after restart.
+- Persist unrevealed authenticated precompute encrypted in the DB so the
+  precomputed frontier survives daemon restarts.
+- Use one fixed local Delta per channel, derived from the master secret. Do not
+  rotate Delta in the first daemon design.
 - Support background precomputation under RAM and worker budgets negotiated as
   the minimum of both parties' current settings.
 - Prioritize requested reveals over background precomputation.
@@ -40,9 +42,11 @@ does not include the abandoned experimental windowing work.
   deletion or rollback by recomputing.
 - Do not reveal batches. Channel updates are sequential, so reveal stays one
   secret at a time.
-- Do not persist unrevealed authenticated frontier nodes in the first daemon
-  version. Encrypted persistence for such nodes is a later extension with
-  stricter epoch handling.
+- Do not persist cleartext future shachain secrets. Unrevealed frontier state is
+  authenticated MPC state, not a revealed secret.
+- Do not make any MPC randomness deterministic except the local per-channel
+  Delta. OT, garbling, leaky-AND, preprocessing, and per-job randomness must stay
+  fresh on every computation.
 
 ## Security Model
 
@@ -58,13 +62,19 @@ state, scheduling, and control surfaces, so it must preserve these invariants:
 - The encrypted DB key is derived from the master secret with domain separation.
 - Channel seed shares are derived from the master secret with separate domain
   separation and do not depend on DB salt or mutable config.
+- The local per-channel Delta is derived from the master secret with its own
+  domain separation. It is fixed for the channel lifetime.
 - Cached state is split into two classes:
   - revealed shachain secrets, which are durable DB state and are governed by
     normal shachain rules;
-  - unrevealed authenticated frontier nodes, which are tied to an MPC Delta epoch
-    and are in-memory only in the first version.
+  - unrevealed authenticated frontier nodes, which are tied to the fixed
+    per-channel Delta and are stored encrypted in the DB.
 - Unrevealed authenticated nodes are never converted into cleartext and re-input
   through normal private input.
+- Persisted authenticated nodes are valid only with the same channel, role,
+  protocol version, circuit digest, local Delta derivation, and peer job
+  descriptor. If any binding does not match, both parties discard the node and
+  recompute.
 - Revealed secrets are inserted into the local shachain store using standard
   shachain rules: at most one known value per level, and older derivable secrets
   can be answered locally.
@@ -109,8 +119,8 @@ channel_seed_share(channel_index) = HKDF-SHA256(
 ```
 
 `db_salt` may be stored cleartext next to the DB header because it protects only
-key derivation hygiene. It must not affect channel shares, otherwise deleting the
-DB would change channel behavior.
+DB-key derivation hygiene. It must not affect channel seed shares or channel
+Delta, otherwise deleting the DB would change channel behavior.
 
 Open decision for implementation: whether to use SQLCipher (`rusqlite` +
 SQLCipher) or an application-level encrypted store. SQLCipher is the most direct
@@ -118,34 +128,83 @@ fit for indexed durable state and crash-safe transactions. Application-level AEA
 over `redb`/`sled` is also possible but creates more footguns around indexing and
 partial writes. Prefer SQLCipher unless build constraints become painful.
 
-## Delta Epochs And Authenticated Frontier State
+## Fixed Delta And Authenticated Frontier State
 
-Authenticated MPC values are bound to the local Delta used by the current MPC
-epoch and to the peer's matching epoch state. They are not ordinary durable cache
-entries.
+Authenticated MPC values are bound to the local Delta used for their channel.
+The daemon uses one fixed local Delta per channel for the channel lifetime. This
+is a deliberate simplification: the statistical-security budget is sized for a
+lifetime cap far above realistic channel use, so Delta rotation is not needed in
+the first design.
 
-The first daemon version uses this policy:
+Derived Delta:
 
-- Each enabled channel has an active Delta epoch.
-- Delta is random per `(channel, epoch, role)`, not deterministically derived
-  from the master secret.
-- Delta rotation is controlled by a configured work budget, measured in one-H
-  jobs or AND gates/checks rather than in revealed secrets.
-- Unrevealed authenticated frontier nodes are in memory only.
-- Daemon restart, DB deletion, DB rollback, or Delta rotation drops the
-  unrevealed authenticated frontier and rewarms it.
-- The DB may store epoch metadata and counters for observability, but not enough
-  material to continue an old authenticated frontier in v1.
-- The daemon never stores or receives the peer's Delta. It may store peer epoch
-  identifiers, commitments, or digests.
+```text
+channel_delta(channel_index, party_role) = HKDF-SHA256(
+    ikm  = master_secret,
+    salt = empty or deployment salt,
+    info = "shachain2pc channel delta v1" ||
+           encode(channel_index) ||
+           encode(party_role)
+)
+```
 
-Deterministically deriving Delta from the master secret is intentionally not the
-v1 design. It creates rollback/reuse hazards: after DB loss, the daemon could
-recreate the same Delta while forgetting how much statistical budget was already
-spent under it. If persistent authenticated frontier is added later, store the
-random local Delta encrypted in the DB, bind every node to the epoch metadata,
-and require both parties to prove they still hold the same epoch before using
-the node.
+After derivation, apply the structural bit constraints required by the MPC
+protocol, such as the required low bit. The daemon never stores or receives the
+peer's Delta.
+
+The safety rule that replaces rotation is static lifetime sizing:
+
+```text
+ssp_effective = ssp_target + ceil_log2(delta_lifetime_checked_units_cap)
+```
+
+`delta_lifetime_checked_units_cap` is a conservative upper bound for all checked
+work under one channel Delta. It must count every checked unit consumed under
+that Delta, including work repeated after restart, DB rollback, crash loops, and
+cache rewarm. The implementation must define the checked unit according to the
+AG2PC bucket/security formula before funds-facing use; back-of-envelope
+"number of commitments" is not sufficient.
+
+Because the surcharge is logarithmic, the cap can be orders of magnitude above a
+realistic channel lifetime. The intended configuration should make exhausting
+the cap infeasible in practice. A best-effort cumulative counter is still useful
+as monitoring and should alert on abnormal rewarm or crash-loop activity, but
+the counter is not the safety mechanism. Safety comes from the static cap used
+to size `ssp_effective`.
+
+Determinism applies only to Delta. Every computation still uses fresh OT,
+garbling, leaky-AND, preprocessing, and per-job randomness. Reusing any of that
+randomness to make authenticated nodes "recomputable" would be a protocol break.
+
+Persisted authenticated frontier nodes are encrypted under the DB key and bound
+to:
+
+- channel index and optional external channel id;
+- party role;
+- protocol version;
+- circuit digest;
+- local fixed-Delta derivation version;
+- node index/depth;
+- peer identity and job descriptor digest;
+- security parameter and lifetime cap.
+
+On restart, the daemon re-derives the local Delta from the master secret and can
+resume from persisted authenticated nodes whose bindings still match. If either
+party lacks a node, or if the bindings disagree, both parties discard that node
+and its descendants and jointly recompute from the deepest common authenticated
+ancestor. If no authenticated ancestor is common, they recompute from the channel
+seed share.
+
+Persisting the frontier is also good for the Delta lifetime budget: a normal
+restart resumes existing authenticated nodes and does not spend new checked
+units. Only DB loss, DB rollback, binding mismatch, or peer asymmetry forces
+rewarm work that consumes more checked units under the same Delta.
+
+Both parties must agree on the public security parameters for a channel,
+including `ssp_target`, `ssp_effective`, and
+`delta_lifetime_checked_units_cap`. These values are included in job descriptors
+and frontier binding digests. Mismatch means refuse the job or drop the cached
+node and recompute under the agreed parameters.
 
 ## Identities And Channels
 
@@ -171,6 +230,8 @@ Channel {
   enabled: bool,
   last_observed_next_reveal_index: Option<u64>,
   precompute_target: u64,
+  ssp_target: u32,
+  delta_lifetime_checked_units_cap: u64,
   local_budget_snapshot: Budget,
   peer_budget_snapshot: Option<Budget>,
   created_at,
@@ -185,34 +246,45 @@ allows it from known later secrets.
 
 ## Persistent State
 
-The DB stores durable checkpoints, not required truth. Every table must be safe
-to delete. The worst expected result is recomputation.
+The DB stores durable checkpoints and encrypted local state, not authoritative
+channel truth. Every table must be safe to delete. The worst expected result is
+lost precompute and recomputation.
 
 Suggested logical tables:
 
 ```text
 meta(schema_version, db_salt, daemon_instance_id)
 channels(channel_index, enabled, last_observed_next_reveal_index,
-         precompute_target, ...)
+         precompute_target, ssp_target, delta_lifetime_checked_units_cap, ...)
 peer_configs(peer_id, last_seen_config, last_seen_at)
 known_secrets(channel_index, level, index, secret_ciphertext, inserted_at)
-epoch_metadata(channel_index, epoch_id, counters, status, created_at, ...)
+frontier_nodes(channel_index, node_index, depth, binding_digest,
+               encrypted_blob, created_at, ...)
+delta_budget_monitor(channel_index, estimated_checked_units, updated_at)
 jobs(job_id, channel_index, kind, priority, state, lease_epoch, ...)
 job_events(job_id, event_no, event_type, payload, created_at)
 ```
 
 `known_secrets` stores revealed shachain values, encrypted by the DB. It uses
 standard shachain insertion constraints, not arbitrary append-only storage.
+Known secrets can answer older derivable reveals in their own subtree, but they
+cannot rebuild the upstream trunk or authenticated frontier because shachain `H`
+is one-way.
 
-`epoch_metadata` stores non-secret metadata about in-memory authenticated
-frontier epochs. In v1 it is not sufficient to resume unrevealed precompute after
-restart. A later persistent-frontier design may add encrypted epoch-local Delta
-and authenticated nodes, but only with explicit epoch matching and budget
-accounting.
+`frontier_nodes` stores unrevealed authenticated nodes encrypted under `db_key`.
+The plaintext is never a clear shachain secret; it is the local authenticated
+MPC representation required to continue computing from that node under the fixed
+per-channel Delta. Every node carries a binding digest. Binding mismatch means
+drop and recompute, not best-effort repair.
+
+`delta_budget_monitor` is a best-effort operational counter. It helps detect
+abnormal repeated recomputation under the same channel Delta, but it is not
+trusted for safety because the DB can be deleted or rolled back.
 
 `jobs` are persisted only for operator visibility and crash cleanup. On daemon
 restart, in-flight MPC jobs are not resumed mid-message in the first version;
-they are marked abandoned and recomputed from the last durable cache node.
+they are marked abandoned and recomputed from the latest matching frontier node
+or from the channel seed share.
 
 ## Refactor Prerequisite: Embeddable MPC Jobs
 
@@ -267,7 +339,7 @@ async fn run_one_hash(
 
 The job is serializable at the boundary: before it starts and after it commits.
 Mid-MPC pause/resume is explicitly deferred. Eviction cancels only the currently
-running `H`; already committed unrevealed parents remain in the active in-memory
+running `H`; already committed unrevealed parents remain in the encrypted
 frontier, and revealed parents remain in the DB.
 
 This satisfies the user-facing requirement of pausable/resumable work at the
@@ -303,6 +375,8 @@ service PeerService {
 ram_budget_bytes
 worker_budget
 precompute_target
+ssp_target
+delta_lifetime_checked_units_cap
 enabled_channels summary/version
 protocol_version
 ```
@@ -321,7 +395,9 @@ AbortJob(job_id, reason)
 ```
 
 The peer protocol must be symmetric: either party can request work, but a job
-starts only after both sides have accepted the same job descriptor.
+starts only after both sides have accepted the same job descriptor. The
+descriptor includes the circuit digest, node id, peer identity, `ssp_target`,
+`ssp_effective`, and `delta_lifetime_checked_units_cap`.
 
 Server and client authentication are both required. The server validates the
 client certificate, the client validates the server certificate, and job
@@ -409,11 +485,13 @@ Eviction rules:
 - Lower-priority jobs are cancelled before starting new high-priority work.
 - Eviction cancels only the currently running `H`.
 - Completed revealed secrets remain persisted. Completed unrevealed
-  authenticated parents remain in the active in-memory epoch frontier.
+  authenticated parents remain persisted in the encrypted frontier.
 - Cancelled jobs are safe to reschedule.
 - If local and peer authenticated frontier state disagrees, both parties choose
-  the deepest common authenticated ancestor in the same epoch, or the latest
-  revealed shachain ancestor, and jointly recompute from there.
+  the deepest common authenticated ancestor with matching bindings and jointly
+  recompute from there. If no authenticated ancestor is common, they recompute
+  from the channel seed share. Revealed leaves are still useful for local older
+  reveals, but they generally do not reconstruct upstream frontier state.
 
 Planning loop:
 
@@ -424,8 +502,8 @@ Planning loop:
 4. Generate candidate one-H jobs from missing cache edges.
 5. Reserve RAM/workers for the highest-priority feasible jobs.
 6. Start jobs through `JobStream`.
-7. Commit unrevealed outputs to the active in-memory frontier, and commit any
-   revealed outputs transactionally to DB.
+7. Commit unrevealed outputs transactionally to the encrypted frontier, and
+   commit any revealed outputs transactionally to DB.
 8. Re-plan after each commit, cancel, config update, or reveal request.
 
 RAM accounting starts conservative:
@@ -448,10 +526,8 @@ Start with the simple per-edge cache:
 - The root is the authenticated channel seed share combination.
 - Each shachain edge is one MPC `H` application.
 - A node is identified by `(channel_index, shachain_index_or_prefix, depth)`.
-- The active epoch frontier stores unrevealed authenticated intermediate nodes in
-  memory.
-- The DB stores revealed secrets and metadata, not unrevealed authenticated
-  nodes in v1.
+- The encrypted frontier stores unrevealed authenticated intermediate nodes.
+- The DB stores revealed secrets, authenticated frontier nodes, and metadata.
 - A disabled channel keeps DB state but does not schedule background work.
 - Re-enabling uses existing nodes if both sides can agree on them; otherwise
   they are dropped and recomputed.
@@ -499,7 +575,7 @@ Expose:
 - enabled/disabled channel count;
 - per-channel next reveal index;
 - known shachain levels;
-- active frontier/cache node count;
+- encrypted frontier/cache node count;
 - active jobs and priorities;
 - cancelled/aborted jobs;
 - current RSS and peak RSS;
@@ -525,24 +601,32 @@ Review gate: no daemon yet; only refactor and unchanged behavior.
 
 - Implement `run_one_hash` over the existing AG2PC session.
 - Represent authenticated values as serializable owned structs.
+- Make the local Delta an explicit session input so the same channel Delta can
+  be reused after daemon restart while all other MPC randomness stays fresh.
 - Add deterministic job descriptors and transcript digests.
 - Add cancellation at job boundaries.
 - Add tests for one-H correctness, abort, and recomputation from parent.
 
-Review gate: one-H jobs are embeddable and serializable at boundaries.
+Review gate: one-H jobs are embeddable and serializable at boundaries, and a
+persisted authenticated parent can be loaded into a fresh session with the same
+local Delta and fresh preprocessing randomness.
 
 ### Phase 2: Encrypted DB And Shachain Store
 
 - Add encrypted DB setup and key derivation.
 - Add channel records.
 - Add known-secret shachain insertion/derivation.
-- Add epoch metadata.
+- Add fixed-Delta derivation and security-budget sizing.
+- Add authenticated frontier node serialization, encryption, and binding
+  validation.
+- Add exact checked-unit accounting for the configured
+  `delta_lifetime_checked_units_cap`.
 - Add crash/reopen tests.
 - Add DB deletion/rollback recomputation tests.
 
-Review gate: DB is droppable for cache state, revealed-secret storage is
-consistent with shachain rules, and reveal APIs require caller-supplied expected
-indices.
+Review gate: DB is droppable for correctness, encrypted frontier survives normal
+restart, revealed-secret storage is consistent with shachain rules, and reveal
+APIs require caller-supplied expected indices.
 
 ### Phase 3: Local Daemon And CLI API
 
@@ -560,6 +644,8 @@ Review gate: local control plane is stable before peer networking.
 - Add peer `Hello`, config stream, and job stream.
 - Use mTLS or pinned certificates on both client and server sides.
 - Negotiate min RAM, workers, and precompute target.
+- Agree on public channel security parameters, including `ssp_target` and
+  `delta_lifetime_checked_units_cap`.
 - Add disconnect/reconnect behavior.
 
 Review gate: two daemons can agree on config and reject mismatched job
@@ -571,7 +657,7 @@ descriptors.
 - Implement RAM/worker budget reservation.
 - Implement eviction/cancellation of background jobs.
 - Implement cache-aware planning from deepest common node.
-- Implement Delta epoch work counters and rotation.
+- Implement fixed-Delta checked-unit monitoring and alerts.
 - Start background precompute after both parties enable a channel.
 
 Review gate: background jobs fill cache under budgets and survive cancellation.
@@ -612,21 +698,28 @@ Review gate: daemon is usable as a PoC service.
 
 1. **AG2PC session reuse and transport embedding.** The current protocol must be
    adapted to gRPC without changing cryptographic message ordering.
-2. **Authenticated frontier persistence.** V1 avoids persisting unrevealed
-   authenticated nodes. If later added, it must persist encrypted local Delta,
-   epoch metadata, and budget counters, and it must never accept peer-mismatched
-   epoch state.
-3. **DB rollback vs external channel state.** A droppable DB is fine for cache
+2. **Reloading authenticated frontier nodes.** Persisted unrevealed nodes are
+   valid only if the value representation is self-contained under the fixed
+   local Delta and can be continued with fresh OT/preprocessing randomness.
+   Phase 1 and Phase 2 must test this directly.
+3. **Deterministic Delta misuse.** Only Delta is deterministic. Reusing any OT,
+   garbling, leaky-AND, preprocessing, or per-job randomness across runs would
+   be a serious protocol break.
+4. **Lifetime budget sizing.** No Delta rotation means the static
+   `delta_lifetime_checked_units_cap` must be extremely conservative and must
+   count repeated work from restart, rollback, and crash-loop rewarm. The DB
+   counter is monitoring only, not a safety boundary.
+5. **DB rollback vs external channel state.** A droppable DB is fine for cache
    state but dangerous for reveal sequence. The local API requires expected-index
    checks from day one.
-4. **Budget accounting.** Conservative estimates are safe but may underutilize
+6. **RAM budget accounting.** Conservative estimates are safe but may underutilize
    memory; aggressive estimates risk OOM. Start conservative and measure.
-5. **Peer asymmetry.** Both sides may have different cache state. The protocol
+7. **Peer asymmetry.** Both sides may have different cache state. The protocol
    must routinely fall back to joint recomputation from a common authenticated
    ancestor or a revealed shachain ancestor.
-6. **Operational security.** The master secret unlocks both DB and future
+8. **Operational security.** The master secret unlocks both DB and future
    channel shares. CLI input, logs, core dumps, and process memory all matter.
-7. **Peer-budget griefing.** A peer can reduce liveness by advertising tiny
+9. **Peer-budget griefing.** A peer can reduce liveness by advertising tiny
    RAM, worker, or precompute budgets. This should produce clear status and
    alerts, not silent stalls.
 

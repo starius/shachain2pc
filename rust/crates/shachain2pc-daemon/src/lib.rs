@@ -24,6 +24,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use zeroize::Zeroize;
@@ -174,6 +175,10 @@ struct ChannelRecord {
     frontier_nodes: BTreeMap<String, WireRecord>,
     known_secrets: BTreeMap<String, String>,
     estimated_checked_units: u64,
+    #[serde(default)]
+    attempted_checked_units: u64,
+    #[serde(default)]
+    failed_precompute_jobs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -196,6 +201,14 @@ struct JobRecord {
     kind: String,
     state: String,
     planned_checked_units: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeerFrontierConfig {
+    channel_enabled: bool,
+    precompute: u64,
+    ssp_target: u32,
+    delta_lifetime_checked_units_cap: u64,
 }
 
 struct PrecomputeJob {
@@ -285,6 +298,7 @@ impl EncryptedStore {
 
 pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()> {
     let state = init_daemon_state(cfg, master_secret)?;
+    tokio::spawn(scheduler_loop(state.clone()));
     let control = ControlApi {
         state: state.clone(),
     };
@@ -310,6 +324,13 @@ pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()>
         .serve(peer_addr);
     tokio::try_join!(control_server, peer_server)?;
     Ok(())
+}
+
+async fn scheduler_loop(state: DaemonState) {
+    loop {
+        sleep(Duration::from_secs(1)).await;
+        let _ = state.run_scheduler_once().await;
+    }
 }
 
 pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<DaemonState> {
@@ -419,6 +440,8 @@ impl ControlService for ControlApi {
                 frontier_nodes: BTreeMap::new(),
                 known_secrets: BTreeMap::new(),
                 estimated_checked_units: 0,
+                attempted_checked_units: 0,
+                failed_precompute_jobs: 0,
             });
         channel.enabled = true;
         channel.precompute_target = default_precompute;
@@ -563,24 +586,32 @@ impl PeerService for PeerApi {
     ) -> std::result::Result<Response<pb::GetFrontierResponse>, Status> {
         let req = request.into_inner();
         let inner = self.state.inner.lock().await;
-        let nodes = inner
-            .db
-            .channels
-            .get(&channel_key(req.channel_index))
-            .map(|channel| {
-                channel
-                    .frontier_nodes
-                    .iter()
-                    .filter_map(|(mask, node)| {
-                        mask.parse::<u64>().ok().map(|mask| pb::FrontierNode {
-                            mask,
-                            public_binding_hex: node.public_binding_hex.clone(),
-                        })
-                    })
-                    .collect()
+        let Some(channel) = inner.db.channels.get(&channel_key(req.channel_index)) else {
+            return Ok(Response::new(pb::GetFrontierResponse {
+                nodes: Vec::new(),
+                channel_enabled: false,
+                precompute: 0,
+                ssp_target: 0,
+                delta_lifetime_checked_units_cap: 0,
+            }));
+        };
+        let nodes = channel
+            .frontier_nodes
+            .iter()
+            .filter_map(|(mask, node)| {
+                mask.parse::<u64>().ok().map(|mask| pb::FrontierNode {
+                    mask,
+                    public_binding_hex: node.public_binding_hex.clone(),
+                })
             })
-            .unwrap_or_default();
-        Ok(Response::new(pb::GetFrontierResponse { nodes }))
+            .collect();
+        Ok(Response::new(pb::GetFrontierResponse {
+            nodes,
+            channel_enabled: channel.enabled,
+            precompute: channel.precompute_target,
+            ssp_target: channel.ssp_target,
+            delta_lifetime_checked_units_cap: channel.delta_lifetime_checked_units_cap,
+        }))
     }
 }
 
@@ -672,6 +703,121 @@ impl DaemonState {
         }
     }
 
+    async fn run_scheduler_once(&self) -> Result<()> {
+        let candidates = self.scheduler_candidates().await;
+        for channel_index in candidates {
+            let Some(peer) = self.peer_frontier(channel_index).await? else {
+                continue;
+            };
+            if !peer.channel_enabled {
+                continue;
+            }
+            self.reconcile_with_peer(channel_index).await?;
+            let effective_precompute = self
+                .effective_precompute_target(channel_index, peer)
+                .await?;
+            if effective_precompute == 0 {
+                continue;
+            }
+            if let Some(target) = self
+                .next_missing_frontier(channel_index, effective_precompute)
+                .await?
+            {
+                let _ = self.precompute_path(channel_index, target).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn scheduler_candidates(&self) -> Vec<u64> {
+        let inner = self.inner.lock().await;
+        if inner.cfg.workers == 0 || inner.cfg.precompute == 0 {
+            return Vec::new();
+        }
+        inner
+            .db
+            .channels
+            .iter()
+            .filter_map(|(key, channel)| {
+                let channel_index = key.parse::<u64>().ok()?;
+                if !channel.enabled || channel.precompute_target == 0 {
+                    return None;
+                }
+                let busy = inner
+                    .active_jobs
+                    .values()
+                    .any(|job| job.channel_index == channel_index);
+                if busy {
+                    return None;
+                }
+                Some(channel_index)
+            })
+            .collect()
+    }
+
+    async fn validate_peer_security_params(
+        &self,
+        channel_index: u64,
+        peer: PeerFrontierConfig,
+    ) -> Result<()> {
+        let inner = self.inner.lock().await;
+        let channel = inner
+            .db
+            .channels
+            .get(&channel_key(channel_index))
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        if peer.ssp_target != channel.ssp_target
+            || peer.delta_lifetime_checked_units_cap != channel.delta_lifetime_checked_units_cap
+        {
+            return Err(DaemonError::Refused(
+                "peer channel security parameters do not match".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn effective_precompute_target(
+        &self,
+        channel_index: u64,
+        peer: PeerFrontierConfig,
+    ) -> Result<u64> {
+        self.validate_peer_security_params(channel_index, peer)
+            .await?;
+        let inner = self.inner.lock().await;
+        let channel = inner
+            .db
+            .channels
+            .get(&channel_key(channel_index))
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        Ok(channel
+            .precompute_target
+            .min(inner.cfg.precompute)
+            .min(peer.precompute))
+    }
+
+    async fn next_missing_frontier(
+        &self,
+        channel_index: u64,
+        effective_precompute: u64,
+    ) -> Result<Option<u64>> {
+        let inner = self.inner.lock().await;
+        let Some(channel) = inner.db.channels.get(&channel_key(channel_index)) else {
+            return Ok(None);
+        };
+        for index in 1..=effective_precompute.min(MAX_INDEX) {
+            let key = node_key(index);
+            let (public, local) = binding_pair(&inner, channel_index, index);
+            let present = channel.frontier_nodes.get(&key).is_some_and(|record| {
+                record.public_binding_hex == to_hex(&public)
+                    && record.local_binding_hex == to_hex(&local)
+            });
+            if !present {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
     async fn precompute_path(
         &self,
         channel_index: u64,
@@ -689,8 +835,30 @@ impl DaemonState {
             }
             PrecomputeStart::Run(job) => job,
         };
+        match self.peer_frontier(channel_index).await {
+            Ok(Some(peer)) => {
+                if !peer.channel_enabled {
+                    self.finish_job(&job.job_id, true).await;
+                    return Err(DaemonError::Refused(
+                        "peer has not enabled this channel".to_owned(),
+                    ));
+                }
+                if let Err(e) = self
+                    .validate_peer_security_params(channel_index, peer)
+                    .await
+                {
+                    self.finish_job(&job.job_id, true).await;
+                    return Err(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.finish_job(&job.job_id, true).await;
+                return Err(e);
+            }
+        }
         if let Err(e) = self.reconcile_with_peer(channel_index).await {
-            self.finish_job(&job.job_id).await;
+            self.finish_job(&job.job_id, true).await;
             return Err(e);
         }
         let digest = job_digest(
@@ -712,7 +880,7 @@ impl DaemonState {
         {
             Ok(nodes) => nodes,
             Err(e) => {
-                self.finish_job(&job.job_id).await;
+                self.finish_job(&job.job_id, true).await;
                 return Err(e.into());
             }
         };
@@ -721,7 +889,7 @@ impl DaemonState {
             .store_precomputed_nodes_and_finish_job(channel_index, &job, nodes)
             .await
         {
-            self.finish_job(&job.job_id).await;
+            self.finish_job(&job.job_id, true).await;
             return Err(e);
         }
         Ok(pb::PrecomputeResponse {
@@ -875,6 +1043,11 @@ impl DaemonState {
         }) {
             return Ok(PrecomputeStart::AlreadyStored);
         }
+        if !inner.active_jobs.is_empty() {
+            return Err(DaemonError::Refused(
+                "daemon already has an active MPC job".to_owned(),
+            ));
+        }
         let reserved: u64 = inner
             .active_jobs
             .values()
@@ -908,6 +1081,14 @@ impl DaemonState {
         let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
         let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
         let share = channel_seed_share(&inner.master_secret.0, channel_index);
+        let channel = inner
+            .db
+            .channels
+            .get_mut(&key)
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        channel.attempted_checked_units = channel
+            .attempted_checked_units
+            .saturating_add(planned_checked_units);
         inner.next_job_id = inner.next_job_id.saturating_add(1);
         let job_id = format!("precompute-{}-{}", channel_index, inner.next_job_id);
         inner.active_jobs.insert(
@@ -919,6 +1100,7 @@ impl DaemonState {
                 planned_checked_units,
             },
         );
+        inner.save()?;
         Ok(PrecomputeStart::Run(PrecomputeJob {
             job_id,
             endpoint,
@@ -1008,24 +1190,59 @@ impl DaemonState {
         inner.save()
     }
 
-    async fn finish_job(&self, job_id: &str) {
-        let mut inner = self.inner.lock().await;
-        inner.active_jobs.remove(job_id);
+    async fn peer_frontier(&self, channel_index: u64) -> Result<Option<PeerFrontierConfig>> {
+        Ok(self
+            .peer_frontier_response(channel_index)
+            .await?
+            .map(|(_, config)| config))
     }
 
-    async fn reconcile_with_peer(&self, channel_index: u64) -> Result<()> {
+    async fn peer_frontier_response(
+        &self,
+        channel_index: u64,
+    ) -> Result<Option<(pb::GetFrontierResponse, PeerFrontierConfig)>> {
         let peer_url = {
             let inner = self.inner.lock().await;
             inner.cfg.peer_url.clone()
         };
         let Some(peer_url) = peer_url else {
-            return Ok(());
+            return Ok(None);
         };
         let mut client = pb::peer_service_client::PeerServiceClient::connect(peer_url).await?;
         let response = client
             .get_frontier(pb::GetFrontierRequest { channel_index })
             .await?
             .into_inner();
+        let config = PeerFrontierConfig {
+            channel_enabled: response.channel_enabled,
+            precompute: response.precompute,
+            ssp_target: response.ssp_target,
+            delta_lifetime_checked_units_cap: response.delta_lifetime_checked_units_cap,
+        };
+        Ok(Some((response, config)))
+    }
+
+    async fn finish_job(&self, job_id: &str, failed: bool) {
+        let mut inner = self.inner.lock().await;
+        if let Some(job) = inner.active_jobs.remove(job_id) {
+            if failed {
+                if let Some(channel) = inner.db.channels.get_mut(&channel_key(job.channel_index)) {
+                    channel.failed_precompute_jobs =
+                        channel.failed_precompute_jobs.saturating_add(1);
+                }
+            }
+            let _ = inner.save();
+        }
+    }
+
+    async fn reconcile_with_peer(&self, channel_index: u64) -> Result<()> {
+        let Some((response, _peer_config)) = self.peer_frontier_response(channel_index).await?
+        else {
+            return Ok(());
+        };
+        if !response.channel_enabled {
+            return Ok(());
+        }
         let peer: HashMap<u64, String> = response
             .nodes
             .into_iter()
@@ -1125,6 +1342,9 @@ fn channel_response(index: u64, channel: &ChannelRecord) -> pb::ChannelResponse 
         delta_lifetime_checked_units_cap: channel.delta_lifetime_checked_units_cap,
         frontier_nodes: channel.frontier_nodes.len() as u64,
         known_secrets: channel.known_secrets.len() as u64,
+        estimated_checked_units: channel.estimated_checked_units,
+        attempted_checked_units: channel.attempted_checked_units,
+        failed_precompute_jobs: channel.failed_precompute_jobs,
     }
 }
 
@@ -1475,6 +1695,8 @@ mod tests {
                 frontier_nodes: BTreeMap::new(),
                 known_secrets: BTreeMap::new(),
                 estimated_checked_units: 0,
+                attempted_checked_units: 0,
+                failed_precompute_jobs: 0,
             },
         );
         store.save(&master, &db).unwrap();

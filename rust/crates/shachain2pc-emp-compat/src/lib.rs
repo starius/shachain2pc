@@ -2292,8 +2292,23 @@ impl Ag2pcSession {
         })
     }
 
+    pub async fn setup_with_delta(
+        streams: &mut Ag2pcStreams,
+        party: Role,
+        ssp: usize,
+        delta: Block,
+    ) -> Result<Self> {
+        Ok(Self {
+            protocol: Ag2pcProtocol::setup_with_delta(streams, party, ssp, delta).await?,
+        })
+    }
+
     pub fn party(&self) -> Role {
         self.protocol.party()
+    }
+
+    pub fn delta(&self) -> Block {
+        self.protocol.delta()
     }
 
     pub fn process_input_calls(&self) -> usize {
@@ -2825,7 +2840,18 @@ const AG2PC_GARBLE_CHUNK_ANDS: usize = 1 << 16;
 
 impl Ag2pcProtocol {
     pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
-        let triple_pool = Ag2pcTriplePool::setup(streams, party, ssp).await?;
+        let delta = random_ag2pc_delta(party)?;
+        Self::setup_with_delta(streams, party, ssp, delta).await
+    }
+
+    pub async fn setup_with_delta(
+        streams: &mut Ag2pcStreams,
+        party: Role,
+        ssp: usize,
+        delta: Block,
+    ) -> Result<Self> {
+        let delta = normalize_ag2pc_delta(party, delta);
+        let triple_pool = Ag2pcTriplePool::setup_with_delta(streams, party, ssp, delta).await?;
         Ok(Self {
             party,
             delta: triple_pool.delta(),
@@ -3150,6 +3176,16 @@ async fn ag2pc_recv_input_open(
 
 impl Ag2pcTriplePool {
     pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
+        let delta = random_ag2pc_delta(party)?;
+        Self::setup_with_delta(streams, party, ssp, delta).await
+    }
+
+    pub async fn setup_with_delta(
+        streams: &mut Ag2pcStreams,
+        party: Role,
+        ssp: usize,
+        delta: Block,
+    ) -> Result<Self> {
         if !streams.main.fs_enabled() {
             streams.main.enable_fs(party == Role::Alice)?;
         }
@@ -3157,7 +3193,7 @@ impl Ag2pcTriplePool {
             streams.sibling.enable_fs(party == Role::Alice)?;
         }
 
-        let delta = random_ag2pc_delta(party)?;
+        let delta = normalize_ag2pc_delta(party, delta);
         let mut out = Self {
             party,
             ssp,
@@ -3746,14 +3782,18 @@ fn ag2pc_feq_commitment(digest: &[u8; HASH_DIGEST_BYTES], nonce: Block) -> [u8; 
 }
 
 fn random_ag2pc_delta(party: Role) -> Result<Block> {
-    let mut bytes = random_block()?.into_bytes();
+    Ok(normalize_ag2pc_delta(party, random_block()?))
+}
+
+pub fn normalize_ag2pc_delta(party: Role, delta: Block) -> Block {
+    let mut bytes = delta.into_bytes();
     bytes[0] |= 1;
     if party == Role::Alice {
         bytes[0] |= 2;
     } else {
         bytes[0] &= !2;
     }
-    Ok(Block::from_bytes(bytes))
+    Block::from_bytes(bytes)
 }
 
 fn select_block(bit: u8) -> Block {
@@ -3991,8 +4031,12 @@ mod tests {
         build_chunk_circuit, build_tile_circuit, sha256_compress_gadget, Gate, CACHE_TILE_HEIGHT,
     };
     use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
-    use std::path::{Path, PathBuf};
+    #[cfg(feature = "cpp-probes")]
+    use std::path::Path;
+    use std::path::PathBuf;
+    #[cfg(feature = "cpp-probes")]
     use std::process::{Command, Stdio};
+    #[cfg(feature = "cpp-probes")]
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
 
@@ -4002,6 +4046,7 @@ mod tests {
     const LIVE_AG2PC_DRAW_LENGTH: usize = 257;
     #[cfg(feature = "cpp-probes")]
     const LIVE_AG2PC_COMPUTE_LENGTH: usize = 35;
+    #[cfg(feature = "cpp-probes")]
     static LIVE_CPP_INTEROP_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[test]
@@ -4044,12 +4089,14 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug)]
+    #[cfg(feature = "cpp-probes")]
     enum TestTransport {
         Listen,
         Connect,
     }
 
     #[derive(Clone, Copy, Debug)]
+    #[cfg(feature = "cpp-probes")]
     enum TestOtRole {
         Send,
         Recv,
@@ -4161,6 +4208,7 @@ mod tests {
         ((i * 7 + 3) % 11) < 5
     }
 
+    #[cfg(feature = "cpp-probes")]
     fn opposite_role(role: Role) -> Role {
         match role {
             Role::Alice => Role::Bob,
@@ -5267,6 +5315,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cpp-probes")]
     async fn open_stream(transport: TestTransport, port: u16) -> Result<EmpStream> {
         match transport {
             TestTransport::Listen => EmpStream::listen(port).await.map_err(Into::into),

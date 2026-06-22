@@ -42,25 +42,35 @@ Output:
 
 ## Candidate Label Relabel Step
 
-If the persisted MAC/lambda state is accepted as valid, assigning labels is
-simple:
+If the persisted MAC/lambda state is accepted as valid, the remaining task is
+to attach fresh session labels to the same authenticated value. This is not a
+one-message label send.
 
 1. Both parties validate the node binding:
    channel id, peer identity, protocol version, circuit digest, Delta
    derivation version, node mask/depth, `ssp_target`, and lifetime cap.
 2. Alice samples a fresh `label0[i]` for every imported bit.
-3. Alice sends `label0[i] xor (lambda[i] * Delta)` to Bob.
-4. Bob stores the received value as `eval_label[i]`.
-5. The imported wires now have fresh labels for the current session.
+3. Bob must receive the active label for the wire's external value
+   `x[i] = lambda[i] xor mac_lsb_A[i] xor mac_lsb_B[i]`.
+4. Neither party knows `x[i]` alone, and directly exchanging the MAC-LSB
+   shares would reveal the imported secret. Therefore the label transfer must
+   obliviously combine both value shares, likely using an authenticated-input or
+   OT-style subprotocol, while binding the result to the accepted MAC state.
+5. The imported wires have fresh labels for the current session only after that
+   oblivious transfer/import step succeeds.
 
-This mirrors the label part of `process_inputs`, but does not re-input a
+The tempting shortcut `label0[i] xor (lambda[i] * Delta)` is insufficient:
+`lambda` is only the mask share, not the external bit. It would either place the
+wrong active label or require revealing the missing MAC-LSB share. This protocol
+must mirror the security of `process_inputs` without re-inputting or opening the
 cleartext value.
 
 ## Open Security Question
 
-The hard part is not label assignment. It is proving that both parties can use
-the persisted authenticated value as a new-session input without opening the
-secret or accepting a maliciously substituted node.
+The hard parts are the unopened MAC-consistency check and the oblivious active
+label transfer. The protocol must prove that both parties can use the persisted
+authenticated value as a new-session input without opening the secret or
+accepting a maliciously substituted node.
 
 The protocol needs a MAC-consistency/import check that:
 

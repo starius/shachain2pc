@@ -1,3 +1,4 @@
+use shachain2pc_emp_wire::ByteIo;
 use shachain2pc_mpc_core::{
     receive_session_start_ack, receive_session_start_and_ack, send_session_start, ChannelFlow,
     CoreError, SessionParams, StepResult,
@@ -7,6 +8,10 @@ use shachain2pc_types::Role;
 use std::fmt;
 use std::future::Future;
 use tokio::sync::mpsc;
+
+pub use shachain2pc_mpc_core::SessionParams as RunnerSessionParams;
+
+const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 pub trait MpcTransport: Send {
     fn send<'a>(&'a mut self, frame: MpcFrame) -> impl Future<Output = Result<()>> + Send + 'a;
@@ -40,6 +45,69 @@ impl<M: MpcTransport, S: MpcTransport> MpcTransportSet for TransportPair<M, S> {
 
     fn sibling(&mut self) -> &mut Self::Sibling {
         &mut self.sibling
+    }
+}
+
+pub struct ByteFrameTransport<S> {
+    stream: S,
+    max_frame_bytes: usize,
+}
+
+impl<S> ByteFrameTransport<S> {
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream,
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+        }
+    }
+
+    pub fn with_max_frame_bytes(stream: S, max_frame_bytes: usize) -> Self {
+        Self {
+            stream,
+            max_frame_bytes,
+        }
+    }
+
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+}
+
+impl<S: ByteIo> MpcTransport for ByteFrameTransport<S> {
+    async fn send(&mut self, frame: MpcFrame) -> Result<()> {
+        let bytes = frame
+            .encode_to_vec()
+            .map_err(|err| RunnerError::Frame(err.to_string()))?;
+        if bytes.len() > self.max_frame_bytes {
+            return Err(RunnerError::FrameTooLarge {
+                len: bytes.len(),
+                max: self.max_frame_bytes,
+            });
+        }
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| RunnerError::Frame(err_frame_too_large(bytes.len())))?;
+        self.stream.send_data(&len.to_le_bytes()).await?;
+        self.stream.send_data(&bytes).await?;
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<MpcFrame> {
+        let len = self.stream.recv_data(4).await?;
+        let len = u32::from_le_bytes(len.as_slice().try_into().expect("length prefix is 4 bytes"))
+            as usize;
+        if len > self.max_frame_bytes {
+            return Err(RunnerError::FrameTooLarge {
+                len,
+                max: self.max_frame_bytes,
+            });
+        }
+        let bytes = self.stream.recv_data(len).await?;
+        MpcFrame::decode(&bytes).map_err(|err| RunnerError::Frame(err.to_string()))
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.stream.flush().await?;
+        Ok(())
     }
 }
 
@@ -205,11 +273,18 @@ fn map_core<T>(result: StepResult<T>) -> Result<T> {
     })
 }
 
+fn err_frame_too_large(len: usize) -> String {
+    format!("MPC frame length {len} does not fit in u32")
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum RunnerError {
     TransportClosed,
     InternalStateMissing,
+    Frame(String),
+    FrameTooLarge { len: usize, max: usize },
     Core(CoreError),
+    Wire(String),
 }
 
 impl fmt::Display for RunnerError {
@@ -217,16 +292,28 @@ impl fmt::Display for RunnerError {
         match self {
             Self::TransportClosed => write!(f, "MPC transport is closed"),
             Self::InternalStateMissing => write!(f, "MPC transport state is missing"),
+            Self::Frame(err) => write!(f, "bad MPC frame: {err}"),
+            Self::FrameTooLarge { len, max } => {
+                write!(f, "MPC frame is too large: {len} bytes > {max} bytes")
+            }
             Self::Core(err) => write!(f, "{err}"),
+            Self::Wire(err) => write!(f, "{err}"),
         }
     }
 }
 
 impl std::error::Error for RunnerError {}
 
+impl From<shachain2pc_emp_wire::WireError> for RunnerError {
+    fn from(value: shachain2pc_emp_wire::WireError) -> Self {
+        Self::Wire(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shachain2pc_emp_wire::ChannelByteStream;
     use shachain2pc_mpc_core::CoreError;
     use shachain2pc_mpc_types::MessageKind;
 
@@ -364,6 +451,67 @@ mod tests {
 
         alice_result.unwrap();
         bob_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn byte_frame_transport_runs_session_handshake() {
+        let (alice_main_tx, bob_main_rx) = mpsc::channel(8);
+        let (bob_main_tx, alice_main_rx) = mpsc::channel(8);
+        let (alice_sibling_tx, bob_sibling_rx) = mpsc::channel(8);
+        let (bob_sibling_tx, alice_sibling_rx) = mpsc::channel(8);
+
+        let mut alice = TransportPair {
+            main: ByteFrameTransport::new(ChannelByteStream::new(alice_main_tx, alice_main_rx)),
+            sibling: ByteFrameTransport::new(ChannelByteStream::new(
+                alice_sibling_tx,
+                alice_sibling_rx,
+            )),
+        };
+        let mut bob = TransportPair {
+            main: ByteFrameTransport::new(ChannelByteStream::new(bob_main_tx, bob_main_rx)),
+            sibling: ByteFrameTransport::new(ChannelByteStream::new(
+                bob_sibling_tx,
+                bob_sibling_rx,
+            )),
+        };
+        let job_id = b"byte-handshake".to_vec();
+        let alice_params = params();
+        let bob_params = alice_params.clone();
+        let alice_job_id = job_id.clone();
+
+        let (alice_result, bob_result) = tokio::join!(
+            async move {
+                run_session_handshake(&mut alice, alice_job_id, Role::Alice, alice_params).await
+            },
+            async move { run_session_handshake(&mut bob, job_id, Role::Bob, bob_params).await },
+        );
+
+        alice_result.unwrap();
+        bob_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn byte_frame_transport_rejects_oversized_frame() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut transport =
+            ByteFrameTransport::with_max_frame_bytes(ChannelByteStream::new(tx, rx), 8);
+        let err = transport
+            .send(frame(
+                b"job-d",
+                Role::Alice,
+                LogicalChannel::Main,
+                0,
+                b"this payload is too large",
+            ))
+            .await
+            .unwrap_err();
+        match err {
+            RunnerError::FrameTooLarge { len, max } => {
+                assert!(len > max);
+                assert_eq!(max, 8);
+            }
+            err => panic!("unexpected error: {err}"),
+        }
     }
 
     #[tokio::test]

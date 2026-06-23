@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use shachain2pc_circuit::generate_from_seed;
 use shachain2pc_emp_compat::{normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ChannelByteStream, BLOCK_BYTES};
+use shachain2pc_mpc_runner::{
+    run_session_handshake, ByteFrameTransport, RunnerSessionParams, TransportPair,
+};
 use shachain2pc_party::{
     reveal_node_job, run_party, run_precompute_path_with_streams, run_seed_root_job,
     Args as PartyArgs, IndexSpec, MpcTcpEndpoint, PartyOutput,
@@ -40,6 +43,7 @@ const DB_TAG_LEN: usize = 16;
 const DEFAULT_SSP_TARGET: u32 = 40;
 const DEFAULT_DELTA_CAP: u64 = 1u64 << 32;
 const PROTOCOL_VERSION: u32 = 1;
+const JOBSTREAM_SESSION_BINDING_DOMAIN: &[u8] = b"shachain2pc daemon JobStream precompute v1";
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -852,6 +856,14 @@ impl DaemonState {
         let job = self
             .begin_incoming_precompute_job(&descriptor, index)
             .await?;
+        streams =
+            match run_jobstream_session_handshake(self.role().await, &descriptor, streams).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    self.finish_job(&job.job_id, true).await;
+                    return Err(e);
+                }
+            };
         let nodes = match run_precompute_path_with_streams(
             &mut streams,
             self.role().await,
@@ -1155,6 +1167,14 @@ impl DaemonState {
                 return Err(e);
             }
         };
+        streams =
+            match run_jobstream_session_handshake(job.endpoint.role, &descriptor, streams).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    self.finish_job(&job.job_id, true).await;
+                    return Err(e);
+                }
+            };
         let nodes = match run_precompute_path_with_streams(
             &mut streams,
             job.endpoint.role,
@@ -1886,6 +1906,45 @@ fn validate_job_payload_context(frame: &pb::JobFrame, descriptor: &GrpcJobDescri
         && frame.ssp_target == descriptor.ssp_target
         && frame.delta_lifetime_checked_units_cap == descriptor.delta_lifetime_checked_units_cap
         && frame.digest.as_slice() == descriptor.digest
+}
+
+async fn run_jobstream_session_handshake(
+    role: Role,
+    descriptor: &GrpcJobDescriptor,
+    streams: Ag2pcStreams<ChannelByteStream>,
+) -> Result<Ag2pcStreams<ChannelByteStream>> {
+    let params = RunnerSessionParams::new(
+        descriptor.ssp,
+        descriptor.digest.to_vec(),
+        jobstream_session_binding(descriptor),
+    );
+    let mut framed = TransportPair {
+        main: ByteFrameTransport::new(streams.main),
+        sibling: ByteFrameTransport::new(streams.sibling),
+    };
+    run_session_handshake(
+        &mut framed,
+        descriptor.job_id.as_bytes().to_vec(),
+        role,
+        params,
+    )
+    .await
+    .map_err(|e| DaemonError::Refused(format!("JobStream session handshake failed: {e}")))?;
+    Ok(Ag2pcStreams {
+        main: framed.main.into_inner(),
+        sibling: framed.sibling.into_inner(),
+    })
+}
+
+fn jobstream_session_binding(descriptor: &GrpcJobDescriptor) -> Vec<u8> {
+    let mut out = Vec::with_capacity(JOBSTREAM_SESSION_BINDING_DOMAIN.len() + 8 + 8 + 4 + 8 + 4);
+    out.extend_from_slice(JOBSTREAM_SESSION_BINDING_DOMAIN);
+    out.extend_from_slice(&descriptor.channel_index.to_le_bytes());
+    out.extend_from_slice(&descriptor.target_index.to_le_bytes());
+    out.extend_from_slice(&descriptor.ssp_target.to_le_bytes());
+    out.extend_from_slice(&descriptor.delta_lifetime_checked_units_cap.to_le_bytes());
+    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out
 }
 
 fn job_frame(

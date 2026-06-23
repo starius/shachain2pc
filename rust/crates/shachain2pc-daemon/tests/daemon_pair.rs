@@ -84,15 +84,15 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
     pair.cli(&pair.bob_control, &["channel", "enable", "13"])
         .await;
 
-    let (alice_precompute, bob_precompute) = tokio::join!(
-        pair.cli(&pair.alice_control, &["precompute", "13", "1"]),
-        pair.cli(&pair.bob_control, &["precompute", "13", "1"])
-    );
+    let alice_precompute = pair
+        .cli(&pair.alice_control, &["precompute", "13", "1"])
+        .await;
     assert!(alice_precompute.contains("nodes=1"), "{alice_precompute}");
     assert!(alice_precompute.contains("checked=1"), "{alice_precompute}");
-    assert!(bob_precompute.contains("nodes=1"), "{bob_precompute}");
-    let channels = pair.cli(&pair.alice_control, &["channels"]).await;
-    assert!(channels.contains("frontier=1"), "{channels}");
+    let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
+    assert!(alice_channels.contains("frontier=1"), "{alice_channels}");
+    assert!(bob_channels.contains("frontier=1"), "{bob_channels}");
 
     let expected =
         reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 13, Index48::new(1).unwrap());
@@ -158,7 +158,7 @@ async fn daemon_pair_background_precomputes_to_shared_target() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn daemon_pair_precomputes_two_channels_on_worker_ports() {
+async fn daemon_pair_precomputes_two_channels_over_jobstream() {
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["config", "workers", "2"])
         .await;
@@ -171,22 +171,25 @@ async fn daemon_pair_precomputes_two_channels_on_worker_ports() {
             .await;
     }
 
-    let (alice_20, bob_20, alice_21, bob_21) = tokio::join!(
+    let (alice_20, alice_21) = tokio::join!(
         pair.cli(&pair.alice_control, &["precompute", "20", "1"]),
-        pair.cli(&pair.bob_control, &["precompute", "20", "1"]),
-        pair.cli(&pair.alice_control, &["precompute", "21", "1"]),
-        pair.cli(&pair.bob_control, &["precompute", "21", "1"])
+        pair.cli(&pair.alice_control, &["precompute", "21", "1"])
     );
-    for output in [alice_20, bob_20, alice_21, bob_21] {
+    for output in [alice_20, alice_21] {
         assert!(output.contains("nodes=1"), "{output}");
         assert!(output.contains("checked=1"), "{output}");
     }
 
     let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
     assert_channel_contains(&alice_channels, 20, "frontier=1");
     assert_channel_contains(&alice_channels, 21, "frontier=1");
     assert_channel_contains(&alice_channels, 20, "attempted=1");
     assert_channel_contains(&alice_channels, 21, "attempted=1");
+    assert_channel_contains(&bob_channels, 20, "frontier=1");
+    assert_channel_contains(&bob_channels, 21, "frontier=1");
+    assert_channel_contains(&bob_channels, 20, "attempted=1");
+    assert_channel_contains(&bob_channels, 21, "attempted=1");
     pair.stop().await;
 }
 

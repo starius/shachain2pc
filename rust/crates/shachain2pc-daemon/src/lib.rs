@@ -13,8 +13,8 @@ use shachain2pc_circuit::generate_from_seed;
 use shachain2pc_emp_compat::{normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 use shachain2pc_party::{
-    reveal_node_job, run_party, run_precompute_path_job, run_precompute_path_with_streams,
-    run_seed_root_job, Args as PartyArgs, IndexSpec, MpcTcpEndpoint, PartyOutput,
+    reveal_node_job, run_party, run_precompute_path_with_streams, run_seed_root_job,
+    Args as PartyArgs, IndexSpec, MpcTcpEndpoint, PartyOutput,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -204,7 +204,6 @@ struct JobRecord {
     kind: String,
     state: String,
     planned_checked_units: u64,
-    worker_slot: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1176,88 +1175,8 @@ impl DaemonState {
         channel_index: u64,
         target_index: u64,
     ) -> Result<pb::PrecomputeResponse> {
-        let index = Index48::new(target_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
-        let peer = match self.peer_frontier(channel_index).await {
-            Ok(Some(peer)) => {
-                if !peer.channel_enabled {
-                    return Err(DaemonError::Refused(
-                        "peer has not enabled this channel".to_owned(),
-                    ));
-                }
-                Some(peer)
-            }
-            Ok(None) => None,
-            Err(e) => return Err(e),
-        };
-        let job = match self
-            .begin_precompute_job(channel_index, index, peer)
-            .await?
-        {
-            PrecomputeStart::AlreadyStored => {
-                return Ok(pb::PrecomputeResponse {
-                    channel_index,
-                    target_index: index.get(),
-                    nodes_stored: 0,
-                    checked_units: 0,
-                });
-            }
-            PrecomputeStart::Run(job) => job,
-        };
-        if let Some(peer) = peer {
-            if let Err(e) = self
-                .validate_peer_security_params(channel_index, peer)
-                .await
-            {
-                self.finish_job(&job.job_id, true).await;
-                return Err(e);
-            }
-        }
-        if let Err(e) = self.reconcile_with_peer(channel_index).await {
-            self.finish_job(&job.job_id, true).await;
-            return Err(e);
-        }
-        let digest = job_digest(
-            channel_index,
-            "precompute-path",
-            0,
-            index.get(),
-            job.ssp as u32,
-        );
-        let nodes = match run_precompute_path_job(
-            job.endpoint,
-            job.share,
-            index,
-            job.delta,
-            digest,
-            job.ssp,
-        )
-        .await
-        {
-            Ok(nodes) => nodes,
-            Err(e) => {
-                self.finish_job(&job.job_id, true).await;
-                return Err(e.into());
-            }
-        };
-        let nodes_stored = nodes.len() as u64;
-        if let Err(e) = self
-            .store_precomputed_nodes_and_finish_job(
-                channel_index,
-                &job.job_id,
-                job.planned_checked_units,
-                nodes,
-            )
+        self.precompute_path_jobstream(channel_index, target_index)
             .await
-        {
-            self.finish_job(&job.job_id, true).await;
-            return Err(e);
-        }
-        Ok(pb::PrecomputeResponse {
-            channel_index,
-            target_index: index.get(),
-            nodes_stored,
-            checked_units: job.planned_checked_units,
-        })
     }
 
     async fn precompute_path_jobstream(
@@ -1279,6 +1198,15 @@ impl DaemonState {
                 ))
             }
         };
+        if let Err(e) = self
+            .validate_peer_security_params(channel_index, peer)
+            .await
+        {
+            let planned_checked_units = set_bits_desc(index.get()).len() as u64;
+            self.record_failed_precompute_attempt(channel_index, planned_checked_units)
+                .await?;
+            return Err(e);
+        }
         let job = match self
             .begin_precompute_jobstream(channel_index, index, peer)
             .await?
@@ -1470,131 +1398,12 @@ impl DaemonState {
         Ok((endpoint, delta, ssp))
     }
 
-    async fn begin_precompute_job(
-        &self,
-        channel_index: u64,
-        index: Index48,
-        peer: Option<PeerFrontierConfig>,
-    ) -> Result<PrecomputeStart> {
-        let planned_checked_units = set_bits_desc(index.get()).len() as u64;
-        let mut inner = self.inner.lock().await;
-        let key = channel_key(channel_index);
-        let key_node = node_key(index.get());
-        let channel = inner
-            .db
-            .channels
-            .get(&key)
-            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
-        if !channel.enabled {
-            return Err(DaemonError::Refused("channel is disabled".to_owned()));
-        }
-        let (public, local) = binding_pair(&inner, channel_index, index.get());
-        if channel.frontier_nodes.get(&key_node).is_some_and(|record| {
-            record.public_binding_hex == to_hex(&public)
-                && record.local_binding_hex == to_hex(&local)
-        }) {
-            return Ok(PrecomputeStart::AlreadyStored);
-        }
-        if inner
-            .active_jobs
-            .values()
-            .any(|job| job.channel_index == channel_index)
-        {
-            return Err(DaemonError::Refused(
-                "channel already has an active precompute job".to_owned(),
-            ));
-        }
-        let peer_workers = peer.map_or(inner.cfg.workers, |peer| peer.workers);
-        let worker_count =
-            effective_precompute_workers(inner.cfg.mpc_port, inner.cfg.workers, peer_workers);
-        if worker_count == 0 {
-            return Err(DaemonError::Refused(
-                "no precompute worker port is available".to_owned(),
-            ));
-        }
-        let worker_slot = precompute_worker_slot(channel_index, index.get(), worker_count);
-        if inner
-            .active_jobs
-            .values()
-            .any(|job| job.worker_slot == worker_slot)
-        {
-            return Err(DaemonError::Refused(format!(
-                "precompute worker slot {worker_slot} is busy"
-            )));
-        }
-        let port = precompute_worker_port(inner.cfg.mpc_port, worker_slot)?;
-        let reserved: u64 = inner
-            .active_jobs
-            .values()
-            .filter(|job| job.channel_index == channel_index)
-            .map(|job| job.planned_checked_units)
-            .sum();
-        let used = channel
-            .estimated_checked_units
-            .saturating_add(reserved)
-            .saturating_add(planned_checked_units);
-        if used > channel.delta_lifetime_checked_units_cap {
-            return Err(DaemonError::Refused(format!(
-                "precompute would exceed Delta lifetime checked-unit cap: estimated={} reserved={} requested={} cap={}",
-                channel.estimated_checked_units,
-                reserved,
-                planned_checked_units,
-                channel.delta_lifetime_checked_units_cap
-            )));
-        }
-        let peer_ip = inner
-            .cfg
-            .peer_url
-            .as_deref()
-            .and_then(peer_ip_from_url)
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let endpoint = MpcTcpEndpoint {
-            role: inner.cfg.role,
-            port,
-            peer_ip,
-        };
-        let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
-        let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
-        let share = channel_seed_share(&inner.master_secret.0, channel_index);
-        let channel = inner
-            .db
-            .channels
-            .get_mut(&key)
-            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
-        channel.attempted_checked_units = channel
-            .attempted_checked_units
-            .saturating_add(planned_checked_units);
-        inner.next_job_id = inner.next_job_id.saturating_add(1);
-        let job_id = format!("precompute-{}-{}", channel_index, inner.next_job_id);
-        inner.active_jobs.insert(
-            job_id.clone(),
-            JobRecord {
-                channel_index,
-                kind: "precompute".to_owned(),
-                state: format!("target={} slot={} port={}", index.get(), worker_slot, port),
-                planned_checked_units,
-                worker_slot,
-            },
-        );
-        inner.save()?;
-        Ok(PrecomputeStart::Run(PrecomputeJob {
-            job_id,
-            endpoint,
-            delta,
-            ssp,
-            share,
-            planned_checked_units,
-        }))
-    }
-
     async fn begin_precompute_jobstream(
         &self,
         channel_index: u64,
         index: Index48,
         peer: PeerFrontierConfig,
     ) -> Result<PrecomputeStart> {
-        self.validate_peer_security_params(channel_index, peer)
-            .await?;
         let planned_checked_units = set_bits_desc(index.get()).len() as u64;
         let mut inner = self.inner.lock().await;
         let key = channel_key(channel_index);
@@ -1674,7 +1483,6 @@ impl DaemonState {
                 kind: "precompute".to_owned(),
                 state: format!("grpc target={}", index.get()),
                 planned_checked_units,
-                worker_slot: u32::MAX,
             },
         );
         inner.save()?;
@@ -1690,6 +1498,24 @@ impl DaemonState {
             share,
             planned_checked_units,
         }))
+    }
+
+    async fn record_failed_precompute_attempt(
+        &self,
+        channel_index: u64,
+        planned_checked_units: u64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let channel = inner
+            .db
+            .channels
+            .get_mut(&channel_key(channel_index))
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        channel.attempted_checked_units = channel
+            .attempted_checked_units
+            .saturating_add(planned_checked_units);
+        channel.failed_precompute_jobs = channel.failed_precompute_jobs.saturating_add(1);
+        inner.save()
     }
 
     async fn begin_incoming_precompute_job(
@@ -1771,7 +1597,6 @@ impl DaemonState {
                 kind: "precompute".to_owned(),
                 state: format!("grpc target={}", index.get()),
                 planned_checked_units,
-                worker_slot: u32::MAX,
             },
         );
         inner.save()?;
@@ -2234,26 +2059,6 @@ fn ssp_effective(ssp_target: u32, cap: u64) -> usize {
         u64::BITS - (cap - 1).leading_zeros()
     };
     (ssp_target + cap_log) as usize
-}
-
-fn effective_precompute_workers(base_port: u16, local_workers: u32, peer_workers: u32) -> u32 {
-    let available_ports = u16::MAX as u32 - base_port as u32;
-    local_workers.min(peer_workers).min(available_ports)
-}
-
-fn precompute_worker_slot(channel_index: u64, target_index: u64, worker_count: u32) -> u32 {
-    debug_assert!(worker_count > 0);
-    ((channel_index ^ target_index) % worker_count as u64) as u32
-}
-
-fn precompute_worker_port(base_port: u16, worker_slot: u32) -> Result<u16> {
-    let port = base_port as u32 + 1 + worker_slot;
-    if port > u16::MAX as u32 {
-        return Err(DaemonError::Refused(
-            "precompute worker port exceeds 65535".to_owned(),
-        ));
-    }
-    Ok(port as u16)
 }
 
 fn set_bits_desc(value: u64) -> Vec<usize> {

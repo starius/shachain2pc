@@ -15,8 +15,8 @@ use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 pub use shachain2pc_mpc_core::{
     cggm_bit_reverse, cggm_build_sender, cggm_eval_receiver, sfvole_receiver_butterfly,
-    sfvole_sender_butterfly, AShareBundle, Prg, Prp, SoftSpoken4State, SOFTSPOKEN_CHUNK_BLOCKS,
-    SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_Q,
+    sfvole_sender_butterfly, AShareBundle, Ag2pcTriplePoolState, Prg, Prp, SoftSpoken4State,
+    SOFTSPOKEN_CHUNK_BLOCKS, SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_Q,
 };
 use shachain2pc_mpc_core::{
     finalize_input_open, reveal_local_share, reveal_recipient_bits, verify_share_relation,
@@ -838,12 +838,23 @@ impl Drop for Ag2pcSecureWires {
 }
 
 pub struct Ag2pcTriplePool {
-    party: Role,
-    ssp: usize,
+    state: Ag2pcTriplePoolState,
     abit1: SoftSpoken4,
     abit2: SoftSpoken4,
-    delta: Block,
-    cots_minted_since_check: bool,
+}
+
+impl ops::Deref for Ag2pcTriplePool {
+    type Target = Ag2pcTriplePoolState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl ops::DerefMut for Ag2pcTriplePool {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 pub struct Ag2pcProtocol {
@@ -2320,12 +2331,9 @@ impl Ag2pcTriplePool {
 
         let delta = normalize_ag2pc_delta(party, delta);
         let mut out = Self {
-            party,
-            ssp,
+            state: Ag2pcTriplePoolState::new(party, ssp, delta),
             abit1: SoftSpoken4::new_with_delta(Role::Alice, true, delta)?,
             abit2: SoftSpoken4::new(Role::Bob, true)?,
-            delta,
-            cots_minted_since_check: false,
         };
         out.begin_abits(streams).await?;
         Ok(out)
@@ -2341,16 +2349,6 @@ impl Ag2pcTriplePool {
 
     pub fn ssp(&self) -> usize {
         self.ssp
-    }
-
-    pub fn get_bucket_size(&self, size: usize) -> usize {
-        let size = size.max(1024);
-        let log2_l = (size as f64).log2();
-        let mut bucket = 2usize;
-        while log2_l * ((bucket - 1) as f64) <= self.ssp as f64 {
-            bucket += 1;
-        }
-        bucket
     }
 
     pub async fn draw<S: TranscriptIo>(
@@ -2471,7 +2469,7 @@ impl Ag2pcTriplePool {
         &mut self,
         streams: &mut Ag2pcStreams<S>,
     ) -> Result<()> {
-        if self.cots_minted_since_check {
+        if self.should_flush_cot_check() {
             self.flush_cot_check(streams).await?;
         }
         Ok(())
@@ -2481,13 +2479,13 @@ impl Ag2pcTriplePool {
         &mut self,
         streams: &mut Ag2pcStreams<S>,
     ) -> Result<()> {
-        self.cots_minted_since_check = false;
+        self.mark_cot_check_flushed();
         self.end_abits(streams).await?;
         self.begin_abits(streams).await
     }
 
     pub async fn end<S: TranscriptIo>(&mut self, streams: &mut Ag2pcStreams<S>) -> Result<()> {
-        self.cots_minted_since_check = false;
+        self.mark_cot_check_flushed();
         self.end_abits(streams).await
     }
 
@@ -2496,7 +2494,7 @@ impl Ag2pcTriplePool {
         streams: &mut Ag2pcStreams<S>,
         count: usize,
     ) -> Result<(Vec<Block>, Vec<Block>)> {
-        self.cots_minted_since_check = true;
+        self.mark_cots_minted();
         match self.party {
             Role::Alice => {
                 let (key, mac) = tokio::try_join!(
@@ -2767,12 +2765,6 @@ impl Ag2pcTriplePool {
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for Ag2pcTriplePool {
-    fn drop(&mut self) {
-        self.delta.zeroize();
     }
 }
 

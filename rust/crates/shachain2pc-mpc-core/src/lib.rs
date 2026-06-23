@@ -34,6 +34,52 @@ impl Zeroize for AShareBundle {
     }
 }
 
+pub struct Ag2pcTriplePoolState {
+    pub party: Role,
+    pub ssp: usize,
+    pub delta: Block,
+    pub cots_minted_since_check: bool,
+}
+
+impl Ag2pcTriplePoolState {
+    pub fn new(party: Role, ssp: usize, delta: Block) -> Self {
+        Self {
+            party,
+            ssp,
+            delta,
+            cots_minted_since_check: false,
+        }
+    }
+
+    pub fn get_bucket_size(&self, size: usize) -> usize {
+        let size = size.max(1024);
+        let log2_l = (size as f64).log2();
+        let mut bucket = 2usize;
+        while log2_l * ((bucket - 1) as f64) <= self.ssp as f64 {
+            bucket += 1;
+        }
+        bucket
+    }
+
+    pub fn mark_cots_minted(&mut self) {
+        self.cots_minted_since_check = true;
+    }
+
+    pub fn should_flush_cot_check(&self) -> bool {
+        self.cots_minted_since_check
+    }
+
+    pub fn mark_cot_check_flushed(&mut self) {
+        self.cots_minted_since_check = false;
+    }
+}
+
+impl Drop for Ag2pcTriplePoolState {
+    fn drop(&mut self) {
+        self.delta.zeroize();
+    }
+}
+
 pub struct Prp {
     cipher: Aes128,
 }

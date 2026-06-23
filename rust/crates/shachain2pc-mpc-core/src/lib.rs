@@ -145,6 +145,9 @@ pub const SOFTSPOKEN_PPRF_CHECK_HIGH: u64 = 0x7050_5246_434b_5f00;
 pub enum SoftSpokenStateError {
     BadDeltaRole,
     MaliciousCheckMismatch,
+    PprfBufferLength { expected: usize, actual: usize },
+    PprfDigestLength { expected: usize, actual: usize },
+    PprfCheckMismatch,
 }
 
 impl fmt::Display for SoftSpokenStateError {
@@ -155,6 +158,15 @@ impl fmt::Display for SoftSpokenStateError {
                 "SoftSpoken delta can only be set before Alice setup starts"
             ),
             Self::MaliciousCheckMismatch => write!(f, "SoftSpoken malicious check mismatch"),
+            Self::PprfBufferLength { expected, actual } => write!(
+                f,
+                "SoftSpoken PPRF buffer length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::PprfDigestLength { expected, actual } => write!(
+                f,
+                "SoftSpoken PPRF digest length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::PprfCheckMismatch => write!(f, "SoftSpoken PPRF check mismatch"),
         }
     }
 }
@@ -275,6 +287,76 @@ impl SoftSpoken4State {
 
     pub fn recv_check_blocks(&self) -> (Block, Block) {
         (self.check_x, self.check_t)
+    }
+
+    pub fn pprf_check_send_prepare(&mut self) -> (Vec<Block>, [u8; REVEAL_DIGEST_BYTES]) {
+        let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
+        let mut t_buf = vec![Block::zero(); SOFTSPOKEN_N * 2];
+        let mut hash = Sha256::new();
+        for i in 0..SOFTSPOKEN_N {
+            let base = i * SOFTSPOKEN_Q;
+            let mut tx = Block::zero();
+            let mut ty = Block::zero();
+            for y in 0..SOFTSPOKEN_Q {
+                let exp = aes_dm_3(&check_key, self.leaves_send[base + y]);
+                self.leaves_send[base + y] = exp[0];
+                tx = tx.xor(exp[1]);
+                ty = ty.xor(exp[2]);
+                hash.update(exp[1].as_bytes());
+                hash.update(exp[2].as_bytes());
+            }
+            t_buf[i * 2] = tx;
+            t_buf[i * 2 + 1] = ty;
+        }
+        (t_buf, hash.finalize().into())
+    }
+
+    pub fn pprf_check_recv_verify(
+        &mut self,
+        t_buf: &[Block],
+        their_digest: &[u8],
+    ) -> Result<(), SoftSpokenStateError> {
+        if t_buf.len() != SOFTSPOKEN_N * 2 {
+            return Err(SoftSpokenStateError::PprfBufferLength {
+                expected: SOFTSPOKEN_N * 2,
+                actual: t_buf.len(),
+            });
+        }
+        if their_digest.len() != REVEAL_DIGEST_BYTES {
+            return Err(SoftSpokenStateError::PprfDigestLength {
+                expected: REVEAL_DIGEST_BYTES,
+                actual: their_digest.len(),
+            });
+        }
+
+        let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
+        let mut hash = Sha256::new();
+        let mut s_buf = vec![Block::zero(); SOFTSPOKEN_Q * 2];
+        for i in 0..SOFTSPOKEN_N {
+            let base = i * SOFTSPOKEN_Q;
+            let mut tx = Block::zero();
+            let mut ty = Block::zero();
+            for y in 0..SOFTSPOKEN_Q {
+                if y == self.alphas[i] {
+                    continue;
+                }
+                let exp = aes_dm_3(&check_key, self.leaves_recv[base + y]);
+                self.leaves_recv[base + y] = exp[0];
+                s_buf[y * 2] = exp[1];
+                s_buf[y * 2 + 1] = exp[2];
+                tx = tx.xor(exp[1]);
+                ty = ty.xor(exp[2]);
+            }
+            s_buf[self.alphas[i] * 2] = t_buf[i * 2].xor(tx);
+            s_buf[self.alphas[i] * 2 + 1] = t_buf[i * 2 + 1].xor(ty);
+            for block in &s_buf {
+                hash.update(block.as_bytes());
+            }
+        }
+        if hash.finalize().as_slice() != their_digest {
+            return Err(SoftSpokenStateError::PprfCheckMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -559,6 +641,19 @@ impl Mitccrh8 {
 fn mitccrh_apply(key: &Prp, block: Block, cir: bool) -> Block {
     let input = if cir { block.sigma() } else { block };
     key.permute_one(input).xor(input)
+}
+
+fn aes_dm(key: &Prp, counter: u64, tweak: Block) -> Block {
+    let pt = Block::make(0, counter).xor(tweak);
+    key.permute_one(pt).xor(pt)
+}
+
+fn aes_dm_3(key: &Prp, tweak: Block) -> [Block; 3] {
+    [
+        aes_dm(key, 0, tweak),
+        aes_dm(key, 1, tweak),
+        aes_dm(key, 2, tweak),
+    ]
 }
 
 fn block_to_bools(block: Block) -> [bool; 128] {

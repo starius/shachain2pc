@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Server;
+use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status, Streaming};
 use zeroize::Zeroize;
 
@@ -146,6 +146,7 @@ impl DaemonHandle {
 pub struct DaemonState {
     inner: Arc<Mutex<Inner>>,
     grpc_jobs: Arc<Mutex<BTreeMap<String, PendingGrpcJob>>>,
+    peer_channel: Option<Channel>,
 }
 
 struct Inner {
@@ -375,6 +376,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
     }
     let (store, db) = EncryptedStore::open(cfg.db_path.clone(), &master_secret)?;
     let cookie = load_or_create_cookie(&cfg)?;
+    let peer_channel = peer_channel_from_url(&cfg.peer_url)?;
     Ok(DaemonState {
         inner: Arc::new(Mutex::new(Inner {
             cfg,
@@ -386,6 +388,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             next_job_id: 0,
         })),
         grpc_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        peer_channel,
     })
 }
 
@@ -733,7 +736,7 @@ async fn open_peer_job_stream(
 }
 
 async fn open_peer_job_channel(
-    peer_url: &str,
+    peer_channel: Channel,
     descriptor: &GrpcJobDescriptor,
     channel: u32,
 ) -> Result<ChannelByteStream> {
@@ -744,8 +747,7 @@ async fn open_peer_job_channel(
         .send(job_frame(descriptor, channel, true, Vec::new()))
         .await
         .map_err(|_| DaemonError::Refused("JobStream request channel closed".to_owned()))?;
-    let mut client =
-        pb::peer_service_client::PeerServiceClient::connect(peer_url.to_owned()).await?;
+    let mut client = pb::peer_service_client::PeerServiceClient::new(peer_channel);
     let response = client
         .job_stream(ReceiverStream::new(request_rx))
         .await?
@@ -881,10 +883,11 @@ impl DaemonState {
             }
         };
         if let Err(e) = self
-            .store_precomputed_nodes_and_finish_job(
+            .store_precomputed_target_and_finish_job(
                 descriptor.channel_index,
                 &job.job_id,
                 job.planned_checked_units,
+                index.get(),
                 nodes,
             )
             .await
@@ -1191,19 +1194,22 @@ impl DaemonState {
                 return Err(e.into());
             }
         };
-        let nodes_stored = nodes.len() as u64;
-        if let Err(e) = self
-            .store_precomputed_nodes_and_finish_job(
+        let nodes_stored = match self
+            .store_precomputed_target_and_finish_job(
                 channel_index,
                 &job.job_id,
                 job.planned_checked_units,
+                index.get(),
                 nodes,
             )
             .await
         {
-            self.finish_job(&job.job_id, true).await;
-            return Err(e);
-        }
+            Ok(nodes_stored) => nodes_stored,
+            Err(e) => {
+                self.finish_job(&job.job_id, true).await;
+                return Err(e);
+            }
+        };
         Ok(pb::PrecomputeResponse {
             channel_index,
             target_index: index.get(),
@@ -1563,13 +1569,12 @@ impl DaemonState {
         &self,
         descriptor: &GrpcJobDescriptor,
     ) -> Result<Ag2pcStreams<ChannelByteStream>> {
-        let peer_url = {
-            let inner = self.inner.lock().await;
-            inner.cfg.peer_url.clone()
-        }
-        .ok_or_else(|| DaemonError::Refused("peer URL is not configured".to_owned()))?;
-        let main = open_peer_job_channel(&peer_url, descriptor, 1).await?;
-        let sibling = open_peer_job_channel(&peer_url, descriptor, 2).await?;
+        let peer_channel = self
+            .peer_channel
+            .clone()
+            .ok_or_else(|| DaemonError::Refused("peer URL is not configured".to_owned()))?;
+        let main = open_peer_job_channel(peer_channel.clone(), descriptor, 1).await?;
+        let sibling = open_peer_job_channel(peer_channel, descriptor, 2).await?;
         Ok(Ag2pcStreams { main, sibling })
     }
 
@@ -1619,38 +1624,43 @@ impl DaemonState {
         inner.save()
     }
 
-    async fn store_precomputed_nodes_and_finish_job(
+    async fn store_precomputed_target_and_finish_job(
         &self,
         channel_index: u64,
         job_id: &str,
         planned_checked_units: u64,
+        target_mask: u64,
         nodes: Vec<(u64, Ag2pcSecureWires)>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let Some((_mask, wires)) = nodes.into_iter().find(|(mask, _)| *mask == target_mask) else {
+            return Err(DaemonError::Crypto(format!(
+                "precompute did not return target node {target_mask}"
+            )));
+        };
         let mut inner = self.inner.lock().await;
         let key = channel_key(channel_index);
-        for (mask, wires) in nodes {
-            let (public, local) = binding_pair(&inner, channel_index, mask);
-            let channel = inner
-                .db
-                .channels
-                .get_mut(&key)
-                .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
-            channel.frontier_nodes.insert(
-                node_key(mask),
-                WireRecord {
-                    public_binding_hex: to_hex(&public),
-                    local_binding_hex: to_hex(&local),
-                    wires: SerializableWires::from_secure_wires(&wires),
-                },
-            );
-        }
+        let (public, local) = binding_pair(&inner, channel_index, target_mask);
+        let channel = inner
+            .db
+            .channels
+            .get_mut(&key)
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        channel.frontier_nodes.insert(
+            node_key(target_mask),
+            WireRecord {
+                public_binding_hex: to_hex(&public),
+                local_binding_hex: to_hex(&local),
+                wires: SerializableWires::from_secure_wires(&wires),
+            },
+        );
         if let Some(channel) = inner.db.channels.get_mut(&key) {
             channel.estimated_checked_units = channel
                 .estimated_checked_units
                 .saturating_add(planned_checked_units);
         }
         inner.active_jobs.remove(job_id);
-        inner.save()
+        inner.save()?;
+        Ok(1)
     }
 
     async fn peer_frontier(&self, channel_index: u64) -> Result<Option<PeerFrontierConfig>> {
@@ -1664,14 +1674,10 @@ impl DaemonState {
         &self,
         channel_index: u64,
     ) -> Result<Option<(pb::GetFrontierResponse, PeerFrontierConfig)>> {
-        let peer_url = {
-            let inner = self.inner.lock().await;
-            inner.cfg.peer_url.clone()
-        };
-        let Some(peer_url) = peer_url else {
+        let Some(peer_channel) = self.peer_channel.clone() else {
             return Ok(None);
         };
-        let mut client = pb::peer_service_client::PeerServiceClient::connect(peer_url).await?;
+        let mut client = pb::peer_service_client::PeerServiceClient::new(peer_channel);
         let response = client
             .get_frontier(pb::GetFrontierRequest { channel_index })
             .await?
@@ -2020,6 +2026,15 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
+}
+
+fn peer_channel_from_url(peer_url: &Option<String>) -> Result<Option<Channel>> {
+    let Some(peer_url) = peer_url else {
+        return Ok(None);
+    };
+    let endpoint = Endpoint::from_shared(peer_url.clone())
+        .map_err(|e| DaemonError::Parse(format!("bad peer URL: {e}")))?;
+    Ok(Some(endpoint.connect_lazy()))
 }
 
 fn info_with_u64(prefix: &[u8], value: u64) -> Vec<u8> {

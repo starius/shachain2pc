@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use shachain2pc_types::Role;
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -260,6 +261,79 @@ pub fn decode_partial_blocks(bytes: &[u8], partial_bytes: usize) -> Result<Vec<B
     Ok(out)
 }
 
+pub trait ByteIo: Send {
+    fn send_data<'a>(&'a mut self, data: &'a [u8]) -> impl Future<Output = Result<()>> + Send + 'a;
+
+    fn recv_data(&mut self, len: usize) -> impl Future<Output = Result<Vec<u8>>> + Send + '_;
+
+    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send + '_;
+
+    fn send_block<'a>(
+        &'a mut self,
+        blocks: &'a [Block],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        async move { self.send_data(Block::slice_as_bytes(blocks)).await }
+    }
+
+    fn recv_block(&mut self, count: usize) -> impl Future<Output = Result<Vec<Block>>> + Send + '_ {
+        async move {
+            let bytes = self.recv_data(count * BLOCK_BYTES).await?;
+            let mut out = Vec::with_capacity(count);
+            for chunk in bytes.chunks_exact(BLOCK_BYTES) {
+                let mut block = [0u8; BLOCK_BYTES];
+                block.copy_from_slice(chunk);
+                out.push(Block::from_bytes(block));
+            }
+            Ok(out)
+        }
+    }
+
+    fn send_bool_bytes<'a>(
+        &'a mut self,
+        bool_bytes: &'a [u8],
+        ptr_mod8: usize,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        async move {
+            let packed = pack_emp_bools(bool_bytes, ptr_mod8)?;
+            self.send_data(&packed).await
+        }
+    }
+
+    fn recv_bool_bytes(
+        &mut self,
+        length: usize,
+        ptr_mod8: usize,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send + '_ {
+        async move {
+            let wire_len = emp_bool_wire_len(length, ptr_mod8)?;
+            let encoded = self.recv_data(wire_len).await?;
+            unpack_emp_bools(&encoded, length, ptr_mod8)
+        }
+    }
+
+    fn send_partial_blocks<'a>(
+        &'a mut self,
+        blocks: &'a [Block],
+        partial_bytes: usize,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        async move {
+            let bytes = encode_partial_blocks(blocks, partial_bytes)?;
+            self.send_data(&bytes).await
+        }
+    }
+
+    fn recv_partial_blocks(
+        &mut self,
+        count: usize,
+        partial_bytes: usize,
+    ) -> impl Future<Output = Result<Vec<Block>>> + Send + '_ {
+        async move {
+            let bytes = self.recv_data(count * partial_bytes).await?;
+            decode_partial_blocks(&bytes, partial_bytes)
+        }
+    }
+}
+
 pub struct EmpStream {
     stream: TcpStream,
     send_counter: u64,
@@ -444,6 +518,56 @@ impl EmpStream {
         validate_partial_bytes(partial_bytes)?;
         let bytes = self.recv_data(count * partial_bytes).await?;
         decode_partial_blocks(&bytes, partial_bytes)
+    }
+}
+
+impl ByteIo for EmpStream {
+    async fn send_data<'a>(&'a mut self, data: &'a [u8]) -> Result<()> {
+        EmpStream::send_data(self, data).await
+    }
+
+    async fn recv_data(&mut self, len: usize) -> Result<Vec<u8>> {
+        EmpStream::recv_data(self, len).await
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        EmpStream::flush(self).await
+    }
+
+    async fn send_block<'a>(&'a mut self, blocks: &'a [Block]) -> Result<()> {
+        EmpStream::send_block(self, blocks).await
+    }
+
+    async fn recv_block(&mut self, count: usize) -> Result<Vec<Block>> {
+        EmpStream::recv_block(self, count).await
+    }
+
+    async fn send_bool_bytes<'a>(
+        &'a mut self,
+        bool_bytes: &'a [u8],
+        ptr_mod8: usize,
+    ) -> Result<()> {
+        EmpStream::send_bool_bytes(self, bool_bytes, ptr_mod8).await
+    }
+
+    async fn recv_bool_bytes(&mut self, length: usize, ptr_mod8: usize) -> Result<Vec<u8>> {
+        EmpStream::recv_bool_bytes(self, length, ptr_mod8).await
+    }
+
+    async fn send_partial_blocks<'a>(
+        &'a mut self,
+        blocks: &'a [Block],
+        partial_bytes: usize,
+    ) -> Result<()> {
+        EmpStream::send_partial_blocks(self, blocks, partial_bytes).await
+    }
+
+    async fn recv_partial_blocks(
+        &mut self,
+        count: usize,
+        partial_bytes: usize,
+    ) -> Result<Vec<Block>> {
+        EmpStream::recv_partial_blocks(self, count, partial_bytes).await
     }
 }
 

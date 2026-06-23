@@ -142,6 +142,7 @@ async fn daemon_pair_background_precomputes_to_shared_target() {
         .await;
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
+    sleep(Duration::from_secs(1)).await;
 
     let expected =
         reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 15, Index48::new(1).unwrap());

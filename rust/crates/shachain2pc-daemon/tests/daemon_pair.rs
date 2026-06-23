@@ -420,6 +420,7 @@ impl DaemonPair {
         let _ = self.bob.kill().await;
         let _ = self.alice.wait().await;
         let _ = self.bob.wait().await;
+        sleep(Duration::from_millis(250)).await;
     }
 }
 

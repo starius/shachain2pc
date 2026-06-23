@@ -22,6 +22,13 @@ This report records the implementation state of the daemon and CLI work.
 - explicit and background path precompute for authenticated frontier nodes.
 - one shared tonic peer channel, cloned per RPC so control calls and each
   JobStream pair multiplex over one HTTP/2 connection.
+- optional peer mTLS for the daemon-to-daemon API. When configured, both the
+  peer server and client present the configured identity and validate the peer
+  against the configured CA and expected DNS name.
+- one live precompute AG2PC session per active channel. Target indices are sent
+  as authenticated in-band JobStream commands, so adjacent precomputes reuse the
+  labeled in-memory shachain frontier instead of re-authenticating the seed and
+  re-deriving shared prefixes while both parties remain up.
 
 ## Integration Coverage
 
@@ -43,6 +50,9 @@ with the real CLI. It verifies:
   recomputes the missing frontier state.
 - target-only precompute persistence for a multi-bit path, proving trunk and
   intermediate authenticated nodes are not written as durable frontier state.
+- live-session reuse across adjacent targets (`2` then `3`), proving the second
+  target costs one H rather than re-deriving the two-H path.
+- peer mTLS JobStream precompute.
 
 ## Frontier State
 
@@ -50,12 +60,16 @@ Persisted authenticated frontier nodes contain only `lambda` and the IT-MAC
 `mac/key` bundles. Labels are deliberately not serialized because garbled labels
 are session-local randomness.
 
-Path precompute opens one AG2PC session, authenticates the seed, computes the
-requested shachain path inside that same session, strips labels from the exact
-requested target node, and stores that authenticated leaf encrypted in the DB.
-The in-session walk may use trunk/intermediate nodes, but those nodes are not
-durable frontier state because they are neither revealable without exposing
-their subtree nor reusable as cross-session computation parents.
+Path precompute opens or reuses one live AG2PC session for the channel,
+authenticates the seed once for that session, computes requested targets inside
+that same session, strips labels from the exact requested target node, and
+stores that authenticated leaf encrypted in the DB.
+
+The live session keeps a compact labeled RAM cache with at most one node per
+shachain layer. Those labels and intermediate trunk nodes are not durable
+frontier state because they are session-local randomness and are not reusable
+after restart. The DB stores only exact requested leaves that can be revealed
+later.
 
 A later daemon process can reveal an exact persisted node because public reveal
 checks only the MAC/lambda authenticated value and does not need session-local
@@ -73,36 +87,35 @@ precompute attempts visible.
 
 If an exact persisted node is unavailable, nonzero reveal still falls back to
 the already verified full derivation path. This keeps the tool correct and
-fund-safe while import/re-label is not implemented. The current fallback uses a
-fresh one-shot AG2PC Delta, not the fixed per-channel Delta, so it does not
-consume the fixed-Delta lifetime cap. If the fallback is later changed to reuse
-the fixed channel Delta, it must reserve and account for the same checked-unit
-budget as precompute.
+fund-safe. The current fallback uses a fresh one-shot AG2PC Delta, not the fixed
+per-channel Delta, so it does not consume the fixed-Delta lifetime cap. If the
+fallback is later changed to reuse the fixed channel Delta, it must reserve and
+account for the same checked-unit budget as precompute.
 
-## Remaining Limitation
+## Restart Boundary
 
 A direct experiment that computed the seed root in one session, persisted the
 authenticated wires, then loaded them as the parent for a fresh one-H session
 failed the AG2PC equality check. This is expected: the persisted node has a
 Delta-bound MAC representation but no fresh-session garbled labels.
 
-Therefore persisted nodes are revealable after restart, but they are not yet
-usable as parents for further H applications after restart. Extending the
-frontier after a restart must re-warm from the seed root inside a new live
-session, or use a future import/re-label protocol that assigns fresh labels
-while binding them to the carried MAC without revealing the cleartext
-intermediate.
+Therefore persisted nodes are revealable after restart, but they are not used as
+parents for further H applications after restart. Extending the frontier after a
+restart starts a fresh live session and re-warms from the seed. This preserves
+fresh OT, garbling, leaky-AND, preprocessing, and label randomness and avoids
+the import/re-label protocol on the daemon's critical path.
+
+A future import/re-label protocol could avoid restart re-warm by assigning
+fresh labels to a persisted authenticated value while binding them to the
+carried MAC without revealing the cleartext intermediate. That remains a
+separate cryptographic optimization that needs human MPC review before
+implementation.
 
 Reconciliation uses the common subset of peer-visible frontier nodes. A local
 node whose peer-visible binding is absent or different on the peer is dropped
 before a new precompute job starts, so asymmetric frontier halves are regenerated
 jointly. The reveal MAC check remains the final correct-or-abort backstop if a
 mismatched authenticated value ever reaches reveal.
-
-Before enabling restart-resumed frontier extension, add a dedicated
-protocol/test that proves a persisted authenticated node can be consumed by a
-later job without equality-check failure and without revealing or re-inputting
-cleartext intermediates.
 
 ## Security Notes
 
@@ -129,5 +142,5 @@ cleartext intermediates.
 - The daemon no longer uses `mpc_port + 1 + n` worker ports. The configured
   `mpc_port` remains for the existing one-shot reveal/full-derivation paths and
   for the legacy C++-compatible `party` transport.
-- The local API currently uses loopback TCP plus a cookie. Peer API TLS/mTLS is
-  still a production hardening item from the plan.
+- The local API currently uses loopback TCP plus a cookie. Peer API mTLS is
+  available for daemon-to-daemon gRPC and is covered by integration tests.

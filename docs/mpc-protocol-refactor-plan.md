@@ -1,9 +1,10 @@
 # MPC Protocol Refactor Plan
 
 Status: implementation in progress. The transport seams, shared stream traits,
-heavy AG2PC extraction, and daemon JobStream precompute path are implemented;
-the remaining work is cleanup of old runner surfaces and later reviewed
-import/relabel frontier crypto.
+heavy AG2PC extraction, daemon JobStream precompute path, and live per-channel
+precompute sessions are implemented. The remaining work is cleanup of old
+runner surfaces and optional later import/relabel frontier crypto if restart
+extension without re-warm becomes worth the review cost.
 
 The goal is to separate the MPC protocol from its runner and concrete
 transport, following the pure-round style used in
@@ -30,7 +31,9 @@ raw TCP, and gRPC call the same protocol library.
 - Preserve current Rust/Rust performance within measurement noise before
   replacing daemon worker ports with gRPC JobStream.
 - Keep import/relabel frontier crypto parked behind its separate human review
-  gate. This refactor is transport/protocol plumbing, not new cryptography.
+  gate. Live per-channel sessions provide incremental precompute while both
+  parties stay up, so import/relabel is no longer on the daemon's critical path.
+  This refactor is transport/protocol plumbing, not new cryptography.
 
 ## Non-Goals
 
@@ -440,7 +443,8 @@ Keep:
 - `expected_next_index` remains outside the MPC core and inside daemon/channel
   authorization.
 - The import/relabel protocol is not part of this refactor and remains blocked
-  on human MPC review.
+  on human MPC review if it is ever pursued. The daemon instead keeps
+  session-local labels in RAM and re-warms with fresh randomness after restart.
 
 ## Review Gates
 
@@ -451,7 +455,9 @@ Keep:
    tests.
 5. `party` runner port passes Rust/Rust and C++/Rust cross-mode.
 6. JobStream daemon transport passes concurrent precompute integration tests.
-7. Old runner paths are removed only after all above gates pass.
+7. Live per-channel daemon sessions reuse authenticated in-memory frontier state
+   without persisting labels.
+8. Old runner paths are removed only after all above gates pass.
 
 ## Expected End State
 
@@ -461,7 +467,8 @@ The repository has one MPC protocol implementation:
 - pure state transitions in `mpc-core`;
 - async sequencing in `mpc-runner`;
 - `party` using `EmpCompatTransport` for C++ interop;
-- daemon using gRPC JobStream for parallel jobs;
+- daemon using gRPC JobStream for parallel jobs and live per-channel precompute
+  sessions;
 - no protocol logic hidden inside concrete socket reads/writes.
 
 This preserves the current correctness and C++ compatibility while giving the

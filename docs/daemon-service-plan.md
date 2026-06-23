@@ -68,7 +68,12 @@ state, scheduling, and control surfaces, so it must preserve these invariants:
   - revealed shachain secrets, which are durable DB state and are governed by
     normal shachain rules;
   - unrevealed authenticated frontier nodes, which are tied to the fixed
-    per-channel Delta and are stored encrypted in the DB.
+    per-channel Delta and are stored encrypted in the DB only when they are
+    exact revealable target leaves.
+- Session-local labeled trunk/intermediate nodes are RAM-only. A live
+  per-channel session may keep at most one labeled node per shachain layer for
+  in-process extension, but those labels and intermediates are not persisted and
+  are discarded on restart.
 - Unrevealed authenticated nodes are never converted into cleartext and re-input
   through normal private input.
 - Persisted authenticated nodes are valid only with the same channel, role,
@@ -78,10 +83,10 @@ state, scheduling, and control surfaces, so it must preserve these invariants:
 - Revealed secrets are inserted into the local shachain store using standard
   shachain rules: at most one known value per level, and older derivable secrets
   can be answered locally.
-- If a peer lacks an intermediate that we have, we must be able to discard ours
-  and jointly recompute from a common ancestor. Local cache asymmetry is not an
-  error, but unilateral catch-up is not possible for authenticated nodes because
-  fresh randomness will not recreate the same node.
+- If a peer lacks a durable target leaf that we have, we discard ours and
+  jointly recompute it. Local cache asymmetry is not an error, but unilateral
+  catch-up is not possible for authenticated nodes because fresh randomness will
+  not recreate the same node.
 - A reveal request must include the caller's expected next reveal index. The
   daemon DB is not the authority for the channel's reveal frontier.
 - A failed MPC job aborts that job and drops in-flight state. It must not reveal
@@ -353,13 +358,14 @@ There are two gRPC surfaces:
 1. Peer API: daemon-to-daemon, authenticated and encrypted.
 2. Local API: CLI-to-daemon, bound to loopback TCP in the first version.
 
-Use `tonic` initially. For peer transport, use mTLS or pinned peer certificates
-from the start. Unix domain sockets and Windows named pipes are deliberately
-deferred to avoid platform-specific transport work in the first daemon version.
-The daemon should keep one reusable tonic channel to its peer and clone it for
-RPCs. Tonic clones share the underlying HTTP/2 connection, so frontier queries
-and each job's `main`/`sibling` JobStream pair multiplex over one peer
-connection instead of reconnecting per operation.
+Use `tonic` initially. The implemented peer transport supports mTLS with a
+configured local identity, CA root, and expected peer DNS name. Unix domain
+sockets and Windows named pipes are deliberately deferred to avoid
+platform-specific transport work in the first daemon version. The daemon keeps
+one reusable tonic channel to its peer and clones it for RPCs. Tonic clones
+share the underlying HTTP/2 connection, so frontier queries and each channel
+session's `main`/`sibling` JobStream pair multiplex over one peer connection
+instead of reconnecting per operation.
 
 ### Peer API
 
@@ -386,11 +392,12 @@ protocol_version
 ```
 
 `JobStream` carries framed MPC messages plus job coordination frames. Use one
-pair of bidirectional streams per active job: one stream for AG2PC `main` and
-one stream for `sibling`. Do not multiplex all logical channels or all jobs onto
-one ordered stream, because chatty one-H jobs and opposite-direction AG2PC
-traffic can block each other behind stream-level ordering and undermine
-parallel workers.
+pair of bidirectional streams per live channel precompute session: one stream
+for AG2PC `main` and one for `sibling`. Target indices are sent as
+authenticated in-band commands over the live session. Do not multiplex the
+AG2PC `main` and `sibling` logical channels onto one ordered stream, because
+opposite-direction AG2PC traffic can block behind stream-level ordering and
+undermine progress.
 
 ```text
 StartJob(job_id, channel_index, node, priority, transcript_digest)
@@ -490,8 +497,9 @@ Eviction rules:
 - Foreground reveal can evict background work.
 - Lower-priority jobs are cancelled before starting new high-priority work.
 - Eviction cancels only the currently running `H`.
-- Completed revealed secrets remain persisted. Completed unrevealed
-  authenticated parents remain persisted in the encrypted frontier.
+- Completed revealed secrets remain persisted. Completed unrevealed target
+  leaves remain persisted in the encrypted frontier. Session-local
+  trunk/intermediate nodes stay in RAM only.
 - Cancelled jobs are safe to reschedule.
 - If local and peer authenticated frontier state disagrees, both parties choose
   the deepest common authenticated ancestor with matching bindings and jointly
@@ -506,8 +514,8 @@ Planning loop:
 3. For each enabled channel, compute desired frontier up to
    `effective_precompute`.
 4. Generate candidate one-H jobs from missing cache edges.
-5. Reserve RAM/workers for the highest-priority feasible jobs.
-6. Start jobs through `JobStream`.
+5. Reserve RAM/workers for the highest-priority feasible target.
+6. Start or reuse the channel's live precompute session through `JobStream`.
 7. Commit unrevealed outputs transactionally to the encrypted frontier, and
    commit any revealed outputs transactionally to DB.
 8. Re-plan after each commit, cancel, config update, or reveal request.
@@ -662,7 +670,8 @@ descriptors.
 - Implement priority queue.
 - Implement RAM/worker budget reservation.
 - Implement eviction/cancellation of background jobs.
-- Implement cache-aware planning from deepest common node.
+- Implement cache-aware planning from the live session cache and the common
+  durable target-leaf subset.
 - Implement fixed-Delta checked-unit monitoring and alerts.
 - Start background precompute after both parties enable a channel.
 
@@ -704,10 +713,10 @@ Review gate: daemon is usable as a PoC service.
 
 1. **AG2PC session reuse and transport embedding.** The current protocol must be
    adapted to gRPC without changing cryptographic message ordering.
-2. **Reloading authenticated frontier nodes.** Persisted unrevealed nodes are
-   valid only if the value representation is self-contained under the fixed
-   local Delta and can be continued with fresh OT/preprocessing randomness.
-   Phase 1 and Phase 2 must test this directly.
+2. **Restart re-warm.** Persisted unrevealed target leaves are revealable after
+   restart, but they are not used as computation parents because labels and
+   one-time protocol randomness are intentionally not persisted. Extending after
+   restart starts a fresh session and re-warms from the seed.
 3. **Deterministic Delta misuse.** Only Delta is deterministic. Reusing any OT,
    garbling, leaky-AND, preprocessing, or per-job randomness across runs would
    be a serious protocol break.

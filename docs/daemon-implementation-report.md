@@ -18,8 +18,10 @@ This report records the implementation state of the daemon and CLI work.
   - enable/disable, status/config, list, and reveal commands;
   - mandatory `expected_next_index` gating for non-local reveals;
   - `I=0` seed reveal refusal unless `allow_seed_reveal` is requested;
-  - persisted revealed shachain leaves and local derivation from later leaves.
-  - explicit and background path precompute for authenticated frontier nodes.
+- persisted revealed shachain leaves and local derivation from later leaves.
+- explicit and background path precompute for authenticated frontier nodes.
+- one shared tonic peer channel, cloned per RPC so control calls and each
+  JobStream pair multiplex over one HTTP/2 connection.
 
 ## Integration Coverage
 
@@ -39,6 +41,8 @@ with the real CLI. It verifies:
 - failed precompute attempts being recorded for monitoring.
 - rollback repair, where one peer loses its DB and a later precompute jointly
   recomputes the missing frontier state.
+- target-only precompute persistence for a multi-bit path, proving trunk and
+  intermediate authenticated nodes are not written as durable frontier state.
 
 ## Frontier State
 
@@ -47,10 +51,15 @@ Persisted authenticated frontier nodes contain only `lambda` and the IT-MAC
 are session-local randomness.
 
 Path precompute opens one AG2PC session, authenticates the seed, computes the
-requested shachain path inside that same session, strips labels from each
-durable node, and stores the authenticated nodes encrypted in the DB. A later
-daemon process can reveal an exact persisted node because public reveal checks
-only the MAC/lambda authenticated value and does not need session-local labels.
+requested shachain path inside that same session, strips labels from the exact
+requested target node, and stores that authenticated leaf encrypted in the DB.
+The in-session walk may use trunk/intermediate nodes, but those nodes are not
+durable frontier state because they are neither revealable without exposing
+their subtree nor reusable as cross-session computation parents.
+
+A later daemon process can reveal an exact persisted node because public reveal
+checks only the MAC/lambda authenticated value and does not need session-local
+labels.
 
 Precompute reserves checked-unit budget before starting MPC. A request that
 would exceed the configured fixed-Delta lifetime cap is refused before the
@@ -83,6 +92,12 @@ frontier after a restart must re-warm from the seed root inside a new live
 session, or use a future import/re-label protocol that assigns fresh labels
 while binding them to the carried MAC without revealing the cleartext
 intermediate.
+
+Reconciliation uses the common subset of peer-visible frontier nodes. A local
+node whose peer-visible binding is absent or different on the peer is dropped
+before a new precompute job starts, so asymmetric frontier halves are regenerated
+jointly. The reveal MAC check remains the final correct-or-abort backstop if a
+mismatched authenticated value ever reaches reveal.
 
 Before enabling restart-resumed frontier extension, add a dedicated
 protocol/test that proves a persisted authenticated node can be consumed by a

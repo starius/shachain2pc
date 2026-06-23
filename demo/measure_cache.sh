@@ -51,12 +51,14 @@ AH=$(mktemp); BH=$(mktemp); AR=$(mktemp); BR=$(mktemp)
 cleanup(){ rm -f "$AO" "$AE" "$BO" "$BE" "$AH" "$BH" "$AR" "$BR"; }
 trap cleanup EXIT
 
-SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
+SHACHAIN2PC_PHASE_TIMING=1 SHACHAIN2PC_CACHE=1 \
+  SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
   "$PARTY_BIN" 1 "$PORT" "$SPEC" "$AS" >"$AO" 2>"$AE" & AP=$!
 poll_hwm "$AP" "$AH" & APOLL=$!
 sleep 0.4
 t0=$(date +%s.%N)
-SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
+SHACHAIN2PC_PHASE_TIMING=1 SHACHAIN2PC_CACHE=1 \
+  SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
   "$PARTY_BIN" 2 "$PORT" "$SPEC" "$BS" 127.0.0.1 >"$BO" 2>"$BE" & BP=$!
 poll_hwm "$BP" "$BH" & BPOLL=$!
 set +e
@@ -94,9 +96,32 @@ while read -r tag I val; do
 done <"$BR"
 per_secret=$(awk -v w="$wall" -v n="$expected" 'BEGIN{printf "%.4f", w/n}')
 pre_reveal=$(awk '/CACHE pre-reveal total/{print $4; exit}' "$AE")
+if [ -z "$pre_reveal" ]; then
+  pre_reveal=$(awk '/^TIMING / {
+      phase = "";
+      total = "";
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^phase=/) {
+          split($i, p, "=");
+          phase = p[2];
+        }
+        if ($i ~ /^total_ms=/) {
+          split($i, t, "=");
+          total = t[2];
+        }
+      }
+      if (phase == "cache_reveal" && prev_total != "") {
+        printf "%.4f", prev_total / 1000;
+        exit;
+      }
+      if (total != "") {
+        prev_total = total;
+      }
+    }' "$AE")
+fi
 pre_reveal=${pre_reveal:-0}
 pre_secret=$(awk -v w="$pre_reveal" -v n="$expected" 'BEGIN{printf "%.4f", w/n}')
 printf "cache %s: wall=%.2fs perSecret=%ss preReveal=%ss preRevealPerSecret=%ss peakRSS=%dMB results=%s mismatches=%s\n" \
   "$SPEC" "$wall" "$per_secret" "$pre_reveal" "$pre_secret" "$((peak/1024))" "$n" "$bad"
-grep -E 'CACHE|NET' "$AE"
+grep -E 'CACHE|NET|TIMING' "$AE" || true
 [ "$bad" -eq 0 ]

@@ -96,6 +96,17 @@ pub struct Ag2pcComputeBuffer {
     pub acc_key: Vec<Block>,
 }
 
+pub struct Ag2pcShareSlicesMut<'a> {
+    pub mac: &'a mut [Block],
+    pub key: &'a mut [Block],
+}
+
+#[derive(Clone, Copy)]
+pub struct Ag2pcLayerSlices<'a> {
+    pub mac: &'a [Block],
+    pub key: &'a [Block],
+}
+
 impl Ag2pcComputeBuffer {
     pub fn new(
         pool: &Ag2pcTriplePoolState,
@@ -335,16 +346,15 @@ impl Ag2pcTriplePoolState {
 
     pub fn leaky_and_finish(
         &self,
-        mac: &mut [Block],
-        key: &mut [Block],
+        shares: Ag2pcShareSlicesMut<'_>,
         l: usize,
         s_me: &[u8],
         s_peer: &[u8],
         mut sout: Vec<Block>,
         feq: &mut Sha256,
     ) -> Result<(), Ag2pcTriplePoolError> {
-        require_len("mac", mac.len(), 3 * l)?;
-        require_len("key", key.len(), 3 * l)?;
+        require_len("mac", shares.mac.len(), 3 * l)?;
+        require_len("key", shares.key.len(), 3 * l)?;
         require_len("s_me", s_me.len(), l)?;
         require_len("s_peer", s_peer.len(), l)?;
         require_len("sout", sout.len(), l)?;
@@ -353,9 +363,9 @@ impl Ag2pcTriplePoolState {
             let d = s_me[k] ^ s_peer[k];
             let mask = select_block(d);
             if self.party == Role::Alice {
-                mac[2 * l + k] = mac[2 * l + k].xor(bit0_mask().and(mask));
+                shares.mac[2 * l + k] = shares.mac[2 * l + k].xor(bit0_mask().and(mask));
             } else {
-                key[2 * l + k] = key[2 * l + k].xor(dxor.and(mask));
+                shares.key[2 * l + k] = shares.key[2 * l + k].xor(dxor.and(mask));
             }
             sout[k] = sout[k].xor(self.delta.and(mask));
         }
@@ -376,53 +386,49 @@ impl Ag2pcTriplePoolState {
 
     pub fn bucket_prepare_layer(
         &self,
-        acc_mac: &mut [Block],
-        acc_key: &mut [Block],
-        layer_mac: &[Block],
-        layer_key: &[Block],
+        acc: Ag2pcShareSlicesMut<'_>,
+        layer: Ag2pcLayerSlices<'_>,
         l: usize,
         r: usize,
     ) -> Result<Vec<u8>, Ag2pcTriplePoolError> {
-        require_len("acc_mac", acc_mac.len(), 3 * l)?;
-        require_len("acc_key", acc_key.len(), 3 * l)?;
-        require_len("layer_mac", layer_mac.len(), 3 * l)?;
-        require_len("layer_key", layer_key.len(), 3 * l)?;
+        require_len("acc_mac", acc.mac.len(), 3 * l)?;
+        require_len("acc_key", acc.key.len(), 3 * l)?;
+        require_len("layer_mac", layer.mac.len(), 3 * l)?;
+        require_len("layer_key", layer.key.len(), 3 * l)?;
         let mut d_me = vec![0u8; l];
         let cut = l - r;
-        for i in 0..l {
+        for (i, d) in d_me.iter_mut().enumerate() {
             let src = if i < cut { i + r } else { i + r - l };
-            acc_mac[i] = acc_mac[i].xor(layer_mac[src]);
-            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer_mac[2 * l + src]);
-            acc_key[i] = acc_key[i].xor(layer_key[src]);
-            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer_key[2 * l + src]);
-            d_me[i] = block_lsb(acc_mac[l + i]) ^ block_lsb(layer_mac[l + src]);
+            acc.mac[i] = acc.mac[i].xor(layer.mac[src]);
+            acc.mac[2 * l + i] = acc.mac[2 * l + i].xor(layer.mac[2 * l + src]);
+            acc.key[i] = acc.key[i].xor(layer.key[src]);
+            acc.key[2 * l + i] = acc.key[2 * l + i].xor(layer.key[2 * l + src]);
+            *d = block_lsb(acc.mac[l + i]) ^ block_lsb(layer.mac[l + src]);
         }
         Ok(d_me)
     }
 
     pub fn bucket_finish_layer(
         &self,
-        acc_mac: &mut [Block],
-        acc_key: &mut [Block],
-        layer_mac: &[Block],
-        layer_key: &[Block],
+        acc: Ag2pcShareSlicesMut<'_>,
+        layer: Ag2pcLayerSlices<'_>,
         l: usize,
         r: usize,
         d_me: &[u8],
         d_peer: &[u8],
     ) -> Result<(), Ag2pcTriplePoolError> {
-        require_len("acc_mac", acc_mac.len(), 3 * l)?;
-        require_len("acc_key", acc_key.len(), 3 * l)?;
-        require_len("layer_mac", layer_mac.len(), 3 * l)?;
-        require_len("layer_key", layer_key.len(), 3 * l)?;
+        require_len("acc_mac", acc.mac.len(), 3 * l)?;
+        require_len("acc_key", acc.key.len(), 3 * l)?;
+        require_len("layer_mac", layer.mac.len(), 3 * l)?;
+        require_len("layer_key", layer.key.len(), 3 * l)?;
         require_len("d_me", d_me.len(), l)?;
         require_len("d_peer", d_peer.len(), l)?;
         let cut = l - r;
         for i in 0..l {
             let src = if i < cut { i + r } else { i + r - l };
             let mask = select_block(d_me[i] ^ d_peer[i]);
-            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer_mac[src].and(mask));
-            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer_key[src].and(mask));
+            acc.mac[2 * l + i] = acc.mac[2 * l + i].xor(layer.mac[src].and(mask));
+            acc.key[2 * l + i] = acc.key[2 * l + i].xor(layer.key[src].and(mask));
         }
         Ok(())
     }

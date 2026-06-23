@@ -15,9 +15,9 @@ use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 pub use shachain2pc_mpc_core::{
     cggm_bit_reverse, cggm_build_sender, cggm_eval_receiver, sfvole_receiver_butterfly,
-    sfvole_sender_butterfly, AShareBundle, Ag2pcComputeBuffer, Ag2pcTriplePoolState, Prg, Prp,
-    SoftSpoken4State, SOFTSPOKEN_CHUNK_BLOCKS, SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N,
-    SOFTSPOKEN_Q,
+    sfvole_sender_butterfly, AShareBundle, Ag2pcComputeBuffer, Ag2pcLayerSlices,
+    Ag2pcShareSlicesMut, Ag2pcTriplePoolState, Prg, Prp, SoftSpoken4State, SOFTSPOKEN_CHUNK_BLOCKS,
+    SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_Q,
 };
 use shachain2pc_mpc_core::{
     finalize_input_open, reveal_local_share, reveal_recipient_bits, verify_share_relation,
@@ -2497,8 +2497,15 @@ impl Ag2pcTriplePool {
             .leaky_and_prepare_s(mac, key, l, hashes.emitc, w_blocks)
             .map_err(|_| CompatError::BadAg2pcInputShape)?;
         let s_peer = self.exchange_bool_vector(streams, &s_me, l).await?;
-        self.leaky_and_finish(mac, key, l, &s_me, &s_peer, sout, hashes.feq)
-            .map_err(|_| CompatError::BadAg2pcInputShape)
+        self.leaky_and_finish(
+            Ag2pcShareSlicesMut { mac, key },
+            l,
+            &s_me,
+            &s_peer,
+            sout,
+            hashes.feq,
+        )
+        .map_err(|_| CompatError::BadAg2pcInputShape)
     }
 
     async fn layered_bucket_into_acc<S: TranscriptIo>(
@@ -2519,8 +2526,20 @@ impl Ag2pcTriplePool {
                 .absorb_block(streams.sibling.get_digest()?)
                 .squeeze_block();
             let r = Ag2pcTriplePoolState::bucket_shift(seed, l);
-            self.bucket_one_layer(streams, acc_mac, acc_key, &sac_mac, &sac_key, l, r)
-                .await?;
+            self.bucket_one_layer(
+                streams,
+                Ag2pcShareSlicesMut {
+                    mac: acc_mac,
+                    key: acc_key,
+                },
+                Ag2pcLayerSlices {
+                    mac: &sac_mac,
+                    key: &sac_key,
+                },
+                l,
+                r,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2528,19 +2547,39 @@ impl Ag2pcTriplePool {
     async fn bucket_one_layer<S: TranscriptIo>(
         &mut self,
         streams: &mut Ag2pcStreams<S>,
-        acc_mac: &mut [Block],
-        acc_key: &mut [Block],
-        layer_mac: &[Block],
-        layer_key: &[Block],
+        acc: Ag2pcShareSlicesMut<'_>,
+        layer: Ag2pcLayerSlices<'_>,
         l: usize,
         r: usize,
     ) -> Result<()> {
+        let Ag2pcShareSlicesMut {
+            mac: acc_mac,
+            key: acc_key,
+        } = acc;
         let d_me = self
-            .bucket_prepare_layer(acc_mac, acc_key, layer_mac, layer_key, l, r)
+            .bucket_prepare_layer(
+                Ag2pcShareSlicesMut {
+                    mac: &mut *acc_mac,
+                    key: &mut *acc_key,
+                },
+                layer,
+                l,
+                r,
+            )
             .map_err(|_| CompatError::BadAg2pcInputShape)?;
         let d_peer = self.exchange_bool_vector(streams, &d_me, l).await?;
-        self.bucket_finish_layer(acc_mac, acc_key, layer_mac, layer_key, l, r, &d_me, &d_peer)
-            .map_err(|_| CompatError::BadAg2pcInputShape)
+        self.bucket_finish_layer(
+            Ag2pcShareSlicesMut {
+                mac: &mut *acc_mac,
+                key: &mut *acc_key,
+            },
+            layer,
+            l,
+            r,
+            &d_me,
+            &d_peer,
+        )
+        .map_err(|_| CompatError::BadAg2pcInputShape)
     }
 
     async fn exchange_blocks<S: TranscriptIo>(

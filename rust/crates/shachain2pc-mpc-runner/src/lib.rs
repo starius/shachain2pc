@@ -1,3 +1,4 @@
+use shachain2pc_mpc_core::{ChannelFlow, CoreError};
 use shachain2pc_mpc_types::{LogicalChannel, MpcFrame};
 use shachain2pc_types::Role;
 use std::fmt;
@@ -87,13 +88,9 @@ pub fn memory_transport_pair(
 }
 
 pub struct MemoryTransport {
-    job_id: Vec<u8>,
-    local_role: Role,
-    channel: LogicalChannel,
+    flow: Option<ChannelFlow>,
     tx: mpsc::Sender<MpcFrame>,
     rx: mpsc::Receiver<MpcFrame>,
-    next_send: u64,
-    next_recv: u64,
 }
 
 impl MemoryTransport {
@@ -105,82 +102,48 @@ impl MemoryTransport {
         rx: mpsc::Receiver<MpcFrame>,
     ) -> Self {
         Self {
-            job_id,
-            local_role,
-            channel,
+            flow: Some(ChannelFlow::new(job_id, local_role, channel)),
             tx,
             rx,
-            next_send: 0,
-            next_recv: 0,
         }
     }
 
-    fn validate_send(&self, frame: &MpcFrame) -> Result<()> {
-        if frame.job_id != self.job_id {
-            return Err(RunnerError::JobMismatch);
-        }
-        if frame.sender_role != self.local_role {
-            return Err(RunnerError::RoleMismatch {
-                expected: self.local_role,
-                got: frame.sender_role,
-            });
-        }
-        if frame.channel != self.channel {
-            return Err(RunnerError::ChannelMismatch {
-                expected: self.channel,
-                got: frame.channel,
-            });
-        }
-        if frame.sequence != self.next_send {
-            return Err(RunnerError::SequenceMismatch {
-                expected: self.next_send,
-                got: frame.sequence,
-            });
-        }
-        Ok(())
-    }
-
-    fn validate_recv(&self, frame: &MpcFrame) -> Result<()> {
-        if frame.job_id != self.job_id {
-            return Err(RunnerError::JobMismatch);
-        }
-        if frame.sender_role == self.local_role {
-            return Err(RunnerError::RoleMismatch {
-                expected: opposite_role(self.local_role),
-                got: frame.sender_role,
-            });
-        }
-        if frame.channel != self.channel {
-            return Err(RunnerError::ChannelMismatch {
-                expected: self.channel,
-                got: frame.channel,
-            });
-        }
-        if frame.sequence != self.next_recv {
-            return Err(RunnerError::SequenceMismatch {
-                expected: self.next_recv,
-                got: frame.sequence,
-            });
-        }
-        Ok(())
+    fn take_flow(&mut self) -> Result<ChannelFlow> {
+        self.flow.take().ok_or(RunnerError::InternalStateMissing)
     }
 }
 
 impl MpcTransport for MemoryTransport {
     async fn send(&mut self, frame: MpcFrame) -> Result<()> {
-        self.validate_send(&frame)?;
+        let flow = self.take_flow()?;
+        let (flow, frame) = match flow.accept_outbound(frame) {
+            Ok(ok) => ok,
+            Err(err) => {
+                let (flow, error) = err.into_parts();
+                self.flow = Some(flow);
+                return Err(RunnerError::Core(error));
+            }
+        };
+        self.flow = Some(flow);
         self.tx
             .send(frame)
             .await
             .map_err(|_| RunnerError::TransportClosed)?;
-        self.next_send = self.next_send.saturating_add(1);
         Ok(())
     }
 
     async fn recv(&mut self) -> Result<MpcFrame> {
         let frame = self.rx.recv().await.ok_or(RunnerError::TransportClosed)?;
-        self.validate_recv(&frame)?;
-        self.next_recv = self.next_recv.saturating_add(1);
+        let flow = self.take_flow()?;
+        let (flow, frame) = match flow.accept_inbound(frame) {
+            Ok(ok) => ok,
+            Err(err) => {
+                let (flow, error) = err.into_parts();
+                self.flow = Some(flow);
+                return Err(RunnerError::Core(error));
+            }
+        };
+        self.flow = Some(flow);
         Ok(frame)
     }
 
@@ -194,60 +157,26 @@ pub type Result<T> = std::result::Result<T, RunnerError>;
 #[derive(Debug, Eq, PartialEq)]
 pub enum RunnerError {
     TransportClosed,
-    JobMismatch,
-    RoleMismatch {
-        expected: Role,
-        got: Role,
-    },
-    ChannelMismatch {
-        expected: LogicalChannel,
-        got: LogicalChannel,
-    },
-    SequenceMismatch {
-        expected: u64,
-        got: u64,
-    },
+    InternalStateMissing,
+    Core(CoreError),
 }
 
 impl fmt::Display for RunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TransportClosed => write!(f, "MPC transport is closed"),
-            Self::JobMismatch => write!(f, "MPC frame job id does not match this transport"),
-            Self::RoleMismatch { expected, got } => {
-                write!(
-                    f,
-                    "MPC frame role mismatch: expected {expected:?}, got {got:?}"
-                )
-            }
-            Self::ChannelMismatch { expected, got } => {
-                write!(
-                    f,
-                    "MPC frame channel mismatch: expected {expected:?}, got {got:?}"
-                )
-            }
-            Self::SequenceMismatch { expected, got } => {
-                write!(
-                    f,
-                    "MPC frame sequence mismatch: expected {expected}, got {got}"
-                )
-            }
+            Self::InternalStateMissing => write!(f, "MPC transport state is missing"),
+            Self::Core(err) => write!(f, "{err}"),
         }
     }
 }
 
 impl std::error::Error for RunnerError {}
 
-fn opposite_role(role: Role) -> Role {
-    match role {
-        Role::Alice => Role::Bob,
-        Role::Bob => Role::Alice,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shachain2pc_mpc_core::CoreError;
     use shachain2pc_mpc_types::MessageKind;
 
     fn frame(
@@ -311,10 +240,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            RunnerError::SequenceMismatch {
+            RunnerError::Core(CoreError::SequenceMismatch {
                 expected: 0,
-                got: 1
-            }
+                got: 1,
+            })
         );
     }
 
@@ -335,10 +264,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            RunnerError::ChannelMismatch {
+            RunnerError::Core(CoreError::ChannelMismatch {
                 expected: LogicalChannel::Main,
                 got: LogicalChannel::Sibling
-            }
+            })
         );
     }
 

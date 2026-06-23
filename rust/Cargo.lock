@@ -1118,9 +1118,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shachain2pc-mpc-core"
+version = "0.1.0"
+dependencies = [
+ "shachain2pc-mpc-types",
+ "shachain2pc-types",
+]
+
+[[package]]
 name = "shachain2pc-mpc-runner"
 version = "0.1.0"
 dependencies = [
+ "shachain2pc-mpc-core",
  "shachain2pc-mpc-types",
  "shachain2pc-types",
  "tokio",

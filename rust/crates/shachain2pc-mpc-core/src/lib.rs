@@ -130,6 +130,218 @@ pub fn verify_share_relation(
         })
 }
 
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn block_to_u128(block: Block) -> u128 {
+    u128::from_le_bytes(block.into_bytes())
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn u128_to_block(value: u128) -> Block {
+    Block::from_bytes(value.to_le_bytes())
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+#[inline]
+pub fn gf_mul(a: Block, b: Block) -> Block {
+    // SAFETY: target_feature(pclmulqdq) and x86_64's baseline SSE2 guarantee the
+    // carryless-multiply intrinsics are available.
+    unsafe { gf_mul_clmul(a, b) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+#[inline]
+pub fn gf_mul(a: Block, b: Block) -> Block {
+    gf_mul_soft(a, b)
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn gf_mul_soft(a: Block, b: Block) -> Block {
+    let a = block_to_u128(a);
+    let b = block_to_u128(b);
+    let mut product = [0u64; 4];
+    for i in 0..128 {
+        if ((b >> i) & 1) != 0 {
+            xor_shifted_u128(&mut product, a, i);
+        }
+    }
+    gf_reduce(product)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+#[inline]
+unsafe fn gf_mul_clmul(a: Block, b: Block) -> Block {
+    use core::arch::x86_64::*;
+
+    let a = _mm_loadu_si128(a.as_bytes().as_ptr().cast());
+    let b = _mm_loadu_si128(b.as_bytes().as_ptr().cast());
+    let g = _mm_set_epi64x(0, 0x87);
+
+    let t0 = _mm_clmulepi64_si128(a, b, 0x00);
+    let t3 = _mm_clmulepi64_si128(a, b, 0x11);
+    let t1 = _mm_clmulepi64_si128(a, b, 0x01);
+    let t2 = _mm_clmulepi64_si128(a, b, 0x10);
+    let mid = _mm_xor_si128(t1, t2);
+    let p_lo = _mm_xor_si128(t0, _mm_slli_si128(mid, 8));
+    let p_hi = _mm_xor_si128(t3, _mm_srli_si128(mid, 8));
+
+    let c0 = _mm_clmulepi64_si128(p_hi, g, 0x00);
+    let c1 = _mm_clmulepi64_si128(p_hi, g, 0x01);
+    let q_lo = _mm_xor_si128(c0, _mm_slli_si128(c1, 8));
+    let q_hi = _mm_srli_si128(c1, 8);
+    let e = _mm_clmulepi64_si128(q_hi, g, 0x00);
+    let res = _mm_xor_si128(_mm_xor_si128(p_lo, q_lo), e);
+
+    let mut out = [0u8; 16];
+    _mm_storeu_si128(out.as_mut_ptr().cast(), res);
+    Block::from_bytes(out)
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn xor_shifted_u128(dst: &mut [u64; 4], value: u128, shift: usize) {
+    let lo = value as u64;
+    let hi = (value >> 64) as u64;
+    let word = shift / 64;
+    let bits = shift % 64;
+    if bits == 0 {
+        dst[word] ^= lo;
+        dst[word + 1] ^= hi;
+    } else {
+        dst[word] ^= lo << bits;
+        dst[word + 1] ^= (lo >> (64 - bits)) ^ (hi << bits);
+        if word + 2 < dst.len() {
+            dst[word + 2] ^= hi >> (64 - bits);
+        }
+    }
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn gf_bit(words: &[u64; 4], bit: usize) -> bool {
+    ((words[bit / 64] >> (bit % 64)) & 1) != 0
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn gf_flip(words: &mut [u64; 4], bit: usize) {
+    words[bit / 64] ^= 1u64 << (bit % 64);
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn gf_reduce(mut product: [u64; 4]) -> Block {
+    for bit in (128..256).rev() {
+        if gf_bit(&product, bit) {
+            gf_flip(&mut product, bit);
+            let base = bit - 128;
+            gf_flip(&mut product, base);
+            gf_flip(&mut product, base + 1);
+            gf_flip(&mut product, base + 2);
+            gf_flip(&mut product, base + 7);
+        }
+    }
+    let value = (product[0] as u128) | ((product[1] as u128) << 64);
+    u128_to_block(value)
+}
+
+pub fn gf_inner_product(a: &[Block], b: &[Block]) -> Block {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .fold(Block::zero(), |acc, (lhs, rhs)| acc.xor(gf_mul(*lhs, *rhs)))
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+pub fn gf_pack_128(data: &[Block]) -> Block {
+    // SAFETY: target_feature(pclmulqdq) and x86_64's baseline SSE2 guarantee the
+    // intrinsics are available.
+    unsafe { gf_pack_128_clmul(data) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+pub fn gf_pack_128(data: &[Block]) -> Block {
+    gf_pack_128_soft(data)
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "pclmulqdq"))))]
+fn gf_pack_128_soft(data: &[Block]) -> Block {
+    assert_eq!(data.len(), 128);
+    let mut product = [0u64; 4];
+    for (shift, block) in data.iter().enumerate() {
+        xor_shifted_u128(&mut product, block_to_u128(*block), shift);
+    }
+    gf_reduce(product)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+unsafe fn gf_pack_128_clmul(data: &[Block]) -> Block {
+    use core::arch::x86_64::*;
+
+    assert_eq!(data.len(), 128);
+    let ld = |i: usize| _mm_loadu_si128(data[i].as_bytes().as_ptr().cast());
+    let mut lo = _mm_setzero_si128();
+    let mut hi = _mm_setzero_si128();
+
+    macro_rules! bit {
+        ($base:expr, $b:literal, $clo:ident, $chi:ident) => {{
+            let d = ld($base + $b);
+            let s = _mm_slli_epi64(d, $b);
+            let c = _mm_srli_epi64(d, 64 - $b);
+            $clo = _mm_xor_si128($clo, _mm_xor_si128(s, _mm_slli_si128(c, 8)));
+            $chi = _mm_xor_si128($chi, _mm_srli_si128(c, 8));
+        }};
+    }
+    macro_rules! pack_byte {
+        ($boff:literal) => {{
+            let base = $boff * 8;
+            let mut clo = ld(base);
+            let mut chi = _mm_setzero_si128();
+            bit!(base, 1, clo, chi);
+            bit!(base, 2, clo, chi);
+            bit!(base, 3, clo, chi);
+            bit!(base, 4, clo, chi);
+            bit!(base, 5, clo, chi);
+            bit!(base, 6, clo, chi);
+            bit!(base, 7, clo, chi);
+            if $boff == 0 {
+                lo = _mm_xor_si128(lo, clo);
+                hi = _mm_xor_si128(hi, chi);
+            } else {
+                lo = _mm_xor_si128(lo, _mm_slli_si128(clo, $boff));
+                hi = _mm_xor_si128(
+                    hi,
+                    _mm_xor_si128(_mm_srli_si128(clo, 16 - $boff), _mm_slli_si128(chi, $boff)),
+                );
+            }
+        }};
+    }
+
+    pack_byte!(0);
+    pack_byte!(1);
+    pack_byte!(2);
+    pack_byte!(3);
+    pack_byte!(4);
+    pack_byte!(5);
+    pack_byte!(6);
+    pack_byte!(7);
+    pack_byte!(8);
+    pack_byte!(9);
+    pack_byte!(10);
+    pack_byte!(11);
+    pack_byte!(12);
+    pack_byte!(13);
+    pack_byte!(14);
+    pack_byte!(15);
+
+    let g = _mm_set_epi64x(0, 0x87);
+    let c0 = _mm_clmulepi64_si128(hi, g, 0x00);
+    let c1 = _mm_clmulepi64_si128(hi, g, 0x01);
+    let q_lo = _mm_xor_si128(c0, _mm_slli_si128(c1, 8));
+    let q_hi = _mm_srli_si128(c1, 8);
+    let e = _mm_clmulepi64_si128(q_hi, g, 0x00);
+    let res = _mm_xor_si128(_mm_xor_si128(lo, q_lo), e);
+
+    let mut out = [0u8; 16];
+    _mm_storeu_si128(out.as_mut_ptr().cast(), res);
+    Block::from_bytes(out)
+}
+
 pub type RevealResult<T> = std::result::Result<T, RevealError>;
 pub type InputOpenResult<T> = std::result::Result<T, InputOpenError>;
 
@@ -728,6 +940,18 @@ mod tests {
         (local_delta, peer_delta, local, peer)
     }
 
+    fn next_u64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn next_block(state: &mut u64) -> Block {
+        Block::make(next_u64(state), next_u64(state))
+    }
+
     fn params() -> SessionParams {
         SessionParams::new(73, vec![0x11; 32], b"job-binding".to_vec())
     }
@@ -794,6 +1018,44 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.error(), &CoreError::Aborted);
         assert!(err.state().is_aborted());
+    }
+
+    #[test]
+    fn gf_mul_clmul_matches_soft() {
+        let mut state = 0x7f4a_7c15_9e37_79b9;
+        for _ in 0..5000 {
+            let lhs = next_block(&mut state);
+            let rhs = next_block(&mut state);
+            assert_eq!(gf_mul(lhs, rhs), gf_mul_soft(lhs, rhs));
+        }
+
+        let one = Block::make(0, 1);
+        let ones = Block::make(u64::MAX, u64::MAX);
+        let hi = Block::make(1 << 63, 0);
+        for &lhs in &[Block::zero(), one, ones, hi] {
+            for &rhs in &[Block::zero(), one, ones, hi] {
+                assert_eq!(gf_mul(lhs, rhs), gf_mul_soft(lhs, rhs));
+            }
+        }
+    }
+
+    #[test]
+    fn gf_pack_128_clmul_matches_soft() {
+        let mut state = 0x1234_5678_9abc_def0;
+        for _ in 0..200 {
+            let data: Vec<Block> = (0..128).map(|_| next_block(&mut state)).collect();
+            assert_eq!(gf_pack_128(&data), gf_pack_128_soft(&data));
+        }
+
+        let zero = vec![Block::zero(); 128];
+        assert_eq!(gf_pack_128(&zero), gf_pack_128_soft(&zero));
+        let ones = vec![Block::make(u64::MAX, u64::MAX); 128];
+        assert_eq!(gf_pack_128(&ones), gf_pack_128_soft(&ones));
+        for i in 0..128 {
+            let mut data = vec![Block::zero(); 128];
+            data[i] = Block::make(u64::MAX, u64::MAX);
+            assert_eq!(gf_pack_128(&data), gf_pack_128_soft(&data));
+        }
     }
 
     #[test]

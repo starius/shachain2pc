@@ -138,18 +138,23 @@ trait MpcTransport {
 ```
 
 For AG2PC, the transport must support logical substreams such as `main` and
-`sibling`. The trait can model this either as:
+`sibling`. The Phase 0 boundary inventory shows these channels make concurrent
+progress in input authentication and COT/triple-pool operations.
 
-- one `MpcFrame { channel_id, payload }` stream with channel IDs; or
-- an `MpcTransportSet` that returns one transport handle per logical channel.
-
-Decision: use channel IDs in a single frame type. This maps naturally to gRPC
-JobStream, can still be backed by raw TCP, and keeps a single per-job identity.
+Decision: use an `MpcTransportSet` that returns one transport handle per
+logical channel. A single ordered stream with `channel_id` frames can deadlock
+unless a background dispatcher drains it into bounded per-channel queues. The
+safer default daemon mapping is therefore two gRPC bidi streams per job, one for
+`main` and one for `sibling`, sharing the same job id.
 
 ### Existing Crates After Refactor
 
 - `shachain2pc-emp-wire`: becomes the legacy byte-stream primitives and
-  EMP-compatible codec support. It should not own protocol state.
+  EMP-compatible codec support. It should not own protocol state. Permanent
+  low-level primitives that are not EMP-wire-specific, such as `Block`, CLMUL
+  GF helpers, MITCCRH, and transpose helpers, should live here or in a future
+  `shachain2pc-mpc-primitives` crate so `mpc-core` has an acyclic dependency
+  path.
 - `shachain2pc-emp-compat`: is gradually emptied of runner/protocol logic.
   Deterministic primitives and C++ fixtures can remain here temporarily, but
   active AG2PC state machines move to `mpc-core`.
@@ -203,6 +208,11 @@ Output: `docs/mpc-message-boundaries.md`.
 
 Review gate: confirm boundaries with Claude before moving code.
 
+Initial inventory decision: `main` and `sibling` require independent progress.
+The runner API should therefore expose an `MpcTransportSet`; a single-stream
+gRPC mapping is allowed only with an explicit demultiplexer task and bounded
+per-channel queues.
+
 ## Phase 1: Byte Transport Trait Under Existing Code
 
 Introduce a minimal byte transport trait below `EmpStream`:
@@ -230,6 +240,9 @@ Tests:
 - existing Rust/Rust and C++/Rust party tests;
 - byte-counter and digest tests;
 - no performance regression beyond noise on I=1 and I=3.
+- no regression on one batch/cache workload, for example 1024 secrets, and one
+  deep derivation workload. Small I=1/I=3 runs are necessary but not sufficient
+  because they do not stress triple-pool, transpose, or memory hot paths.
 
 ## Phase 2: Introduce `mpc-types`
 
@@ -335,14 +348,17 @@ Required gates:
 
 ## Phase 6: Add Daemon gRPC JobStream
 
-Add peer service RPC:
+Add peer service RPCs:
 
 ```text
-rpc JobStream(stream MpcFrame) returns (stream MpcFrame);
+rpc JobMainStream(stream MpcFrame) returns (stream MpcFrame);
+rpc JobSiblingStream(stream MpcFrame) returns (stream MpcFrame);
 ```
 
-One JobStream represents one MPC job. `MpcFrame.channel_id` multiplexes logical
-AG2PC substreams such as `main` and `sibling` within that job.
+One pair of streams represents one MPC job. Both streams carry the same job id;
+one carries the `main` logical channel and the other carries `sibling`. A future
+single-stream variant may use `MpcFrame.channel_id`, but only with a dispatcher
+that keeps both logical channels drained into per-channel queues.
 
 The daemon scheduler stops assigning raw worker ports. Instead:
 
@@ -396,6 +412,9 @@ Keep:
 - JobStream frames should use `bytes::Bytes` or contiguous `Vec<u8>` to avoid
   repeated conversions.
 - Each phase records I=1 and I=3 release timings before and after.
+- Each phase also records one batch/cache timing+RSS point and one deep
+  derivation timing+RSS point. These catch regressions in bucketing,
+  `compute_inplace`, SIMD transpose, and memory layout.
 - Any regression above measurement noise blocks the phase unless explained.
 
 ## Security Rules

@@ -17,7 +17,8 @@ use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 pub use shachain2pc_mpc_core::AShareBundle;
 use shachain2pc_mpc_core::{
-    reveal_local_share, reveal_recipient_bits, verify_share_relation, RevealError,
+    finalize_input_open, reveal_local_share, reveal_recipient_bits, verify_share_relation,
+    InputOpenError, RevealError,
 };
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
@@ -2961,13 +2962,7 @@ impl Ag2pcProtocol {
             }
         }
 
-        let share_msg: Vec<u8> = sw
-            .wire_bundle
-            .iter()
-            .map(|wire| block_lsb(wire.mac))
-            .collect();
-        let my_macs: Vec<Block> = sw.wire_bundle.iter().map(|wire| wire.mac).collect();
-        let d_me = hash_once(&blocks_to_bytes(&my_macs));
+        let local_open = reveal_local_share(&sw.wire_bundle);
 
         let mut own_x_packed = Vec::new();
         let mut peer_idx_list = Vec::new();
@@ -2981,30 +2976,24 @@ impl Ag2pcProtocol {
         let (peer_share, d_peer, peer_x_packed) = self
             .exchange_input_open(
                 streams,
-                &share_msg,
-                &d_me,
+                &local_open.share_bits,
+                &local_open.mac_digest,
                 &own_x_packed,
                 n_total,
                 peer_idx_list.len(),
             )
             .await?;
 
-        let exp_macs: Vec<Block> = sw
-            .wire_bundle
-            .iter()
-            .zip(&peer_share)
-            .map(|(wire, share)| wire.key.xor(select_block(*share).and(self.delta)))
-            .collect();
-        if hash_once(&blocks_to_bytes(&exp_macs)) != d_peer {
-            return Err(CompatError::FeqMismatch);
-        }
-
-        for i in 0..n_total {
-            sw.lambda[i] = share_msg[i] ^ peer_share[i] ^ own_x_bits[i];
-        }
-        for (i, wire_index) in peer_idx_list.iter().enumerate() {
-            sw.lambda[*wire_index] ^= peer_x_packed[i] & 1;
-        }
+        sw.lambda = finalize_input_open(
+            &sw.wire_bundle,
+            &own_x_bits,
+            &peer_idx_list,
+            &peer_share,
+            d_peer,
+            &peer_x_packed,
+            self.delta,
+        )
+        .map_err(map_input_open_error)?;
 
         if self.party == Role::Alice {
             let labels: Vec<Block> = sw
@@ -3155,6 +3144,16 @@ fn map_reveal_error(error: RevealError) -> CompatError {
         RevealError::BadWireShape { .. } | RevealError::PeerShareLength { .. } => {
             CompatError::BadAg2pcInputShape
         }
+    }
+}
+
+fn map_input_open_error(error: InputOpenError) -> CompatError {
+    match error {
+        InputOpenError::MacDigestMismatch => CompatError::FeqMismatch,
+        InputOpenError::OwnInputLength { .. }
+        | InputOpenError::PeerShareLength { .. }
+        | InputOpenError::PeerInputLength { .. }
+        | InputOpenError::PeerInputIndex { .. } => CompatError::BadAg2pcInputShape,
     }
 }
 

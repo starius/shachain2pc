@@ -367,7 +367,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::StatusRequest>,
     ) -> std::result::Result<Response<pb::StatusResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let inner = self.state.inner.lock().await;
         Ok(Response::new(pb::StatusResponse {
             role: inner.cfg.role.party_id() as u32,
@@ -389,7 +389,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::SetConfigRequest>,
     ) -> std::result::Result<Response<pb::SetConfigResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let req = request.into_inner();
         let mut inner = self.state.inner.lock().await;
         if let Some(v) = req.max_ram_bytes {
@@ -412,7 +412,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::EnableChannelRequest>,
     ) -> std::result::Result<Response<pb::ChannelResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let req = request.into_inner();
         let mut inner = self.state.inner.lock().await;
         let key = channel_key(req.channel_index);
@@ -462,7 +462,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::DisableChannelRequest>,
     ) -> std::result::Result<Response<pb::ChannelResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let req = request.into_inner();
         let mut inner = self.state.inner.lock().await;
         let key = channel_key(req.channel_index);
@@ -481,7 +481,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::PrecomputeRequest>,
     ) -> std::result::Result<Response<pb::PrecomputeResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let req = request.into_inner();
         let out = self
             .state
@@ -495,7 +495,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::RevealRequest>,
     ) -> std::result::Result<Response<pb::RevealResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let req = request.into_inner();
         let out = self
             .state
@@ -514,7 +514,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::ListChannelsRequest>,
     ) -> std::result::Result<Response<pb::ListChannelsResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let inner = self.state.inner.lock().await;
         let channels = inner
             .db
@@ -533,7 +533,7 @@ impl ControlService for ControlApi {
         &self,
         request: Request<pb::ListJobsRequest>,
     ) -> std::result::Result<Response<pb::ListJobsResponse>, Status> {
-        self.state.check_cookie(&request).map_err(|e| *e)?;
+        self.state.check_cookie(&request).await?;
         let inner = self.state.inner.lock().await;
         let jobs = inner
             .active_jobs
@@ -620,21 +620,19 @@ impl PeerService for PeerApi {
 }
 
 impl DaemonState {
-    fn check_cookie<T>(&self, request: &Request<T>) -> std::result::Result<(), Box<Status>> {
+    async fn check_cookie<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
         let cookie = request
             .metadata()
             .get("x-shachain-cookie")
-            .ok_or_else(|| Status::unauthenticated("missing local cookie"))?;
-        let expected = self
-            .inner
-            .try_lock()
-            .map_err(|_| Status::resource_exhausted("daemon is busy"))?
-            .cookie
-            .clone();
-        if cookie.to_str().ok() == Some(expected.as_str()) {
+            .ok_or_else(|| Status::unauthenticated("missing local cookie"))?
+            .to_str()
+            .map_err(|_| Status::unauthenticated("bad local cookie"))?
+            .to_owned();
+        let expected = self.inner.lock().await.cookie.clone();
+        if cookie == expected {
             Ok(())
         } else {
-            Err(Box::new(Status::unauthenticated("bad local cookie")))
+            Err(Status::unauthenticated("bad local cookie"))
         }
     }
 

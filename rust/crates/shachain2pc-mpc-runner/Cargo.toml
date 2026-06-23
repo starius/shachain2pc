@@ -1,0 +1,17 @@
+[package]
+name = "shachain2pc-mpc-runner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+shachain2pc-mpc-types = { path = "../shachain2pc-mpc-types" }
+shachain2pc-types = { path = "../shachain2pc-types" }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+
+[lib]
+path = "src/lib.rs"

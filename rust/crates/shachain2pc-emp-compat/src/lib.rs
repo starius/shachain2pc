@@ -15,15 +15,16 @@ use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 pub use shachain2pc_mpc_core::{
     cggm_bit_reverse, cggm_build_sender, cggm_eval_receiver, sfvole_receiver_butterfly,
-    sfvole_sender_butterfly, AShareBundle, Prg, Prp,
+    sfvole_sender_butterfly, AShareBundle, Prg, Prp, SoftSpoken4State, SOFTSPOKEN_CHUNK_BLOCKS,
+    SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_PPRF_CHECK_HIGH, SOFTSPOKEN_Q,
 };
 use shachain2pc_mpc_core::{
     finalize_input_open, gf_inner_product, gf_mul, gf_pack_128, reveal_local_share,
     reveal_recipient_bits, verify_share_relation, InputOpenError, Mitccrh8, RevealError,
 };
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
-use std::fmt;
 use std::sync::OnceLock;
+use std::{fmt, ops};
 use zeroize::Zeroize;
 
 pub const HASH_DIGEST_BYTES: usize = 32;
@@ -528,68 +529,35 @@ fn blocks_to_bytes(blocks: &[Block]) -> Vec<u8> {
     out
 }
 
-const SOFTSPOKEN_K: usize = 4;
-const SOFTSPOKEN_N: usize = 128 / SOFTSPOKEN_K;
-const SOFTSPOKEN_Q: usize = 1 << SOFTSPOKEN_K;
-const SOFTSPOKEN_CHUNK_BLOCKS: usize = 64;
-const SOFTSPOKEN_CHUNK_OTS: usize = SOFTSPOKEN_CHUNK_BLOCKS * 128;
-const SOFTSPOKEN_PPRF_CHECK_HIGH: u64 = 0x7050_5246_434b_5f00;
-
 pub struct SoftSpoken4 {
-    role: Role,
-    malicious: bool,
-    setup_done: bool,
-    delta: Block,
-    delta_bool: [bool; 128],
-    choice_prg: Prg,
-    session: u64,
-    cur_send_session: u64,
-    cur_recv_session: u64,
-    cur_send_b0: u64,
-    cur_recv_b0: u64,
-    leftover: Vec<Block>,
-    leftover_pos: usize,
-    leftover_count: usize,
-    alphas: [usize; SOFTSPOKEN_N],
-    leaves_recv: Vec<Block>,
-    leaves_send: Vec<Block>,
-    check_q: Block,
-    check_t: Block,
-    check_x: Block,
+    state: SoftSpoken4State,
+}
+
+impl ops::Deref for SoftSpoken4 {
+    type Target = SoftSpoken4State;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl ops::DerefMut for SoftSpoken4 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 impl SoftSpoken4 {
     pub fn new(role: Role, malicious: bool) -> Result<Self> {
         let mut delta = Block::zero();
-        let mut delta_bool = [false; 128];
         if role == Role::Alice {
             delta = random_block()?;
             let mut bytes = delta.into_bytes();
             bytes[0] |= 1;
             delta = Block::from_bytes(bytes);
-            delta_bool = block_to_bools(delta);
         }
         Ok(Self {
-            role,
-            malicious,
-            setup_done: false,
-            delta,
-            delta_bool,
-            choice_prg: Prg::new(random_block()?, 0),
-            session: 0,
-            cur_send_session: 0,
-            cur_recv_session: 0,
-            cur_send_b0: 0,
-            cur_recv_b0: 0,
-            leftover: Vec::new(),
-            leftover_pos: 0,
-            leftover_count: 0,
-            alphas: [0; SOFTSPOKEN_N],
-            leaves_recv: Vec::new(),
-            leaves_send: Vec::new(),
-            check_q: Block::zero(),
-            check_t: Block::zero(),
-            check_x: Block::zero(),
+            state: SoftSpoken4State::new(role, malicious, delta, random_block()?),
         })
     }
 
@@ -600,11 +568,9 @@ impl SoftSpoken4 {
     }
 
     pub fn set_delta(&mut self, delta: Block) -> Result<()> {
-        if self.setup_done || self.role != Role::Alice {
+        if self.state.set_delta(delta).is_err() {
             return Err(CompatError::BadOtRole("SoftSpoken4::set_delta"));
         }
-        self.delta = delta;
-        self.delta_bool = block_to_bools(delta);
         Ok(())
     }
 
@@ -998,15 +964,6 @@ fn aes_dm_3(key: &Prp, tweak: Block) -> [Block; 3] {
         aes_dm(key, 1, tweak),
         aes_dm(key, 2, tweak),
     ]
-}
-
-fn block_to_bools(block: Block) -> [bool; 128] {
-    let bytes = block.into_bytes();
-    let mut out = [false; 128];
-    for i in 0..128 {
-        out[i] = ((bytes[i / 8] >> (i % 8)) & 1) != 0;
-    }
-    out
 }
 
 fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {

@@ -134,6 +134,95 @@ impl Drop for Prg {
     }
 }
 
+pub const SOFTSPOKEN_K: usize = 4;
+pub const SOFTSPOKEN_N: usize = 128 / SOFTSPOKEN_K;
+pub const SOFTSPOKEN_Q: usize = 1 << SOFTSPOKEN_K;
+pub const SOFTSPOKEN_CHUNK_BLOCKS: usize = 64;
+pub const SOFTSPOKEN_CHUNK_OTS: usize = SOFTSPOKEN_CHUNK_BLOCKS * 128;
+pub const SOFTSPOKEN_PPRF_CHECK_HIGH: u64 = 0x7050_5246_434b_5f00;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SoftSpokenStateError {
+    BadDeltaRole,
+}
+
+impl fmt::Display for SoftSpokenStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadDeltaRole => write!(
+                f,
+                "SoftSpoken delta can only be set before Alice setup starts"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SoftSpokenStateError {}
+
+pub struct SoftSpoken4State {
+    pub role: Role,
+    pub malicious: bool,
+    pub setup_done: bool,
+    pub delta: Block,
+    pub delta_bool: [bool; 128],
+    pub choice_prg: Prg,
+    pub session: u64,
+    pub cur_send_session: u64,
+    pub cur_recv_session: u64,
+    pub cur_send_b0: u64,
+    pub cur_recv_b0: u64,
+    pub leftover: Vec<Block>,
+    pub leftover_pos: usize,
+    pub leftover_count: usize,
+    pub alphas: [usize; SOFTSPOKEN_N],
+    pub leaves_recv: Vec<Block>,
+    pub leaves_send: Vec<Block>,
+    pub check_q: Block,
+    pub check_t: Block,
+    pub check_x: Block,
+}
+
+impl SoftSpoken4State {
+    pub fn new(role: Role, malicious: bool, delta: Block, choice_seed: Block) -> Self {
+        let (delta, delta_bool) = if role == Role::Alice {
+            (delta, block_to_bools(delta))
+        } else {
+            (Block::zero(), [false; 128])
+        };
+        Self {
+            role,
+            malicious,
+            setup_done: false,
+            delta,
+            delta_bool,
+            choice_prg: Prg::new(choice_seed, 0),
+            session: 0,
+            cur_send_session: 0,
+            cur_recv_session: 0,
+            cur_send_b0: 0,
+            cur_recv_b0: 0,
+            leftover: Vec::new(),
+            leftover_pos: 0,
+            leftover_count: 0,
+            alphas: [0; SOFTSPOKEN_N],
+            leaves_recv: Vec::new(),
+            leaves_send: Vec::new(),
+            check_q: Block::zero(),
+            check_t: Block::zero(),
+            check_x: Block::zero(),
+        }
+    }
+
+    pub fn set_delta(&mut self, delta: Block) -> Result<(), SoftSpokenStateError> {
+        if self.setup_done || self.role != Role::Alice {
+            return Err(SoftSpokenStateError::BadDeltaRole);
+        }
+        self.delta = delta;
+        self.delta_bool = block_to_bools(delta);
+        Ok(())
+    }
+}
+
 const CGGM_LSB_CLEAR_MASK: Block = Block::from_bytes([
     0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ]);
@@ -415,6 +504,15 @@ impl Mitccrh8 {
 fn mitccrh_apply(key: &Prp, block: Block, cir: bool) -> Block {
     let input = if cir { block.sigma() } else { block };
     key.permute_one(input).xor(input)
+}
+
+fn block_to_bools(block: Block) -> [bool; 128] {
+    let bytes = block.into_bytes();
+    let mut out = [false; 128];
+    for i in 0..128 {
+        out[i] = ((bytes[i / 8] >> (i % 8)) & 1) != 0;
+    }
+    out
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

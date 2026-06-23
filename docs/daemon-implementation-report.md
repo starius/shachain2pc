@@ -106,6 +106,11 @@ cleartext intermediates.
 - JobStream frames bind the channel, target index, digest, `ssp_target`, and
   Delta lifetime cap. Receivers reject descriptor or security-parameter
   mismatches and enforce their own worker budget before accepting incoming work.
+- Before AG2PC bytes are exchanged, daemon precompute runs the shared
+  `mpc-runner` session handshake over a length-prefixed typed frame on the
+  `main` JobStream. This binds the effective SSP, circuit/job digest, and
+  immutable job context at the runner layer, then returns the same byte streams
+  to the existing AG2PC implementation.
 - The daemon no longer uses `mpc_port + 1 + n` worker ports. The configured
   `mpc_port` remains for the existing one-shot reveal/full-derivation paths and
   for the legacy C++-compatible `party` transport.

@@ -1101,6 +1101,7 @@ dependencies = [
  "sha2",
  "shachain2pc-circuit",
  "shachain2pc-emp-wire",
+ "shachain2pc-mpc-core",
  "shachain2pc-types",
  "tokio",
  "zeroize",
@@ -1122,8 +1123,10 @@ name = "shachain2pc-mpc-core"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "shachain2pc-emp-wire",
  "shachain2pc-mpc-types",
  "shachain2pc-types",
+ "zeroize",
 ]
 
 [[package]]

@@ -7,8 +7,10 @@ publish.workspace = true
 
 [dependencies]
 sha2 = { workspace = true }
+shachain2pc-emp-wire = { path = "../shachain2pc-emp-wire" }
 shachain2pc-mpc-types = { path = "../shachain2pc-mpc-types" }
 shachain2pc-types = { path = "../shachain2pc-types" }
+zeroize = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

@@ -15,6 +15,10 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
+pub use shachain2pc_mpc_core::AShareBundle;
+use shachain2pc_mpc_core::{
+    reveal_local_share, reveal_recipient_bits, verify_share_relation, RevealError,
+};
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
 use std::sync::OnceLock;
@@ -1532,28 +1536,6 @@ fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {
     // planes are already 128 contiguous rows of bs blocks each, so view them as
     // bytes directly instead of copying into a scratch buffer first.
     transpose_128_rows(Block::slice_as_bytes(planes), bs * BLOCK_BYTES, bs * 128)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AShareBundle {
-    pub mac: Block,
-    pub key: Block,
-}
-
-impl Default for AShareBundle {
-    fn default() -> Self {
-        Self {
-            mac: Block::zero(),
-            key: Block::zero(),
-        }
-    }
-}
-
-impl Zeroize for AShareBundle {
-    fn zeroize(&mut self) {
-        self.mac.zeroize();
-        self.key.zeroize();
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3080,16 +3062,10 @@ impl Ag2pcProtocol {
         role: Role,
     ) -> Result<Vec<u8>> {
         let n = wires.len();
-        let my_share: Vec<u8> = wires
-            .wire_bundle
-            .iter()
-            .map(|wire| block_lsb(wire.mac))
-            .collect();
-        let my_macs: Vec<Block> = wires.wire_bundle.iter().map(|wire| wire.mac).collect();
+        let local = reveal_local_share(&wires.wire_bundle);
         if self.party != role {
-            let digest = hash_once(&blocks_to_bytes(&my_macs));
-            streams.main.send_data(&my_share).await?;
-            streams.main.send_data(&digest).await?;
+            streams.main.send_data(&local.share_bits).await?;
+            streams.main.send_data(&local.mac_digest).await?;
             streams.main.flush().await?;
             Ok(Vec::new())
         } else {
@@ -3100,19 +3076,14 @@ impl Ag2pcProtocol {
                 .await?
                 .try_into()
                 .expect("digest length");
-            let exp_macs: Vec<Block> = wires
-                .wire_bundle
-                .iter()
-                .zip(&peer_share)
-                .map(|(wire, share)| wire.key.xor(select_block(*share).and(self.delta)))
-                .collect();
-            if hash_once(&blocks_to_bytes(&exp_macs)) != peer_digest {
-                return Err(CompatError::FeqMismatch);
-            }
-            Ok((0..n)
-                .map(|i| my_share[i] ^ wires.lambda[i] ^ (peer_share[i] & 1))
-                .map(|bit| bit & 1)
-                .collect())
+            reveal_recipient_bits(
+                &wires.lambda,
+                &wires.wire_bundle,
+                &peer_share,
+                peer_digest,
+                self.delta,
+            )
+            .map_err(map_reveal_error)
         }
     }
 
@@ -3176,6 +3147,15 @@ async fn ag2pc_send_input_open<S: ByteIo>(
     }
     stream.flush().await?;
     Ok(())
+}
+
+fn map_reveal_error(error: RevealError) -> CompatError {
+    match error {
+        RevealError::MacDigestMismatch => CompatError::FeqMismatch,
+        RevealError::BadWireShape { .. } | RevealError::PeerShareLength { .. } => {
+            CompatError::BadAg2pcInputShape
+        }
+    }
 }
 
 async fn ag2pc_recv_input_open<S: ByteIo>(
@@ -3855,16 +3835,7 @@ pub fn verify_ag2pc_share_relation(
     peer: &[AShareBundle],
     peer_delta: Block,
 ) -> bool {
-    local.len() == peer.len()
-        && local.iter().zip(peer).all(|(mine, theirs)| {
-            let mine_expected = theirs
-                .key
-                .xor(select_block(block_lsb(mine.mac)).and(peer_delta));
-            let peer_expected = mine
-                .key
-                .xor(select_block(block_lsb(theirs.mac)).and(local_delta));
-            mine.mac == mine_expected && theirs.mac == peer_expected
-        })
+    verify_share_relation(local, local_delta, peer, peer_delta)
 }
 
 fn checked_nonnegative(name: &'static str, value: i32) -> Result<usize> {

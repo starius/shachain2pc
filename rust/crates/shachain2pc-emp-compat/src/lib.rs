@@ -14,7 +14,9 @@ use p256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
-use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, EmpStream, WireError, BLOCK_BYTES};
+use shachain2pc_emp_wire::{
+    Ag2pcStreams, Block, ByteIo, EmpStream, TranscriptIo, WireError, BLOCK_BYTES,
+};
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
 use std::sync::OnceLock;
@@ -1136,7 +1138,11 @@ impl SoftSpoken4 {
         self.delta
     }
 
-    pub async fn run(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+    pub async fn run<S: TranscriptIo>(
+        &mut self,
+        stream: &mut S,
+        length: usize,
+    ) -> Result<Vec<Block>> {
         let mut out = vec![Block::zero(); length];
         let got = self.drain_leftover(&mut out);
         if got == length {
@@ -1149,7 +1155,7 @@ impl SoftSpoken4 {
         Ok(out)
     }
 
-    pub async fn begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+    pub async fn begin<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         if self.role == Role::Alice {
             self.send_begin(stream).await
         } else {
@@ -1157,7 +1163,7 @@ impl SoftSpoken4 {
         }
     }
 
-    pub async fn end(&mut self, stream: &mut EmpStream) -> Result<()> {
+    pub async fn end<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         if self.role == Role::Alice {
             self.send_end(stream).await
         } else {
@@ -1165,7 +1171,11 @@ impl SoftSpoken4 {
         }
     }
 
-    pub async fn next_n(&mut self, stream: &mut EmpStream, length: usize) -> Result<Vec<Block>> {
+    pub async fn next_n<S: TranscriptIo>(
+        &mut self,
+        stream: &mut S,
+        length: usize,
+    ) -> Result<Vec<Block>> {
         let mut out = vec![Block::zero(); length];
         let mut got = self.drain_leftover(&mut out);
         while got + SOFTSPOKEN_CHUNK_OTS <= length {
@@ -1202,7 +1212,11 @@ impl SoftSpoken4 {
         take
     }
 
-    async fn next_chunk(&mut self, stream: &mut EmpStream, bs: usize) -> Result<Vec<Block>> {
+    async fn next_chunk<S: TranscriptIo>(
+        &mut self,
+        stream: &mut S,
+        bs: usize,
+    ) -> Result<Vec<Block>> {
         if self.role == Role::Alice {
             self.send_chunk_pipeline(stream, bs).await
         } else {
@@ -1210,7 +1224,7 @@ impl SoftSpoken4 {
         }
     }
 
-    async fn send_begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn send_begin<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         self.reset_leftover();
         if !self.setup_done {
             self.bootstrap_send(stream).await?;
@@ -1224,7 +1238,7 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn recv_begin(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn recv_begin<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         self.reset_leftover();
         if !self.setup_done {
             self.bootstrap_recv(stream).await?;
@@ -1239,7 +1253,7 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn send_end(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn send_end<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         if self.malicious {
             let _scratch = self.send_chunk_pipeline(stream, 1).await?;
             let x = stream.recv_block(1).await?[0];
@@ -1252,7 +1266,7 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn recv_end(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn recv_end<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         if self.malicious {
             let _scratch = self.recv_chunk_pipeline(stream, 1).await?;
             stream.send_block(&[self.check_x]).await?;
@@ -1262,7 +1276,7 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn bootstrap_send(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn bootstrap_send<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         let mut choices = Vec::with_capacity(128);
         for i in 0..SOFTSPOKEN_N {
             let mut alpha = 0usize;
@@ -1298,7 +1312,7 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn bootstrap_recv(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn bootstrap_recv<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         self.leaves_send = vec![Block::zero(); SOFTSPOKEN_N * SOFTSPOKEN_Q];
         let mut k0 = Vec::with_capacity(128);
         let mut k1 = Vec::with_capacity(128);
@@ -1322,7 +1336,7 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn pprf_check_send(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn pprf_check_send<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
         let mut t_buf = vec![Block::zero(); SOFTSPOKEN_N * 2];
         let mut hash = Sha256::new();
@@ -1347,7 +1361,7 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn pprf_check_recv(&mut self, stream: &mut EmpStream) -> Result<()> {
+    async fn pprf_check_recv<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
         let t_buf = stream.recv_block(SOFTSPOKEN_N * 2).await?;
         let their_digest = stream.recv_data(HASH_DIGEST_BYTES).await?;
@@ -1380,9 +1394,9 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    async fn send_chunk_pipeline(
+    async fn send_chunk_pipeline<S: TranscriptIo>(
         &mut self,
-        stream: &mut EmpStream,
+        stream: &mut S,
         bs: usize,
     ) -> Result<Vec<Block>> {
         let mut planes = vec![Block::zero(); 128 * bs];
@@ -1421,9 +1435,9 @@ impl SoftSpoken4 {
         Ok(out)
     }
 
-    async fn recv_chunk_pipeline(
+    async fn recv_chunk_pipeline<S: TranscriptIo>(
         &mut self,
-        stream: &mut EmpStream,
+        stream: &mut S,
         bs: usize,
     ) -> Result<Vec<Block>> {
         let mut planes = vec![Block::zero(); 128 * bs];
@@ -1464,9 +1478,9 @@ impl SoftSpoken4 {
         Ok(out)
     }
 
-    fn combine_send_chunk(
+    fn combine_send_chunk<S: TranscriptIo>(
         &mut self,
-        stream: &mut EmpStream,
+        stream: &mut S,
         out: &[Block],
         bs: usize,
     ) -> Result<()> {
@@ -1480,9 +1494,9 @@ impl SoftSpoken4 {
         Ok(())
     }
 
-    fn combine_recv_chunk(
+    fn combine_recv_chunk<S: TranscriptIo>(
         &mut self,
-        stream: &mut EmpStream,
+        stream: &mut S,
         out: &[Block],
         u_canonical: &[Block],
         bs: usize,
@@ -3645,15 +3659,15 @@ impl Drop for Ag2pcTriplePool {
     }
 }
 
-async fn ag2pc_begin_flush(soft: &mut SoftSpoken4, stream: &mut EmpStream) -> Result<()> {
+async fn ag2pc_begin_flush<S: TranscriptIo>(soft: &mut SoftSpoken4, stream: &mut S) -> Result<()> {
     soft.begin(stream).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn ag2pc_next_n_flush(
+async fn ag2pc_next_n_flush<S: TranscriptIo>(
     soft: &mut SoftSpoken4,
-    stream: &mut EmpStream,
+    stream: &mut S,
     count: usize,
 ) -> Result<Vec<Block>> {
     let out = soft.next_n(stream, count).await?;
@@ -3661,7 +3675,7 @@ async fn ag2pc_next_n_flush(
     Ok(out)
 }
 
-async fn ag2pc_end_flush(soft: &mut SoftSpoken4, stream: &mut EmpStream) -> Result<()> {
+async fn ag2pc_end_flush<S: TranscriptIo>(soft: &mut SoftSpoken4, stream: &mut S) -> Result<()> {
     soft.end(stream).await?;
     stream.flush().await?;
     Ok(())

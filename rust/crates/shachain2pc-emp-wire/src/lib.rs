@@ -334,6 +334,18 @@ pub trait ByteIo: Send {
     }
 }
 
+pub trait TranscriptIo: ByteIo {
+    fn enable_fs(&mut self, send_first: bool) -> Result<()>;
+
+    fn fs_enabled(&self) -> bool;
+
+    fn get_send_digest(&self) -> Result<Block>;
+
+    fn get_recv_digest(&self) -> Result<Block>;
+
+    fn get_digest(&self) -> Result<Block>;
+}
+
 pub struct EmpStream {
     stream: TcpStream,
     send_counter: u64,
@@ -568,6 +580,28 @@ impl ByteIo for EmpStream {
         partial_bytes: usize,
     ) -> Result<Vec<Block>> {
         EmpStream::recv_partial_blocks(self, count, partial_bytes).await
+    }
+}
+
+impl TranscriptIo for EmpStream {
+    fn enable_fs(&mut self, send_first: bool) -> Result<()> {
+        EmpStream::enable_fs(self, send_first)
+    }
+
+    fn fs_enabled(&self) -> bool {
+        EmpStream::fs_enabled(self)
+    }
+
+    fn get_send_digest(&self) -> Result<Block> {
+        EmpStream::get_send_digest(self)
+    }
+
+    fn get_recv_digest(&self) -> Result<Block> {
+        EmpStream::get_recv_digest(self)
+    }
+
+    fn get_digest(&self) -> Result<Block> {
+        EmpStream::get_digest(self)
     }
 }
 

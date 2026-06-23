@@ -19,8 +19,8 @@ pub use shachain2pc_mpc_core::{
     SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_Q,
 };
 use shachain2pc_mpc_core::{
-    finalize_input_open, gf_inner_product, gf_pack_128, reveal_local_share, reveal_recipient_bits,
-    verify_share_relation, InputOpenError, Mitccrh8, RevealError,
+    finalize_input_open, reveal_local_share, reveal_recipient_bits, verify_share_relation,
+    InputOpenError, Mitccrh8, RevealError,
 };
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::sync::OnceLock;
@@ -734,40 +734,11 @@ impl SoftSpoken4 {
         stream: &mut S,
         bs: usize,
     ) -> Result<Vec<Block>> {
-        let mut planes = vec![Block::zero(); 128 * bs];
-        for i in 0..SOFTSPOKEN_N {
-            let w = sfvole_receiver_butterfly(
-                SOFTSPOKEN_K,
-                self.alphas[i],
-                &self.leaves_recv[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q],
-                self.cur_send_b0,
-                bs,
-                self.cur_send_session,
-            );
-            for bit in 0..SOFTSPOKEN_K {
-                let dst = (i * SOFTSPOKEN_K + bit) * bs;
-                planes[dst..dst + bs].copy_from_slice(&w[bit * bs..(bit + 1) * bs]);
-            }
-        }
+        let planes = self.send_chunk_prepare(bs);
         let d_bufs = stream.recv_block((SOFTSPOKEN_N - 1) * bs).await?;
-        for i in 1..SOFTSPOKEN_N {
-            let d_i = &d_bufs[(i - 1) * bs..i * bs];
-            for bit in 0..SOFTSPOKEN_K {
-                if ((self.alphas[i] >> bit) & 1) != 0 {
-                    let offset = (i * SOFTSPOKEN_K + bit) * bs;
-                    for j in 0..bs {
-                        planes[offset + j] = planes[offset + j].xor(d_i[j]);
-                    }
-                }
-            }
-        }
-        planes[..bs].fill(Block::zero());
-        let out = transpose_softspoken_planes(&planes, bs);
-        if self.malicious {
-            self.combine_send_chunk(stream, &out, bs)?;
-        }
-        self.cur_send_b0 += bs as u64;
-        Ok(out)
+        let transcript_seed = self.malicious.then(|| stream.get_digest()).transpose()?;
+        self.send_chunk_finish(planes, &d_bufs, transcript_seed, bs)
+            .map_err(|_| CompatError::FeqMismatch)
     }
 
     async fn recv_chunk_pipeline<S: TranscriptIo>(
@@ -775,83 +746,12 @@ impl SoftSpoken4 {
         stream: &mut S,
         bs: usize,
     ) -> Result<Vec<Block>> {
-        let mut planes = vec![Block::zero(); 128 * bs];
-        let (u_canonical, v0) = sfvole_sender_butterfly(
-            SOFTSPOKEN_K,
-            &self.leaves_send[..SOFTSPOKEN_Q],
-            self.cur_recv_b0,
-            bs,
-            self.cur_recv_session,
-        );
-        for bit in 0..SOFTSPOKEN_K {
-            planes[bit * bs..(bit + 1) * bs].copy_from_slice(&v0[bit * bs..(bit + 1) * bs]);
-        }
-        let mut d_bufs = vec![Block::zero(); (SOFTSPOKEN_N - 1) * bs];
-        for i in 1..SOFTSPOKEN_N {
-            let (u_temp, v_i) = sfvole_sender_butterfly(
-                SOFTSPOKEN_K,
-                &self.leaves_send[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q],
-                self.cur_recv_b0,
-                bs,
-                self.cur_recv_session,
-            );
-            for j in 0..bs {
-                d_bufs[(i - 1) * bs + j] = u_canonical[j].xor(u_temp[j]);
-            }
-            for bit in 0..SOFTSPOKEN_K {
-                let dst = (i * SOFTSPOKEN_K + bit) * bs;
-                planes[dst..dst + bs].copy_from_slice(&v_i[bit * bs..(bit + 1) * bs]);
-            }
-        }
+        let (d_bufs, out, u_canonical) = self.recv_chunk_prepare(bs);
         stream.send_block(&d_bufs).await?;
-        planes[..bs].copy_from_slice(&u_canonical);
-        let out = transpose_softspoken_planes(&planes, bs);
-        if self.malicious {
-            self.combine_recv_chunk(stream, &out, &u_canonical, bs)?;
-        }
-        self.cur_recv_b0 += bs as u64;
+        let transcript_seed = self.malicious.then(|| stream.get_digest()).transpose()?;
+        self.recv_chunk_finish(transcript_seed, &out, &u_canonical, bs);
         Ok(out)
     }
-
-    fn combine_send_chunk<S: TranscriptIo>(
-        &mut self,
-        stream: &mut S,
-        out: &[Block],
-        bs: usize,
-    ) -> Result<()> {
-        let seed = stream.get_digest()?;
-        let mut chi_prg = Prg::new(seed, 0);
-        let chi = chi_prg.random_block(bs);
-        let packed: Vec<Block> = (0..bs)
-            .map(|i| gf_pack_128(&out[i * 128..(i + 1) * 128]))
-            .collect();
-        self.check_q = self.check_q.xor(gf_inner_product(&chi, &packed));
-        Ok(())
-    }
-
-    fn combine_recv_chunk<S: TranscriptIo>(
-        &mut self,
-        stream: &mut S,
-        out: &[Block],
-        u_canonical: &[Block],
-        bs: usize,
-    ) -> Result<()> {
-        let seed = stream.get_digest()?;
-        let mut chi_prg = Prg::new(seed, 0);
-        let chi = chi_prg.random_block(bs);
-        let packed: Vec<Block> = (0..bs)
-            .map(|i| gf_pack_128(&out[i * 128..(i + 1) * 128]))
-            .collect();
-        self.check_t = self.check_t.xor(gf_inner_product(&chi, &packed));
-        self.check_x = self.check_x.xor(gf_inner_product(&chi, u_canonical));
-        Ok(())
-    }
-}
-
-fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {
-    // planes are already 128 contiguous rows of bs blocks each, so view them as
-    // bytes directly instead of copying into a scratch buffer first.
-    transpose_128_rows(Block::slice_as_bytes(planes), bs * BLOCK_BYTES, bs * 128)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3082,6 +2982,7 @@ fn random_block() -> Result<Block> {
     Ok(Block::from_bytes(bytes))
 }
 
+#[cfg(test)]
 fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
     transpose_128_rows_simd(rows, row_bytes, output_len)
 }
@@ -3092,6 +2993,7 @@ fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<B
 // transpose; the transmutes are same-size 128-bit reinterprets to change the
 // interleave granularity.
 #[inline]
+#[cfg(test)]
 fn transpose_16x16_bytes(m: [core::simd::u8x16; 16]) -> [core::simd::u8x16; 16] {
     use core::simd::{u16x8, u32x4, u64x2, u8x16};
     let mut t = [u8x16::splat(0); 16];
@@ -3135,6 +3037,7 @@ fn transpose_16x16_bytes(m: [core::simd::u8x16; 16]) -> [core::simd::u8x16; 16] 
 // one bit per movemask (simd_ge(0x80).to_bitmask()), MSB-first, advancing with a
 // per-byte left shift. `col` holds that column's byte for the 16 rows of the group.
 #[inline]
+#[cfg(test)]
 fn transpose_emit_column(
     out: &mut [Block],
     mut col: core::simd::u8x16,
@@ -3161,6 +3064,7 @@ fn transpose_emit_column(
 // the naive form. Produces the same OUT[col].bit(row) =
 // (rows[row*rb + col/8] >> (col%8)) & 1 mapping as the scalar reference
 // (tests::transpose_128_rows_matches_bit_reference).
+#[cfg(test)]
 fn transpose_128_rows_simd(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
     use core::simd::u8x16;
     const ROWS: usize = 128;

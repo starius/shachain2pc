@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use sha2::{Digest, Sha256};
@@ -424,6 +426,131 @@ impl SoftSpoken4State {
         }
         Ok(())
     }
+
+    pub fn send_chunk_prepare(&mut self, bs: usize) -> Vec<Block> {
+        let mut planes = vec![Block::zero(); 128 * bs];
+        for i in 0..SOFTSPOKEN_N {
+            let w = sfvole_receiver_butterfly(
+                SOFTSPOKEN_K,
+                self.alphas[i],
+                &self.leaves_recv[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q],
+                self.cur_send_b0,
+                bs,
+                self.cur_send_session,
+            );
+            for bit in 0..SOFTSPOKEN_K {
+                let dst = (i * SOFTSPOKEN_K + bit) * bs;
+                planes[dst..dst + bs].copy_from_slice(&w[bit * bs..(bit + 1) * bs]);
+            }
+        }
+        planes
+    }
+
+    pub fn send_chunk_finish(
+        &mut self,
+        mut planes: Vec<Block>,
+        d_bufs: &[Block],
+        transcript_seed: Option<Block>,
+        bs: usize,
+    ) -> Result<Vec<Block>, SoftSpokenStateError> {
+        let expected = (SOFTSPOKEN_N - 1) * bs;
+        if d_bufs.len() != expected {
+            return Err(SoftSpokenStateError::BaseOtLength {
+                expected,
+                actual: d_bufs.len(),
+            });
+        }
+        for i in 1..SOFTSPOKEN_N {
+            let d_i = &d_bufs[(i - 1) * bs..i * bs];
+            for bit in 0..SOFTSPOKEN_K {
+                if ((self.alphas[i] >> bit) & 1) != 0 {
+                    let offset = (i * SOFTSPOKEN_K + bit) * bs;
+                    for j in 0..bs {
+                        planes[offset + j] = planes[offset + j].xor(d_i[j]);
+                    }
+                }
+            }
+        }
+        planes[..bs].fill(Block::zero());
+        let out = transpose_softspoken_planes(&planes, bs);
+        if let Some(seed) = transcript_seed {
+            self.combine_send_chunk(seed, &out, bs);
+        }
+        self.cur_send_b0 += bs as u64;
+        Ok(out)
+    }
+
+    pub fn recv_chunk_prepare(&mut self, bs: usize) -> (Vec<Block>, Vec<Block>, Vec<Block>) {
+        let mut planes = vec![Block::zero(); 128 * bs];
+        let (u_canonical, v0) = sfvole_sender_butterfly(
+            SOFTSPOKEN_K,
+            &self.leaves_send[..SOFTSPOKEN_Q],
+            self.cur_recv_b0,
+            bs,
+            self.cur_recv_session,
+        );
+        for bit in 0..SOFTSPOKEN_K {
+            planes[bit * bs..(bit + 1) * bs].copy_from_slice(&v0[bit * bs..(bit + 1) * bs]);
+        }
+        let mut d_bufs = vec![Block::zero(); (SOFTSPOKEN_N - 1) * bs];
+        for i in 1..SOFTSPOKEN_N {
+            let (u_temp, v_i) = sfvole_sender_butterfly(
+                SOFTSPOKEN_K,
+                &self.leaves_send[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q],
+                self.cur_recv_b0,
+                bs,
+                self.cur_recv_session,
+            );
+            for j in 0..bs {
+                d_bufs[(i - 1) * bs + j] = u_canonical[j].xor(u_temp[j]);
+            }
+            for bit in 0..SOFTSPOKEN_K {
+                let dst = (i * SOFTSPOKEN_K + bit) * bs;
+                planes[dst..dst + bs].copy_from_slice(&v_i[bit * bs..(bit + 1) * bs]);
+            }
+        }
+        planes[..bs].copy_from_slice(&u_canonical);
+        let out = transpose_softspoken_planes(&planes, bs);
+        (d_bufs, out, u_canonical)
+    }
+
+    pub fn recv_chunk_finish(
+        &mut self,
+        transcript_seed: Option<Block>,
+        out: &[Block],
+        u_canonical: &[Block],
+        bs: usize,
+    ) {
+        if let Some(seed) = transcript_seed {
+            self.combine_recv_chunk(seed, out, u_canonical, bs);
+        }
+        self.cur_recv_b0 += bs as u64;
+    }
+
+    fn combine_send_chunk(&mut self, transcript_seed: Block, out: &[Block], bs: usize) {
+        let mut chi_prg = Prg::new(transcript_seed, 0);
+        let chi = chi_prg.random_block(bs);
+        let packed: Vec<Block> = (0..bs)
+            .map(|i| gf_pack_128(&out[i * 128..(i + 1) * 128]))
+            .collect();
+        self.check_q = self.check_q.xor(gf_inner_product(&chi, &packed));
+    }
+
+    fn combine_recv_chunk(
+        &mut self,
+        transcript_seed: Block,
+        out: &[Block],
+        u_canonical: &[Block],
+        bs: usize,
+    ) {
+        let mut chi_prg = Prg::new(transcript_seed, 0);
+        let chi = chi_prg.random_block(bs);
+        let packed: Vec<Block> = (0..bs)
+            .map(|i| gf_pack_128(&out[i * 128..(i + 1) * 128]))
+            .collect();
+        self.check_t = self.check_t.xor(gf_inner_product(&chi, &packed));
+        self.check_x = self.check_x.xor(gf_inner_product(&chi, u_canonical));
+    }
 }
 
 const CGGM_LSB_CLEAR_MASK: Block = Block::from_bytes([
@@ -729,6 +856,153 @@ fn block_to_bools(block: Block) -> [bool; 128] {
         out[i] = ((bytes[i / 8] >> (i % 8)) & 1) != 0;
     }
     out
+}
+
+pub fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {
+    // planes are already 128 contiguous rows of bs blocks each, so view them as
+    // bytes directly instead of copying into a scratch buffer first.
+    transpose_128_rows(Block::slice_as_bytes(planes), bs * BLOCK_BYTES, bs * 128)
+}
+
+pub fn transpose_128_rows(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    transpose_128_rows_simd(rows, row_bytes, output_len)
+}
+
+fn transpose_16x16_bytes(m: [core::simd::u8x16; 16]) -> [core::simd::u8x16; 16] {
+    use core::simd::{u16x8, u32x4, u64x2, u8x16};
+    let mut t = [u8x16::splat(0); 16];
+    for i in 0..8 {
+        let (lo, hi) = m[2 * i].interleave(m[2 * i + 1]);
+        t[2 * i] = lo;
+        t[2 * i + 1] = hi;
+    }
+    // SAFETY: u8x16/u16x8/u32x4/u64x2 are all 128-bit repr(simd); the [_; 16]
+    // arrays have identical size and alignment, so the bitcasts are sound.
+    let t16: [u16x8; 16] = unsafe { core::mem::transmute(t) };
+    let mut u = [u16x8::splat(0); 16];
+    for i in 0..4 {
+        let (lo, hi) = t16[4 * i].interleave(t16[4 * i + 2]);
+        u[4 * i] = lo;
+        u[4 * i + 1] = hi;
+        let (lo, hi) = t16[4 * i + 1].interleave(t16[4 * i + 3]);
+        u[4 * i + 2] = lo;
+        u[4 * i + 3] = hi;
+    }
+    let u32v: [u32x4; 16] = unsafe { core::mem::transmute(u) };
+    let mut v = [u32x4::splat(0); 16];
+    for i in 0..2 {
+        for k in 0..4 {
+            let (lo, hi) = u32v[8 * i + k].interleave(u32v[8 * i + k + 4]);
+            v[8 * i + 2 * k] = lo;
+            v[8 * i + 2 * k + 1] = hi;
+        }
+    }
+    let v64: [u64x2; 16] = unsafe { core::mem::transmute(v) };
+    let mut r = [u64x2::splat(0); 16];
+    for k in 0..8 {
+        let (lo, hi) = v64[k].interleave(v64[k + 8]);
+        r[2 * k] = lo;
+        r[2 * k + 1] = hi;
+    }
+    unsafe { core::mem::transmute(r) }
+}
+
+fn transpose_emit_column(
+    out: &mut [Block],
+    mut col: core::simd::u8x16,
+    source_byte: usize,
+    row_group: usize,
+) {
+    use core::simd::cmp::SimdPartialOrd;
+    use core::simd::u8x16;
+    let msb = u8x16::splat(0x80);
+    let one = u8x16::splat(1);
+    for bit in (0..8).rev() {
+        let mask = col.simd_ge(msb).to_bitmask() as u16;
+        let ob = out[source_byte * 8 + bit].as_mut_bytes();
+        ob[row_group * 2] = mask as u8;
+        ob[row_group * 2 + 1] = (mask >> 8) as u8;
+        col <<= one;
+    }
+}
+
+// Portable-SIMD bit-matrix transpose of a 128-row matrix (std::simd, so the same
+// code targets AVX2 on x86_64 and NEON on aarch64). It loads 16 contiguous bytes
+// per row, transposes each 16x16 byte tile in registers (transpose_16x16_bytes),
+// then peels off the bits with movemask -- avoiding the strided per-byte gather
+// of the naive form.
+fn transpose_128_rows_simd(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    use core::simd::u8x16;
+    const ROWS: usize = 128;
+    const ROW_GROUPS: usize = ROWS / 16;
+    debug_assert_eq!(output_len, row_bytes * 8);
+    debug_assert_eq!(rows.len(), ROWS * row_bytes);
+    let mut out = vec![Block::zero(); output_len];
+    let col_tiles = row_bytes / 16;
+    for rg in 0..ROW_GROUPS {
+        for cg in 0..col_tiles {
+            let mut m = [u8x16::splat(0); 16];
+            for (r, slot) in m.iter_mut().enumerate() {
+                let off = (rg * 16 + r) * row_bytes + cg * 16;
+                *slot = u8x16::from_slice(&rows[off..off + 16]);
+            }
+            let cols = transpose_16x16_bytes(m);
+            for (c, col) in cols.into_iter().enumerate() {
+                transpose_emit_column(&mut out, col, cg * 16 + c, rg);
+            }
+        }
+    }
+    // Tail: any columns past the last full 16-byte tile (only hit when row_bytes
+    // is not a multiple of 16, e.g. the row_bytes=1 unit test). Gather per
+    // column.
+    let mut lane = [0u8; 16];
+    for source_byte in (col_tiles * 16)..row_bytes {
+        for rg in 0..ROW_GROUPS {
+            let base = rg * 16;
+            for (i, slot) in lane.iter_mut().enumerate() {
+                *slot = rows[(base + i) * row_bytes + source_byte];
+            }
+            transpose_emit_column(&mut out, u8x16::from_array(lane), source_byte, rg);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn transpose_128_rows_soft(rows: &[u8], row_bytes: usize, output_len: usize) -> Vec<Block> {
+    debug_assert_eq!(output_len, row_bytes * 8);
+    let mut out = vec![Block::zero(); output_len];
+    for source_byte in 0..row_bytes {
+        for (group, _) in [0u8; BLOCK_BYTES].iter().enumerate() {
+            let row = group * 8;
+            let x = u64::from_le_bytes([
+                rows[(row) * row_bytes + source_byte],
+                rows[(row + 1) * row_bytes + source_byte],
+                rows[(row + 2) * row_bytes + source_byte],
+                rows[(row + 3) * row_bytes + source_byte],
+                rows[(row + 4) * row_bytes + source_byte],
+                rows[(row + 5) * row_bytes + source_byte],
+                rows[(row + 6) * row_bytes + source_byte],
+                rows[(row + 7) * row_bytes + source_byte],
+            ]);
+            let transposed = transpose_8x8(x).to_le_bytes();
+            for bit in 0..8 {
+                out[source_byte * 8 + bit].as_mut_bytes()[group] = transposed[bit];
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn transpose_8x8(mut x: u64) -> u64 {
+    let mut t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+    x ^= t ^ (t << 7);
+    t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+    x ^= t ^ (t << 14);
+    t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+    x ^= t ^ (t << 28);
+    x
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1639,6 +1913,44 @@ mod tests {
         let local = pairs.iter().map(|(local, _peer)| *local).collect();
         let peer = pairs.iter().map(|(_local, peer)| *peer).collect();
         (local_delta, peer_delta, local, peer)
+    }
+
+    #[test]
+    fn transpose_128_rows_matches_bit_reference() {
+        const ROWS: usize = 128;
+        for row_bytes in [1usize, 16, 32, 256] {
+            let output_len = row_bytes * 8;
+            let mut rows = vec![0u8; ROWS * row_bytes];
+            for (i, byte) in rows.iter_mut().enumerate() {
+                *byte = ((i * 37 + i / 7 + 0x5a) & 0xff) as u8;
+            }
+            let reference = transpose_128_rows_bit_reference(&rows, row_bytes, output_len);
+            assert_eq!(transpose_128_rows(&rows, row_bytes, output_len), reference);
+            assert_eq!(
+                transpose_128_rows_soft(&rows, row_bytes, output_len),
+                reference
+            );
+        }
+    }
+
+    fn transpose_128_rows_bit_reference(
+        rows: &[u8],
+        row_bytes: usize,
+        output_len: usize,
+    ) -> Vec<Block> {
+        let mut out = vec![Block::zero(); output_len];
+        for (col, out_block) in out.iter_mut().enumerate() {
+            let mut bytes = [0u8; BLOCK_BYTES];
+            let source_byte = col / 8;
+            let source_mask = 1 << (col % 8);
+            for row in 0..128 {
+                if (rows[row * row_bytes + source_byte] & source_mask) != 0 {
+                    bytes[row / 8] |= 1 << (row % 8);
+                }
+            }
+            *out_block = Block::from_bytes(bytes);
+        }
+        out
     }
 
     fn next_u64(state: &mut u64) -> u64 {

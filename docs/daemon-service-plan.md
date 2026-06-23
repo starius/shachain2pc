@@ -363,7 +363,7 @@ deferred to avoid platform-specific transport work in the first daemon version.
 service PeerService {
   rpc Hello(HelloRequest) returns (HelloResponse);
   rpc ConfigStream(stream ConfigUpdate) returns (stream ConfigUpdate);
-  rpc JobStream(stream PeerFrame) returns (stream PeerFrame);
+  rpc JobStream(stream JobFrame) returns (stream JobFrame);
 }
 ```
 
@@ -382,9 +382,11 @@ protocol_version
 ```
 
 `JobStream` carries framed MPC messages plus job coordination frames. Use one
-bidirectional stream per active job or per worker, not one global stream for all
-jobs. A single global stream would make chatty one-H jobs block each other behind
-HTTP/2 stream-level ordering and would undermine parallel workers.
+pair of bidirectional streams per active job: one stream for AG2PC `main` and
+one stream for `sibling`. Do not multiplex all logical channels or all jobs onto
+one ordered stream, because chatty one-H jobs and opposite-direction AG2PC
+traffic can block each other behind stream-level ordering and undermine
+parallel workers.
 
 ```text
 StartJob(job_id, channel_index, node, priority, transcript_digest)

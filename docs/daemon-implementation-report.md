@@ -37,6 +37,8 @@ with the real CLI. It verifies:
 - automatic background precompute to the shared local/peer target;
 - cap refusal without consuming the monitoring counters;
 - failed precompute attempts being recorded for monitoring.
+- rollback repair, where one peer loses its DB and a later precompute jointly
+  recomputes the missing frontier state.
 
 ## Frontier State
 
@@ -98,15 +100,14 @@ cleartext intermediates.
   parties. The daemon enforces the configured cap for precompute requests, but
   the cap itself must still be chosen conservatively because DB rollback can
   erase the local monitor.
-- Background precompute currently runs through deterministic per-worker raw TCP
-  ports derived from the configured MPC base port. Precompute worker slot `n`
-  uses `mpc_port + 1 + n`; the base `mpc_port` remains reserved for the
-  existing one-shot reveal/full-derivation paths. Both daemons must therefore
-  reserve the same contiguous worker-port range.
-- The plan's gRPC JobStream transport is still a future transport swap. The
-  current per-worker TCP transport makes parallel daemon workers real without
-  changing the MPC transcript or touching the import/re-label crypto gate.
+- Background precompute runs over peer gRPC `JobStream`. Each MPC job uses two
+  bidirectional streams, one for AG2PC `main` and one for `sibling`, so the two
+  logical channels can make independent progress without raw worker ports.
+- JobStream frames bind the channel, target index, digest, `ssp_target`, and
+  Delta lifetime cap. Receivers reject descriptor or security-parameter
+  mismatches and enforce their own worker budget before accepting incoming work.
+- The daemon no longer uses `mpc_port + 1 + n` worker ports. The configured
+  `mpc_port` remains for the existing one-shot reveal/full-derivation paths and
+  for the legacy C++-compatible `party` transport.
 - The local API currently uses loopback TCP plus a cookie. Peer API TLS/mTLS is
   still a production hardening item from the plan.
-- Peer gRPC is not yet the raw MPC transport. The daemon still coordinates jobs
-  that use the existing EMP-compatible TCP transport.

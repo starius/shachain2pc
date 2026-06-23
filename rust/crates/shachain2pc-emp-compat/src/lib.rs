@@ -2492,78 +2492,18 @@ impl Ag2pcTriplePool {
         l: usize,
         hashes: &mut Ag2pcComputeHashes<'_>,
     ) -> Result<()> {
-        let mut g_blocks = Vec::with_capacity(l);
-        for k0 in (0..l).step_by(8) {
-            let batch = (l - k0).min(8);
-            let mut pad = [Block::zero(); 16];
-            for j in 0..8 {
-                if j < batch {
-                    let kk = key[k0 + j];
-                    pad[2 * j] = kk;
-                    pad[2 * j + 1] = kk.xor(self.delta);
-                }
-            }
-            hashes.gmitc.hash(&mut pad, 8, 2);
-            for j in 0..batch {
-                let k = k0 + j;
-                let c = select_block(block_lsb(mac[l + k]))
-                    .and(self.delta)
-                    .xor(key[l + k])
-                    .xor(mac[l + k]);
-                g_blocks.push(pad[2 * j].xor(pad[2 * j + 1]).xor(c));
-            }
-        }
-        let mut w_blocks = self.exchange_blocks(streams, &g_blocks, l).await?;
+        let mut g_blocks = self
+            .leaky_and_prepare_g(mac, key, l, hashes.gmitc)
+            .map_err(|_| CompatError::BadAg2pcInputShape)?;
+        let w_blocks = self.exchange_blocks(streams, &g_blocks, l).await?;
         g_blocks.zeroize();
         drop(g_blocks);
-
-        let mut sout = vec![Block::zero(); l];
-        for k0 in (0..l).step_by(8) {
-            let batch = (l - k0).min(8);
-            let mut pad = [Block::zero(); 16];
-            for j in 0..8 {
-                if j < batch {
-                    pad[2 * j] = mac[k0 + j];
-                    pad[2 * j + 1] = key[k0 + j];
-                }
-            }
-            hashes.emitc.hash(&mut pad, 8, 2);
-            for j in 0..batch {
-                let k = k0 + j;
-                let hm = pad[2 * j];
-                let hk = pad[2 * j + 1];
-                let e = hm.xor(w_blocks[k].and(select_block(block_lsb(mac[k]))));
-                let c = select_block(block_lsb(mac[l + k]))
-                    .and(self.delta)
-                    .xor(key[l + k])
-                    .xor(mac[l + k]);
-                sout[k] = hk
-                    .xor(e)
-                    .xor(key[2 * l + k])
-                    .xor(mac[2 * l + k])
-                    .xor(c.and(select_block(block_lsb(mac[k]))))
-                    .xor(self.delta.and(select_block(block_lsb(mac[2 * l + k]))));
-            }
-        }
-
-        w_blocks.zeroize();
-        drop(w_blocks);
-
-        let s_me: Vec<u8> = sout.iter().map(|block| block_lsb1(*block)).collect();
+        let (s_me, sout) = self
+            .leaky_and_prepare_s(mac, key, l, hashes.emitc, w_blocks)
+            .map_err(|_| CompatError::BadAg2pcInputShape)?;
         let s_peer = self.exchange_bool_vector(streams, &s_me, l).await?;
-        let dxor = self.delta.xor(bit0_mask());
-        for k in 0..l {
-            let d = s_me[k] ^ s_peer[k];
-            let mask = select_block(d);
-            if self.party == Role::Alice {
-                mac[2 * l + k] = mac[2 * l + k].xor(bit0_mask().and(mask));
-            } else {
-                key[2 * l + k] = key[2 * l + k].xor(dxor.and(mask));
-            }
-            sout[k] = sout[k].xor(self.delta.and(mask));
-        }
-        hashes.feq.update(Block::slice_as_bytes(&sout));
-        Ok(())
+        self.leaky_and_finish(mac, key, l, &s_me, &s_peer, sout, hashes.feq)
+            .map_err(|_| CompatError::BadAg2pcInputShape)
     }
 
     async fn layered_bucket_into_acc<S: TranscriptIo>(
@@ -2904,10 +2844,6 @@ fn block_lsb(block: Block) -> u8 {
 
 fn block_lsb1(block: Block) -> u8 {
     (block.as_bytes()[0] >> 1) & 1
-}
-
-fn bit0_mask() -> Block {
-    Block::make(0, 1)
 }
 
 pub fn verify_ag2pc_share_relation(

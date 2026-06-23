@@ -44,8 +44,19 @@ pub struct Ag2pcTriplePoolState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ag2pcTriplePoolError {
     BadInputShape,
-    CotLength { expected: usize, actual: usize },
-    PeerBitLength { expected: usize, actual: usize },
+    CotLength {
+        expected: usize,
+        actual: usize,
+    },
+    PeerBitLength {
+        expected: usize,
+        actual: usize,
+    },
+    BufferLength {
+        name: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for Ag2pcTriplePoolError {
@@ -61,6 +72,14 @@ impl fmt::Display for Ag2pcTriplePoolError {
             Self::PeerBitLength { expected, actual } => write!(
                 f,
                 "AG2PC peer bit length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::BufferLength {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "AG2PC {name} length mismatch: expected {expected}, got {actual}"
             ),
         }
     }
@@ -236,12 +255,135 @@ impl Ag2pcTriplePoolState {
     pub fn mark_cot_check_flushed(&mut self) {
         self.cots_minted_since_check = false;
     }
+
+    pub fn leaky_and_prepare_g(
+        &self,
+        mac: &[Block],
+        key: &[Block],
+        l: usize,
+        gmitc: &mut Mitccrh8,
+    ) -> Result<Vec<Block>, Ag2pcTriplePoolError> {
+        require_len("mac", mac.len(), 3 * l)?;
+        require_len("key", key.len(), 3 * l)?;
+        let mut g_blocks = Vec::with_capacity(l);
+        for k0 in (0..l).step_by(8) {
+            let batch = (l - k0).min(8);
+            let mut pad = [Block::zero(); 16];
+            for j in 0..8 {
+                if j < batch {
+                    let kk = key[k0 + j];
+                    pad[2 * j] = kk;
+                    pad[2 * j + 1] = kk.xor(self.delta);
+                }
+            }
+            gmitc.hash(&mut pad, 8, 2);
+            for j in 0..batch {
+                let k = k0 + j;
+                let c = select_block(block_lsb(mac[l + k]))
+                    .and(self.delta)
+                    .xor(key[l + k])
+                    .xor(mac[l + k]);
+                g_blocks.push(pad[2 * j].xor(pad[2 * j + 1]).xor(c));
+            }
+        }
+        Ok(g_blocks)
+    }
+
+    pub fn leaky_and_prepare_s(
+        &self,
+        mac: &[Block],
+        key: &[Block],
+        l: usize,
+        emitc: &mut Mitccrh8,
+        mut w_blocks: Vec<Block>,
+    ) -> Result<(Vec<u8>, Vec<Block>), Ag2pcTriplePoolError> {
+        require_len("mac", mac.len(), 3 * l)?;
+        require_len("key", key.len(), 3 * l)?;
+        require_len("W blocks", w_blocks.len(), l)?;
+        let mut sout = vec![Block::zero(); l];
+        for k0 in (0..l).step_by(8) {
+            let batch = (l - k0).min(8);
+            let mut pad = [Block::zero(); 16];
+            for j in 0..8 {
+                if j < batch {
+                    pad[2 * j] = mac[k0 + j];
+                    pad[2 * j + 1] = key[k0 + j];
+                }
+            }
+            emitc.hash(&mut pad, 8, 2);
+            for j in 0..batch {
+                let k = k0 + j;
+                let hm = pad[2 * j];
+                let hk = pad[2 * j + 1];
+                let e = hm.xor(w_blocks[k].and(select_block(block_lsb(mac[k]))));
+                let c = select_block(block_lsb(mac[l + k]))
+                    .and(self.delta)
+                    .xor(key[l + k])
+                    .xor(mac[l + k]);
+                sout[k] = hk
+                    .xor(e)
+                    .xor(key[2 * l + k])
+                    .xor(mac[2 * l + k])
+                    .xor(c.and(select_block(block_lsb(mac[k]))))
+                    .xor(self.delta.and(select_block(block_lsb(mac[2 * l + k]))));
+            }
+        }
+        w_blocks.zeroize();
+        let s_me = sout.iter().map(|block| block_lsb1(*block)).collect();
+        Ok((s_me, sout))
+    }
+
+    pub fn leaky_and_finish(
+        &self,
+        mac: &mut [Block],
+        key: &mut [Block],
+        l: usize,
+        s_me: &[u8],
+        s_peer: &[u8],
+        mut sout: Vec<Block>,
+        feq: &mut Sha256,
+    ) -> Result<(), Ag2pcTriplePoolError> {
+        require_len("mac", mac.len(), 3 * l)?;
+        require_len("key", key.len(), 3 * l)?;
+        require_len("s_me", s_me.len(), l)?;
+        require_len("s_peer", s_peer.len(), l)?;
+        require_len("sout", sout.len(), l)?;
+        let dxor = self.delta.xor(bit0_mask());
+        for k in 0..l {
+            let d = s_me[k] ^ s_peer[k];
+            let mask = select_block(d);
+            if self.party == Role::Alice {
+                mac[2 * l + k] = mac[2 * l + k].xor(bit0_mask().and(mask));
+            } else {
+                key[2 * l + k] = key[2 * l + k].xor(dxor.and(mask));
+            }
+            sout[k] = sout[k].xor(self.delta.and(mask));
+        }
+        feq.update(Block::slice_as_bytes(&sout));
+        sout.zeroize();
+        Ok(())
+    }
 }
 
 impl Drop for Ag2pcTriplePoolState {
     fn drop(&mut self) {
         self.delta.zeroize();
     }
+}
+
+fn require_len(
+    name: &'static str,
+    actual: usize,
+    expected: usize,
+) -> Result<(), Ag2pcTriplePoolError> {
+    if actual != expected {
+        return Err(Ag2pcTriplePoolError::BufferLength {
+            name,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 pub struct Prp {
@@ -2082,6 +2224,10 @@ fn select_block(bit: u8) -> Block {
 
 fn block_lsb(block: Block) -> u8 {
     u8::from(block.get_lsb())
+}
+
+fn block_lsb1(block: Block) -> u8 {
+    (block.as_bytes()[0] >> 1) & 1
 }
 
 fn bit0_mask() -> Block {

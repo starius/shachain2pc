@@ -658,12 +658,12 @@ impl EmpStreams {
     }
 }
 
-pub struct Ag2pcStreams {
-    pub main: EmpStream,
-    pub sibling: EmpStream,
+pub struct Ag2pcStreams<S = EmpStream> {
+    pub main: S,
+    pub sibling: S,
 }
 
-impl Ag2pcStreams {
+impl Ag2pcStreams<EmpStream> {
     pub async fn open(role: Role, port: u16, peer_ip: IpAddr) -> Result<Self> {
         match role {
             Role::Alice => Self::listen(port).await,
@@ -687,8 +687,10 @@ impl Ag2pcStreams {
         let sibling = connect_emp(addr).await?;
         Ok(Self { main, sibling })
     }
+}
 
-    pub fn streams_mut(&mut self) -> [&mut EmpStream; AG2PC_STREAM_COUNT] {
+impl<S> Ag2pcStreams<S> {
+    pub fn streams_mut(&mut self) -> [&mut S; AG2PC_STREAM_COUNT] {
         [&mut self.main, &mut self.sibling]
     }
 }

@@ -4,6 +4,7 @@ members = [
     "crates/shachain2pc-circuit",
     "crates/shachain2pc-emp-wire",
     "crates/shachain2pc-emp-compat",
+    "crates/shachain2pc-mpc-types",
     "crates/shachain2pc-party",
     "crates/shachain2pc-daemon",
 ]

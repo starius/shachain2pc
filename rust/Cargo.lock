@@ -1118,6 +1118,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shachain2pc-mpc-types"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "shachain2pc-types",
+ "zeroize",
+]
+
+[[package]]
 name = "shachain2pc-party"
 version = "0.1.0"
 dependencies = [

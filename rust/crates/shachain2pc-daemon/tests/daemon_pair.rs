@@ -2,7 +2,7 @@ use shachain2pc_daemon::{channel_seed_share, reference_for_channel};
 use shachain2pc_types::Index48;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -154,6 +154,62 @@ async fn daemon_pair_precompute_persists_only_requested_leaf() {
     assert_eq!(parse_result(&bob), expected.to_hex());
     assert_eq!(parse_cache(&alice), Some(true));
     assert_eq!(parse_cache(&bob), Some(true));
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_reuses_live_session_prefix_between_precomputes() {
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "18"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "18"])
+        .await;
+
+    let first = pair
+        .cli(&pair.alice_control, &["precompute", "18", "2"])
+        .await;
+    assert!(first.contains("nodes=1"), "{first}");
+    assert!(first.contains("checked=1"), "{first}");
+
+    let second = pair
+        .cli(&pair.alice_control, &["precompute", "18", "3"])
+        .await;
+    assert!(second.contains("nodes=1"), "{second}");
+    assert!(second.contains("checked=1"), "{second}");
+
+    let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
+    assert_channel_contains(&alice_channels, 18, "frontier=2");
+    assert_channel_contains(&alice_channels, 18, "estimated=2");
+    assert_channel_contains(&bob_channels, 18, "frontier=2");
+    assert_channel_contains(&bob_channels, 18, "estimated=2");
+
+    let expected =
+        reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 18, Index48::new(3).unwrap());
+    let (alice, bob) = tokio::join!(
+        pair.cli(&pair.alice_control, &["reveal", "18", "3", "3"]),
+        pair.cli(&pair.bob_control, &["reveal", "18", "3", "3"])
+    );
+    assert_eq!(parse_result(&alice), expected.to_hex());
+    assert_eq!(parse_result(&bob), expected.to_hex());
+    assert_eq!(parse_cache(&alice), Some(true));
+    assert_eq!(parse_cache(&bob), Some(true));
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_peer_mtls_precompute_jobstream() {
+    let pair = DaemonPair::start_mtls().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "24"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "24"])
+        .await;
+
+    let out = pair
+        .cli(&pair.alice_control, &["precompute", "24", "1"])
+        .await;
+    assert!(out.contains("nodes=1"), "{out}");
+    assert!(out.contains("checked=1"), "{out}");
     pair.stop().await;
 }
 
@@ -376,11 +432,32 @@ impl DaemonPair {
         Self::start_with_dir_and_ports(dir, ports).await
     }
 
+    async fn start_mtls() -> Self {
+        let dir = TempDir::new().unwrap();
+        let tls = generate_tls_files(dir.path());
+        let ports = Ports {
+            alice_local: free_port(),
+            alice_peer: free_port(),
+            bob_local: free_port(),
+            bob_peer: free_port(),
+            mpc: free_port_range(16),
+        };
+        Self::start_with_dir_ports_and_tls(dir, ports, Some(tls)).await
+    }
+
     async fn start_with_dir_and_ports(dir: TempDir, ports: Ports) -> Self {
+        Self::start_with_dir_ports_and_tls(dir, ports, None).await
+    }
+
+    async fn start_with_dir_ports_and_tls(
+        dir: TempDir,
+        ports: Ports,
+        tls: Option<TlsFiles>,
+    ) -> Self {
         let alice_control = dir.path().join("alice-control.json");
         let bob_control = dir.path().join("bob-control.json");
-        let alice = spawn_daemon(dir.path(), 1, MASTER_A, ports, &alice_control);
-        let bob = spawn_daemon(dir.path(), 2, MASTER_B, ports, &bob_control);
+        let alice = spawn_daemon(dir.path(), 1, MASTER_A, ports, &alice_control, tls.as_ref());
+        let bob = spawn_daemon(dir.path(), 2, MASTER_B, ports, &bob_control, tls.as_ref());
         let pair = Self {
             dir,
             alice,
@@ -491,7 +568,21 @@ impl DaemonPair {
     }
 }
 
-fn spawn_daemon(dir: &Path, role: u8, master: &str, ports: Ports, control: &Path) -> Child {
+#[derive(Clone)]
+struct TlsFiles {
+    cert: PathBuf,
+    key: PathBuf,
+    ca: PathBuf,
+}
+
+fn spawn_daemon(
+    dir: &Path,
+    role: u8,
+    master: &str,
+    ports: Ports,
+    control: &Path,
+    tls: Option<&TlsFiles>,
+) -> Child {
     let name = if role == 1 { "alice" } else { "bob" };
     let (local_port, peer_port, remote_peer_port) = if role == 1 {
         (ports.alice_local, ports.alice_peer, ports.bob_peer)
@@ -510,7 +601,11 @@ fn spawn_daemon(dir: &Path, role: u8, master: &str, ports: Ports, control: &Path
         .arg("--listen-peer")
         .arg(format!("127.0.0.1:{peer_port}"))
         .arg("--peer")
-        .arg(format!("http://127.0.0.1:{remote_peer_port}"))
+        .arg(if tls.is_some() {
+            format!("https://localhost:{remote_peer_port}")
+        } else {
+            format!("http://127.0.0.1:{remote_peer_port}")
+        })
         .arg("--mpc-port")
         .arg(ports.mpc.to_string())
         .arg("--control-file")
@@ -519,7 +614,89 @@ fn spawn_daemon(dir: &Path, role: u8, master: &str, ports: Ports, control: &Path
         .arg(dir.join(format!("{name}.cookie")))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(tls) = tls {
+        cmd.arg("--peer-tls-cert")
+            .arg(&tls.cert)
+            .arg("--peer-tls-key")
+            .arg(&tls.key)
+            .arg("--peer-tls-ca")
+            .arg(&tls.ca)
+            .arg("--peer-tls-domain")
+            .arg("localhost");
+    }
     cmd.spawn().unwrap()
+}
+
+fn generate_tls_files(dir: &Path) -> TlsFiles {
+    let tls_dir = dir.join("tls");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    let ca_key = tls_dir.join("ca.key");
+    let ca = tls_dir.join("ca.pem");
+    let key = tls_dir.join("peer.key");
+    let csr = tls_dir.join("peer.csr");
+    let cert = tls_dir.join("peer.pem");
+    let ext = tls_dir.join("peer.ext");
+    std::fs::write(
+        &ext,
+        "subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n",
+    )
+    .unwrap();
+    openssl_cmd(&[
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-keyout",
+        ca_key.to_str().unwrap(),
+        "-out",
+        ca.to_str().unwrap(),
+        "-subj",
+        "/CN=shachain2pc-test-ca",
+    ]);
+    openssl_cmd(&[
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        key.to_str().unwrap(),
+        "-out",
+        csr.to_str().unwrap(),
+        "-subj",
+        "/CN=localhost",
+    ]);
+    openssl_cmd(&[
+        "x509",
+        "-req",
+        "-in",
+        csr.to_str().unwrap(),
+        "-CA",
+        ca.to_str().unwrap(),
+        "-CAkey",
+        ca_key.to_str().unwrap(),
+        "-CAcreateserial",
+        "-out",
+        cert.to_str().unwrap(),
+        "-days",
+        "1",
+        "-extfile",
+        ext.to_str().unwrap(),
+    ]);
+    TlsFiles { cert, key, ca }
+}
+
+fn openssl_cmd(args: &[&str]) {
+    let output = StdCommand::new("openssl").args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "openssl {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn parse_result(output: &str) -> String {

@@ -1,5 +1,6 @@
 use shachain2pc_daemon::{
     parse_addr, parse_master_secret_hex, parse_role, run_daemon, DaemonConfig, DaemonError,
+    PeerTlsConfig,
 };
 use std::env;
 use std::io::{self, Read};
@@ -36,6 +37,10 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, DaemonError> {
     let mut listen_local = None;
     let mut listen_peer = None;
     let mut peer = None;
+    let mut peer_tls_cert = None;
+    let mut peer_tls_key = None;
+    let mut peer_tls_ca = None;
+    let mut peer_tls_domain = None;
     let mut mpc_port = None;
     let mut max_ram_mb = 1024u64;
     let mut workers = 1u32;
@@ -54,6 +59,10 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, DaemonError> {
             "--listen-local" => listen_local = Some(parse_addr(take(&args, &mut i, arg)?)?),
             "--listen-peer" => listen_peer = Some(parse_addr(take(&args, &mut i, arg)?)?),
             "--peer" => peer = Some(take(&args, &mut i, arg)?.to_owned()),
+            "--peer-tls-cert" => peer_tls_cert = Some(PathBuf::from(take(&args, &mut i, arg)?)),
+            "--peer-tls-key" => peer_tls_key = Some(PathBuf::from(take(&args, &mut i, arg)?)),
+            "--peer-tls-ca" => peer_tls_ca = Some(PathBuf::from(take(&args, &mut i, arg)?)),
+            "--peer-tls-domain" => peer_tls_domain = Some(take(&args, &mut i, arg)?.to_owned()),
             "--mpc-port" => {
                 let value = take(&args, &mut i, arg)?
                     .parse::<u16>()
@@ -97,12 +106,36 @@ fn parse_args(args: Vec<String>) -> Result<ParsedArgs, DaemonError> {
         return Err(DaemonError::Usage(usage(&program)));
     };
 
+    let peer_tls = match (
+        peer_tls_cert,
+        peer_tls_key,
+        peer_tls_ca,
+        peer_tls_domain,
+    ) {
+        (None, None, None, None) => None,
+        (Some(cert_path), Some(key_path), Some(ca_path), Some(domain_name)) => {
+            Some(PeerTlsConfig {
+                cert_path,
+                key_path,
+                ca_path,
+                domain_name,
+            })
+        }
+        _ => {
+            return Err(DaemonError::Usage(
+                "--peer-tls-cert, --peer-tls-key, --peer-tls-ca and --peer-tls-domain must be provided together"
+                    .to_owned(),
+            ))
+        }
+    };
+
     let cfg = DaemonConfig {
         role: role.ok_or_else(|| DaemonError::Usage(usage(&program)))?,
         db_path: db.ok_or_else(|| DaemonError::Usage(usage(&program)))?,
         control_addr: listen_local.unwrap_or_else(|| localhost(0)),
         peer_addr: listen_peer.unwrap_or_else(|| localhost(0)),
         peer_url: peer,
+        peer_tls,
         mpc_port: mpc_port.ok_or_else(|| DaemonError::Usage(usage(&program)))?,
         max_ram_bytes: max_ram_mb.saturating_mul(1024 * 1024),
         workers,
@@ -126,6 +159,6 @@ fn localhost(port: u16) -> SocketAddr {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} --role <1|2> --db <path> --master-secret-hex <hex>|--master-secret-stdin --listen-local <addr> --listen-peer <addr> --mpc-port <port> [--peer <url>] [--control-file <path>] [--cookie-file <path>] [--max-ram-mb <mb>] [--workers <n>] [--precompute <n>]"
+        "usage: {program} --role <1|2> --db <path> --master-secret-hex <hex>|--master-secret-stdin --listen-local <addr> --listen-peer <addr> --mpc-port <port> [--peer <url>] [--peer-tls-cert <pem> --peer-tls-key <pem> --peer-tls-ca <pem> --peer-tls-domain <name>] [--control-file <path>] [--cookie-file <path>] [--max-ram-mb <mb>] [--workers <n>] [--precompute <n>]"
     )
 }

@@ -220,6 +220,8 @@ struct PrecomputeJob {
     endpoint: MpcTcpEndpoint,
     delta: Block,
     ssp: usize,
+    ssp_target: u32,
+    delta_lifetime_checked_units_cap: u64,
     share: Value32,
     planned_checked_units: u64,
 }
@@ -252,6 +254,8 @@ struct GrpcJobDescriptor {
     channel_index: u64,
     target_index: u64,
     ssp: u32,
+    ssp_target: u32,
+    delta_lifetime_checked_units_cap: u64,
     digest: [u8; 32],
 }
 
@@ -1207,6 +1211,7 @@ impl DaemonState {
                 .await?;
             return Err(e);
         }
+        self.reconcile_with_peer(channel_index).await?;
         let job = match self
             .begin_precompute_jobstream(channel_index, index, peer)
             .await?
@@ -1233,6 +1238,8 @@ impl DaemonState {
             channel_index,
             target_index: index.get(),
             ssp: job.ssp as u32,
+            ssp_target: job.ssp_target,
+            delta_lifetime_checked_units_cap: job.delta_lifetime_checked_units_cap,
             digest,
         };
         let mut streams = match self.open_peer_job_streams(&descriptor).await {
@@ -1464,6 +1471,8 @@ impl DaemonState {
         }
         let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
         let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
+        let ssp_target = channel.ssp_target;
+        let delta_lifetime_checked_units_cap = channel.delta_lifetime_checked_units_cap;
         let share = channel_seed_share(&inner.master_secret.0, channel_index);
         let role = inner.cfg.role;
         let channel = inner
@@ -1495,6 +1504,8 @@ impl DaemonState {
             },
             delta,
             ssp,
+            ssp_target,
+            delta_lifetime_checked_units_cap,
             share,
             planned_checked_units,
         }))
@@ -1534,10 +1545,23 @@ impl DaemonState {
         if !channel.enabled {
             return Err(DaemonError::Refused("channel is disabled".to_owned()));
         }
+        if descriptor.ssp_target != channel.ssp_target
+            || descriptor.delta_lifetime_checked_units_cap
+                != channel.delta_lifetime_checked_units_cap
+        {
+            return Err(DaemonError::Refused(
+                "incoming JobStream security parameters do not match".to_owned(),
+            ));
+        }
         let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
         if descriptor.ssp != ssp as u32 {
             return Err(DaemonError::Refused(
                 "incoming JobStream uses the wrong security parameter".to_owned(),
+            ));
+        }
+        if inner.active_jobs.len() >= inner.cfg.workers as usize {
+            return Err(DaemonError::Refused(
+                "all local precompute workers are busy".to_owned(),
             ));
         }
         let expected_digest = job_digest(
@@ -1936,6 +1960,8 @@ fn descriptor_from_job_frame(
         channel_index: frame.channel_index,
         target_index: frame.target_index,
         ssp: frame.ssp,
+        ssp_target: frame.ssp_target,
+        delta_lifetime_checked_units_cap: frame.delta_lifetime_checked_units_cap,
         digest,
     })
 }
@@ -1951,6 +1977,8 @@ fn validate_job_payload_context(frame: &pb::JobFrame, descriptor: &GrpcJobDescri
     frame.channel_index == descriptor.channel_index
         && frame.target_index == descriptor.target_index
         && frame.ssp == descriptor.ssp
+        && frame.ssp_target == descriptor.ssp_target
+        && frame.delta_lifetime_checked_units_cap == descriptor.delta_lifetime_checked_units_cap
         && frame.digest.as_slice() == descriptor.digest
 }
 
@@ -1969,6 +1997,8 @@ fn job_frame(
         digest: descriptor.digest.to_vec(),
         start,
         payload,
+        ssp_target: descriptor.ssp_target,
+        delta_lifetime_checked_units_cap: descriptor.delta_lifetime_checked_units_cap,
     }
 }
 

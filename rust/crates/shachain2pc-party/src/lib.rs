@@ -5,7 +5,7 @@ use shachain2pc_circuit::{
     CACHE_TILE_LEAVES,
 };
 use shachain2pc_emp_compat::{Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError};
-use shachain2pc_emp_wire::{Ag2pcStreams, EmpStream, WireError};
+use shachain2pc_emp_wire::{Ag2pcStreams, EmpStream, TranscriptIo, WireError};
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
 use std::collections::HashMap;
 use std::env;
@@ -304,26 +304,35 @@ pub async fn run_precompute_path_job(
     digest: [u8; 32],
     ssp: usize,
 ) -> Result<Vec<(u64, Ag2pcSecureWires)>, PartyError> {
-    let sha = sha256_compress_gadget()?;
     let mut streams =
         open_ag2pc_streams_after_digest(endpoint.role, endpoint.port, endpoint.peer_ip, digest)
             .await?;
-    let mut session =
-        Ag2pcSession::setup_with_delta(&mut streams, endpoint.role, ssp, delta).await?;
+    run_precompute_path_with_streams(&mut streams, endpoint.role, share, index, delta, ssp).await
+}
+
+pub async fn run_precompute_path_with_streams<S: TranscriptIo>(
+    streams: &mut Ag2pcStreams<S>,
+    role: Role,
+    share: Value32,
+    index: Index48,
+    delta: shachain2pc_emp_wire::Block,
+    ssp: usize,
+) -> Result<Vec<(u64, Ag2pcSecureWires)>, PartyError> {
+    let sha = sha256_compress_gadget()?;
+    let mut session = Ag2pcSession::setup_with_delta(streams, role, ssp, delta).await?;
     streams.main.flush().await?;
 
-    let seed_inputs =
-        authenticate_seed_inputs(&mut session, &mut streams, endpoint.role, share).await?;
+    let seed_inputs = authenticate_seed_inputs(&mut session, streams, role, share).await?;
     let bits = set_bits_desc(index.get());
     let mut out = Vec::with_capacity(bits.len().max(1));
     if bits.is_empty() {
         let root_program = Ag2pcProgram::chunk_from_sha(&sha, &[], true)?;
         let mut root = session
-            .run_program(&mut streams, &root_program, &seed_inputs)
+            .run_program(streams, &root_program, &seed_inputs)
             .await?;
         root.strip_labels_for_reveal();
         out.push((0, root));
-        session.end(&mut streams).await?;
+        session.end(streams).await?;
         streams.main.flush().await?;
         return Ok(out);
     }
@@ -335,7 +344,7 @@ pub async fn run_precompute_path_job(
     let mut mask = 1u64 << first_bit;
     let first_program = Ag2pcProgram::chunk_from_sha(&sha, &[first_bit], true)?;
     let mut carried = session
-        .run_program(&mut streams, &first_program, &seed_inputs)
+        .run_program(streams, &first_program, &seed_inputs)
         .await?;
     let mut persisted = carried.clone();
     persisted.strip_labels_for_reveal();
@@ -344,15 +353,13 @@ pub async fn run_precompute_path_job(
     for bit in bits_iter {
         mask |= 1u64 << bit;
         let program = Ag2pcProgram::chunk_from_sha(&sha, &[bit], false)?;
-        carried = session
-            .run_program(&mut streams, &program, &carried)
-            .await?;
+        carried = session.run_program(streams, &program, &carried).await?;
         let mut persisted = carried.clone();
         persisted.strip_labels_for_reveal();
         out.push((mask, persisted));
     }
 
-    session.end(&mut streams).await?;
+    session.end(streams).await?;
     streams.main.flush().await?;
     Ok(out)
 }
@@ -934,9 +941,9 @@ async fn reveal_authenticated_values(
     Ok(outputs)
 }
 
-async fn authenticate_seed_inputs(
+async fn authenticate_seed_inputs<S: TranscriptIo>(
     session: &mut Ag2pcSession,
-    streams: &mut Ag2pcStreams,
+    streams: &mut Ag2pcStreams<S>,
     role: Role,
     share: Value32,
 ) -> Result<Ag2pcSecureWires, PartyError> {

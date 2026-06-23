@@ -1,3 +1,5 @@
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+use aes::Aes128;
 use sha2::{Digest, Sha256};
 use shachain2pc_emp_wire::{Block, BLOCK_BYTES};
 use shachain2pc_mpc_types::{LogicalChannel, MessageKind, MpcFrame, SessionStart, SessionStartAck};
@@ -27,6 +29,43 @@ impl Zeroize for AShareBundle {
     fn zeroize(&mut self) {
         self.mac.zeroize();
         self.key.zeroize();
+    }
+}
+
+pub struct Prp {
+    cipher: Aes128,
+}
+
+impl Prp {
+    #[inline]
+    pub fn new(key: Block) -> Self {
+        Self {
+            cipher: Aes128::new(GenericArray::from_slice(key.as_bytes())),
+        }
+    }
+
+    #[inline]
+    pub fn zero_key() -> Self {
+        Self::new(Block::zero())
+    }
+
+    #[inline]
+    pub fn permute_block(&self, blocks: &mut [Block]) {
+        // Block is repr(transparent) over [u8; 16], the same layout as
+        // aes::Block, so this preserves the existing batched AES-NI path.
+        let aes_blocks: &mut [aes::Block] = unsafe {
+            std::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast::<aes::Block>(), blocks.len())
+        };
+        self.cipher.encrypt_blocks(aes_blocks);
+    }
+
+    #[inline]
+    pub fn permute_one(&self, block: Block) -> Block {
+        let mut aes_block = GenericArray::clone_from_slice(block.as_bytes());
+        self.cipher.encrypt_block(&mut aes_block);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&aes_block);
+        Block::from_bytes(bytes)
     }
 }
 

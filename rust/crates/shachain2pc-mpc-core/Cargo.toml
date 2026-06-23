@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+aes.workspace = true
 sha2 = { workspace = true }
 shachain2pc-emp-wire = { path = "../shachain2pc-emp-wire" }
 shachain2pc-mpc-types = { path = "../shachain2pc-mpc-types" }

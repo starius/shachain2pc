@@ -10,7 +10,6 @@ build = "build.rs"
 cpp-probes = []
 
 [dependencies]
-aes.workspace = true
 openssl.workspace = true
 p256.workspace = true
 sha2.workspace = true

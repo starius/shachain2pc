@@ -1,4 +1,7 @@
-use shachain2pc_mpc_core::{ChannelFlow, CoreError};
+use shachain2pc_mpc_core::{
+    receive_session_start_ack, receive_session_start_and_ack, send_session_start, ChannelFlow,
+    CoreError, SessionParams, StepResult,
+};
 use shachain2pc_mpc_types::{LogicalChannel, MpcFrame};
 use shachain2pc_types::Role;
 use std::fmt;
@@ -87,6 +90,47 @@ pub fn memory_transport_pair(
     (alice, bob)
 }
 
+pub async fn run_session_handshake<T: MpcTransportSet>(
+    transports: &mut T,
+    job_id: Vec<u8>,
+    role: Role,
+    params: SessionParams,
+) -> Result<()> {
+    let mut flow = ChannelFlow::new(job_id, role, LogicalChannel::Main);
+    match role {
+        Role::Alice => {
+            let (next, start) = map_core(send_session_start(flow, &params))?;
+            flow = next;
+            transports.main().send(start).await?;
+            transports.main().flush().await?;
+
+            let peer_ack = transports.main().recv().await?;
+            flow = map_core(receive_session_start_ack(flow, &params, peer_ack))?;
+
+            let peer_start = transports.main().recv().await?;
+            let (_flow, ack) = map_core(receive_session_start_and_ack(flow, &params, peer_start))?;
+            transports.main().send(ack).await?;
+            transports.main().flush().await?;
+        }
+        Role::Bob => {
+            let peer_start = transports.main().recv().await?;
+            let (next, ack) = map_core(receive_session_start_and_ack(flow, &params, peer_start))?;
+            flow = next;
+            transports.main().send(ack).await?;
+            transports.main().flush().await?;
+
+            let (next, start) = map_core(send_session_start(flow, &params))?;
+            flow = next;
+            transports.main().send(start).await?;
+            transports.main().flush().await?;
+
+            let peer_ack = transports.main().recv().await?;
+            map_core(receive_session_start_ack(flow, &params, peer_ack))?;
+        }
+    }
+    Ok(())
+}
+
 pub struct MemoryTransport {
     flow: Option<ChannelFlow>,
     tx: mpsc::Sender<MpcFrame>,
@@ -154,6 +198,13 @@ impl MpcTransport for MemoryTransport {
 
 pub type Result<T> = std::result::Result<T, RunnerError>;
 
+fn map_core<T>(result: StepResult<T>) -> Result<T> {
+    result.map_err(|err| {
+        let (_state, error) = err.into_parts();
+        RunnerError::Core(error)
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum RunnerError {
     TransportClosed,
@@ -178,6 +229,10 @@ mod tests {
     use super::*;
     use shachain2pc_mpc_core::CoreError;
     use shachain2pc_mpc_types::MessageKind;
+
+    fn params() -> SessionParams {
+        SessionParams::new(73, vec![0x22; 32], b"runner-binding".to_vec())
+    }
 
     fn frame(
         job_id: &[u8],
@@ -289,5 +344,55 @@ mod tests {
 
         assert_eq!(bob_b.main().recv().await.unwrap().payload, b"b");
         assert_eq!(bob_a.main().recv().await.unwrap().payload, b"a");
+    }
+
+    #[tokio::test]
+    async fn runner_session_handshake_completes_in_process() {
+        let job_id = b"handshake-job".to_vec();
+        let (mut alice, mut bob) = memory_transport_pair(job_id.clone(), 8);
+        let alice_params = params();
+        let bob_params = alice_params.clone();
+        let alice_job_id = job_id.clone();
+        let bob_job_id = job_id;
+
+        let (alice_result, bob_result) = tokio::join!(
+            async move {
+                run_session_handshake(&mut alice, alice_job_id, Role::Alice, alice_params).await
+            },
+            async move { run_session_handshake(&mut bob, bob_job_id, Role::Bob, bob_params).await },
+        );
+
+        alice_result.unwrap();
+        bob_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runner_session_handshake_rejects_param_mismatch() {
+        let job_id = b"handshake-job".to_vec();
+        let (mut alice, mut bob) = memory_transport_pair(job_id.clone(), 8);
+        let alice_params = params();
+        let mut bob_params = alice_params.clone();
+        bob_params.job_binding.push(0xff);
+        let alice_job_id = job_id.clone();
+        let bob_job_id = job_id;
+
+        let (alice_result, bob_result) = tokio::join!(
+            async move {
+                run_session_handshake(&mut alice, alice_job_id, Role::Alice, alice_params).await
+            },
+            async move { run_session_handshake(&mut bob, bob_job_id, Role::Bob, bob_params).await },
+        );
+
+        let bob_err = bob_result.unwrap_err();
+        assert_eq!(
+            bob_err,
+            RunnerError::Core(CoreError::SessionParameterMismatch {
+                field: "job_binding"
+            })
+        );
+        assert!(matches!(
+            alice_result,
+            Err(RunnerError::TransportClosed) | Err(RunnerError::Core(_))
+        ));
     }
 }

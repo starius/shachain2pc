@@ -7,6 +7,8 @@ cd "$(dirname "$0")/.."
 SPEC="${1:-ffffffffff00-ffffffffffff}"; PORT="${2:-28400}"; TCB="${3:-16}"
 TF="${4:-16}"
 AS=$(printf 'aa%.0s' {1..32}); BS=$(printf 'ab%.0s' {1..32})
+PARTY_BIN="${PARTY_BIN:-./.build/party}"
+REF_BIN="${REF_BIN:-./.build/ref_cli}"
 
 if [[ "$SPEC" != *-* ]]; then
   echo "measure_cache.sh requires an inclusive range: LO-HI" >&2
@@ -26,8 +28,12 @@ if (( lo > hi )); then
 fi
 expected=$((hi - lo + 1))
 
-if [ ! -x ./.build/party ] || [ ! -x ./.build/ref_cli ]; then
+if [ "$PARTY_BIN" = "./.build/party" ] && { [ ! -x "$PARTY_BIN" ] || [ ! -x "$REF_BIN" ]; }; then
   make .build/party .build/ref_cli >/dev/null
+fi
+if [ ! -x "$PARTY_BIN" ] || [ ! -x "$REF_BIN" ]; then
+  echo "missing binary: PARTY_BIN=$PARTY_BIN REF_BIN=$REF_BIN" >&2
+  exit 2
 fi
 
 poll_hwm() {
@@ -46,12 +52,12 @@ cleanup(){ rm -f "$AO" "$AE" "$BO" "$BE" "$AH" "$BH" "$AR" "$BR"; }
 trap cleanup EXIT
 
 SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
-  ./.build/party 1 "$PORT" "$SPEC" "$AS" >"$AO" 2>"$AE" & AP=$!
+  "$PARTY_BIN" 1 "$PORT" "$SPEC" "$AS" >"$AO" 2>"$AE" & AP=$!
 poll_hwm "$AP" "$AH" & APOLL=$!
 sleep 0.4
 t0=$(date +%s.%N)
 SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS="$TCB" SHACHAIN2PC_TILE_FANOUT="$TF" \
-  ./.build/party 2 "$PORT" "$SPEC" "$BS" 127.0.0.1 >"$BO" 2>"$BE" & BP=$!
+  "$PARTY_BIN" 2 "$PORT" "$SPEC" "$BS" 127.0.0.1 >"$BO" 2>"$BE" & BP=$!
 poll_hwm "$BP" "$BH" & BPOLL=$!
 set +e
 wait "$BP"; BRC=$?
@@ -83,7 +89,7 @@ if ! diff -q "$AR" "$BR" >/dev/null; then
 fi
 while read -r tag I val; do
   [ "$tag" = RESULT ] || continue
-  r=$(./.build/ref_cli "$AS" "$BS" "$I")
+  r=$("$REF_BIN" "$AS" "$BS" "$I")
   [ "$val" = "$r" ] || bad=$((bad+1))
 done <"$BR"
 per_secret=$(awk -v w="$wall" -v n="$expected" 'BEGIN{printf "%.4f", w/n}')

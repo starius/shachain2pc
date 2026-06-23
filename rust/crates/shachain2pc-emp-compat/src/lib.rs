@@ -14,7 +14,7 @@ use p256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
-use shachain2pc_emp_wire::{Ag2pcStreams, Block, EmpStream, WireError, BLOCK_BYTES};
+use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, EmpStream, WireError, BLOCK_BYTES};
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
 use std::sync::OnceLock;
@@ -871,7 +871,7 @@ impl P256 {
     }
 }
 
-async fn send_point(stream: &mut EmpStream, point: &[u8]) -> Result<()> {
+async fn send_point<S: ByteIo>(stream: &mut S, point: &[u8]) -> Result<()> {
     if point.len() != POINT_BYTES {
         return Err(CompatError::BadPointLength(point.len()));
     }
@@ -882,7 +882,7 @@ async fn send_point(stream: &mut EmpStream, point: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn recv_point(stream: &mut EmpStream) -> Result<Vec<u8>> {
+async fn recv_point<S: ByteIo>(stream: &mut S) -> Result<Vec<u8>> {
     let len_bytes = stream.recv_data(4).await?;
     let len = u32::from_le_bytes(len_bytes.try_into().expect("length prefix"));
     if len != POINT_BYTES as u32 {
@@ -891,7 +891,7 @@ async fn recv_point(stream: &mut EmpStream) -> Result<Vec<u8>> {
     Ok(stream.recv_data(POINT_BYTES).await?)
 }
 
-pub async fn csw_send(stream: &mut EmpStream, data0: &[Block], data1: &[Block]) -> Result<()> {
+pub async fn csw_send<S: ByteIo>(stream: &mut S, data0: &[Block], data1: &[Block]) -> Result<()> {
     if data0.len() != data1.len() {
         return Err(CompatError::BadOtLength {
             data0: data0.len(),
@@ -962,7 +962,7 @@ pub async fn csw_send(stream: &mut EmpStream, data0: &[Block], data1: &[Block]) 
     Ok(())
 }
 
-pub async fn csw_recv(stream: &mut EmpStream, choices: &[bool]) -> Result<Vec<Block>> {
+pub async fn csw_recv<S: ByteIo>(stream: &mut S, choices: &[bool]) -> Result<Vec<Block>> {
     if choices.len() < 80 {
         return Err(CompatError::BadCswLength(choices.len()));
     }

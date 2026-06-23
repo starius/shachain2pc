@@ -13,11 +13,14 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
+pub use shachain2pc_mpc_core::{
+    cggm_bit_reverse, cggm_build_sender, cggm_eval_receiver, sfvole_receiver_butterfly,
+    sfvole_sender_butterfly, AShareBundle, Prp,
+};
 use shachain2pc_mpc_core::{
     finalize_input_open, gf_inner_product, gf_mul, gf_pack_128, reveal_local_share,
     reveal_recipient_bits, verify_share_relation, InputOpenError, RevealError,
 };
-pub use shachain2pc_mpc_core::{AShareBundle, Prp};
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
 use std::sync::OnceLock;
@@ -303,208 +306,6 @@ pub fn garble_hash_online(a: Block, b: Block, gate_index: u64, row: u64) -> [Blo
     ];
     zero_key_prp().permute_block(&mut blocks);
     blocks
-}
-
-const CGGM_LSB_CLEAR_MASK: Block = Block::from_bytes([
-    0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-]);
-
-fn ccrh_hash(block: Block) -> Block {
-    let sigma = block.sigma();
-    zero_key_prp().permute_one(sigma).xor(sigma)
-}
-
-pub fn cggm_bit_reverse(mut x: u32, depth: usize) -> u32 {
-    let mut out = 0;
-    for _ in 0..depth {
-        out = (out << 1) | (x & 1);
-        x >>= 1;
-    }
-    out
-}
-
-fn cggm_expand_level(
-    leaves: &mut [Block],
-    parents: usize,
-    want_right: bool,
-    clear_lsb: bool,
-) -> Block {
-    let mut sum = Block::zero();
-    for j in 0..parents {
-        let parent = leaves[j];
-        let mut left = ccrh_hash(parent);
-        let mut right = parent.xor(left);
-        if clear_lsb {
-            left = left.and(CGGM_LSB_CLEAR_MASK);
-            right = right.and(CGGM_LSB_CLEAR_MASK);
-        }
-        leaves[parents + j] = right;
-        leaves[j] = left;
-        sum = sum.xor(if want_right { right } else { left });
-    }
-    sum
-}
-
-pub fn cggm_build_sender(
-    depth: usize,
-    delta: Block,
-    root: Block,
-    clear_leaf_lsb: bool,
-) -> (Vec<Block>, Vec<Block>) {
-    assert!(depth >= 1);
-    let q = 1usize << depth;
-    let mut leaves = vec![Block::zero(); q];
-    let mut k0 = vec![Block::zero(); depth];
-
-    leaves[0] = root;
-    leaves[1] = delta.xor(root);
-    k0[0] = leaves[0];
-
-    for level in 2..depth {
-        let parents = 1usize << (level - 1);
-        k0[level - 1] = cggm_expand_level(&mut leaves, parents, false, false);
-    }
-    if depth >= 2 {
-        let parents = 1usize << (depth - 1);
-        k0[depth - 1] = cggm_expand_level(&mut leaves, parents, false, clear_leaf_lsb);
-    }
-    (leaves, k0)
-}
-
-pub fn cggm_eval_receiver(
-    depth: usize,
-    alpha: usize,
-    recv_keys: &[Block],
-    clear_leaf_lsb: bool,
-) -> Vec<Block> {
-    assert!(depth >= 1);
-    assert_eq!(recv_keys.len(), depth);
-    let q = 1usize << depth;
-    let mut leaves = vec![Block::zero(); q];
-
-    let alpha_1 = (alpha >> (depth - 1)) & 1;
-    let alpha_bar_1 = 1 - alpha_1;
-    leaves[alpha_bar_1] = recv_keys[0];
-    let mut pos = alpha_1;
-
-    for level in 2..=depth {
-        let half = 1usize << (level - 1);
-        let alpha_i = (alpha >> (depth - level)) & 1;
-        let alpha_bar_i = 1 - alpha_i;
-        let clear = clear_leaf_lsb && level == depth;
-
-        let sum_pre = cggm_expand_level(&mut leaves, half, alpha_bar_i != 0, clear);
-        let junk = leaves[pos];
-        leaves[pos] = Block::zero();
-        leaves[pos + half] = Block::zero();
-        let mut sibling = sum_pre.xor(junk).xor(recv_keys[level - 1]);
-        if clear {
-            sibling = sibling.and(CGGM_LSB_CLEAR_MASK);
-        }
-        leaves[pos + alpha_bar_i * half] = sibling;
-        pos += alpha_i * half;
-    }
-    leaves
-}
-
-fn aes_dm(key: &Prp, counter: u64, tweak: Block) -> Block {
-    let pt = Block::make(0, counter).xor(tweak);
-    key.permute_one(pt).xor(pt)
-}
-
-pub fn sfvole_sender_butterfly(
-    k: usize,
-    leaves: &[Block],
-    counter_base: u64,
-    bs: usize,
-    session_id: u64,
-) -> (Vec<Block>, Vec<Block>) {
-    assert!(k >= 2);
-    assert_eq!(leaves.len(), 1usize << k);
-    let q = 1usize << k;
-    let key = Prp::new(Block::make(0, session_id));
-    let mut u = vec![Block::zero(); bs];
-    let mut v = vec![Block::zero(); k * bs];
-    // Batch the q AES calls per column (all share `key`): r[x] = AES(in) ^ in
-    // with in = make(0, counter) ^ leaves[x]. Buffers hoisted out of the loop.
-    let mut r = vec![Block::zero(); q];
-    let mut inputs = vec![Block::zero(); q];
-
-    for j in 0..bs {
-        let ctr = Block::make(0, counter_base + j as u64);
-        for (dst, leaf) in inputs.iter_mut().zip(leaves) {
-            *dst = ctr.xor(*leaf);
-        }
-        r.copy_from_slice(&inputs);
-        key.permute_block(&mut r);
-        for (rx, inp) in r.iter_mut().zip(&inputs) {
-            *rx = rx.xor(*inp);
-        }
-        // Recursive halving butterfly: v_b = XOR of r[x] with bit b set, for all
-        // b, in O(q) (vs O(k*q) marginal sums) and branchlessly. Each round folds
-        // r[y] = r[2y] ^ r[2y+1] in place; after k rounds r[0] = XOR of all = u.
-        let mut n = q;
-        for b in 0..k {
-            let half = n >> 1;
-            let mut acc = Block::zero();
-            for y in 0..half {
-                let lo = r[2 * y];
-                let hi = r[2 * y + 1];
-                acc = acc.xor(hi);
-                r[y] = lo.xor(hi);
-            }
-            v[b * bs + j] = acc;
-            n = half;
-        }
-        u[j] = r[0];
-    }
-    (u, v)
-}
-
-pub fn sfvole_receiver_butterfly(
-    k: usize,
-    alpha: usize,
-    leaves: &[Block],
-    counter_base: u64,
-    bs: usize,
-    session_id: u64,
-) -> Vec<Block> {
-    assert!(k >= 2);
-    assert_eq!(leaves.len(), 1usize << k);
-    let q = 1usize << k;
-    let key = Prp::new(Block::make(0, session_id));
-    let mut w = vec![Block::zero(); k * bs];
-    let mut r = vec![Block::zero(); q];
-    let mut inputs = vec![Block::zero(); q];
-
-    for j in 0..bs {
-        let ctr = Block::make(0, counter_base + j as u64);
-        for (y, dst) in inputs.iter_mut().enumerate() {
-            *dst = ctr.xor(leaves[alpha ^ y]);
-        }
-        r.copy_from_slice(&inputs);
-        key.permute_block(&mut r);
-        for (rx, inp) in r.iter_mut().zip(&inputs) {
-            *rx = rx.xor(*inp);
-        }
-        // Same recursive halving butterfly as the sender (over the y = alpha^x
-        // permuted r), computing w_b for all b in O(q), branchlessly. r[0] folds
-        // to the (receiver-discarded) u byproduct.
-        let mut n = q;
-        for b in 0..k {
-            let half = n >> 1;
-            let mut acc = Block::zero();
-            for y in 0..half {
-                let lo = r[2 * y];
-                let hi = r[2 * y + 1];
-                acc = acc.xor(hi);
-                r[y] = lo.xor(hi);
-            }
-            w[b * bs + j] = acc;
-            n = half;
-        }
-    }
-    w
 }
 
 pub struct P256 {
@@ -1253,6 +1054,11 @@ impl SoftSpoken4 {
         self.check_x = self.check_x.xor(gf_inner_product(&chi, u_canonical));
         Ok(())
     }
+}
+
+fn aes_dm(key: &Prp, counter: u64, tweak: Block) -> Block {
+    let pt = Block::make(0, counter).xor(tweak);
+    key.permute_one(pt).xor(pt)
 }
 
 fn aes_dm_3(key: &Prp, tweak: Block) -> [Block; 3] {

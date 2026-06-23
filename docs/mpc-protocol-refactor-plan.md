@@ -363,6 +363,12 @@ and the other carries `sibling`. A future single-stream variant may use
 `JobFrame.channel`, but only with a dispatcher that keeps both logical channels
 drained into per-channel queues.
 
+Implemented daemon precompute uses `mpc-runner` for a typed
+`SessionStart`/`SessionStartAck` handshake over the `main` JobStream before the
+raw AG2PC bytes start. The handshake is length-prefixed inside the already
+validated JobStream payload channel. After it succeeds, the same byte streams
+are returned to the existing AG2PC implementation.
+
 The daemon scheduler stops assigning raw worker ports. Instead:
 
 - scheduler allocates a worker/job id;

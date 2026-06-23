@@ -144,6 +144,7 @@ pub const SOFTSPOKEN_PPRF_CHECK_HIGH: u64 = 0x7050_5246_434b_5f00;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SoftSpokenStateError {
     BadDeltaRole,
+    MaliciousCheckMismatch,
 }
 
 impl fmt::Display for SoftSpokenStateError {
@@ -153,6 +154,7 @@ impl fmt::Display for SoftSpokenStateError {
                 f,
                 "SoftSpoken delta can only be set before Alice setup starts"
             ),
+            Self::MaliciousCheckMismatch => write!(f, "SoftSpoken malicious check mismatch"),
         }
     }
 }
@@ -220,6 +222,59 @@ impl SoftSpoken4State {
         self.delta = delta;
         self.delta_bool = block_to_bools(delta);
         Ok(())
+    }
+
+    pub fn reset_leftover(&mut self) {
+        self.leftover_pos = 0;
+        self.leftover_count = 0;
+    }
+
+    pub fn drain_leftover(&mut self, out: &mut [Block]) -> usize {
+        if self.leftover_count == 0 || out.is_empty() {
+            return 0;
+        }
+        let take = out.len().min(self.leftover_count);
+        let start = self.leftover_pos;
+        let end = start + take;
+        out[..take].copy_from_slice(&self.leftover[start..end]);
+        self.leftover_pos += take;
+        self.leftover_count -= take;
+        take
+    }
+
+    pub fn begin_send_session(&mut self) {
+        self.cur_send_session = self.session;
+        self.session += 1;
+        self.cur_send_b0 = 0;
+        if self.malicious {
+            self.check_q = Block::zero();
+        }
+    }
+
+    pub fn begin_recv_session(&mut self) {
+        self.cur_recv_session = self.session;
+        self.session += 1;
+        self.cur_recv_b0 = 0;
+        if self.malicious {
+            self.check_t = Block::zero();
+            self.check_x = Block::zero();
+        }
+    }
+
+    pub fn verify_send_check(
+        &self,
+        check_x: Block,
+        check_t: Block,
+    ) -> Result<(), SoftSpokenStateError> {
+        let lhs = self.check_q.xor(gf_mul(check_x, self.delta));
+        if lhs != check_t {
+            return Err(SoftSpokenStateError::MaliciousCheckMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn recv_check_blocks(&self) -> (Block, Block) {
+        (self.check_x, self.check_t)
     }
 }
 

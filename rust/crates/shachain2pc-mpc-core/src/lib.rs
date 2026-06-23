@@ -1,9 +1,143 @@
 use sha2::{Digest, Sha256};
+use shachain2pc_emp_wire::{Block, BLOCK_BYTES};
 use shachain2pc_mpc_types::{LogicalChannel, MessageKind, MpcFrame, SessionStart, SessionStartAck};
 use shachain2pc_types::Role;
 use std::fmt;
+use zeroize::Zeroize;
 
 const SESSION_ACK_DOMAIN: &[u8] = b"shachain2pc-mpc-core/session-start-ack/v1";
+pub const REVEAL_DIGEST_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AShareBundle {
+    pub mac: Block,
+    pub key: Block,
+}
+
+impl Default for AShareBundle {
+    fn default() -> Self {
+        Self {
+            mac: Block::zero(),
+            key: Block::zero(),
+        }
+    }
+}
+
+impl Zeroize for AShareBundle {
+    fn zeroize(&mut self) {
+        self.mac.zeroize();
+        self.key.zeroize();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevealLocalShare {
+    pub share_bits: Vec<u8>,
+    pub mac_digest: [u8; REVEAL_DIGEST_BYTES],
+}
+
+pub fn reveal_local_share(wire_bundle: &[AShareBundle]) -> RevealLocalShare {
+    let share_bits = wire_bundle.iter().map(|wire| block_lsb(wire.mac)).collect();
+    let mut hash = Sha256::new();
+    for wire in wire_bundle {
+        hash.update(wire.mac.as_bytes());
+    }
+    RevealLocalShare {
+        share_bits,
+        mac_digest: hash.finalize().into(),
+    }
+}
+
+pub fn reveal_recipient_bits(
+    lambda: &[u8],
+    wire_bundle: &[AShareBundle],
+    peer_share: &[u8],
+    peer_digest: [u8; REVEAL_DIGEST_BYTES],
+    delta: Block,
+) -> RevealResult<Vec<u8>> {
+    if lambda.len() != wire_bundle.len() {
+        return Err(RevealError::BadWireShape {
+            lambda_len: lambda.len(),
+            bundle_len: wire_bundle.len(),
+        });
+    }
+    if peer_share.len() != wire_bundle.len() {
+        return Err(RevealError::PeerShareLength {
+            expected: wire_bundle.len(),
+            actual: peer_share.len(),
+        });
+    }
+
+    let mut expected_hash = Sha256::new();
+    for (wire, share) in wire_bundle.iter().zip(peer_share) {
+        let expected_mac = wire.key.xor(select_block(*share).and(delta));
+        expected_hash.update(expected_mac.as_bytes());
+    }
+    let expected_digest: [u8; REVEAL_DIGEST_BYTES] = expected_hash.finalize().into();
+    if expected_digest != peer_digest {
+        return Err(RevealError::MacDigestMismatch);
+    }
+
+    let local = reveal_local_share(wire_bundle);
+    Ok((0..wire_bundle.len())
+        .map(|i| local.share_bits[i] ^ lambda[i] ^ (peer_share[i] & 1))
+        .map(|bit| bit & 1)
+        .collect())
+}
+
+pub fn verify_share_relation(
+    local: &[AShareBundle],
+    local_delta: Block,
+    peer: &[AShareBundle],
+    peer_delta: Block,
+) -> bool {
+    local.len() == peer.len()
+        && local.iter().zip(peer).all(|(mine, theirs)| {
+            let mine_expected = theirs
+                .key
+                .xor(select_block(block_lsb(mine.mac)).and(peer_delta));
+            let peer_expected = mine
+                .key
+                .xor(select_block(block_lsb(theirs.mac)).and(local_delta));
+            mine.mac == mine_expected && theirs.mac == peer_expected
+        })
+}
+
+pub type RevealResult<T> = std::result::Result<T, RevealError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RevealError {
+    BadWireShape {
+        lambda_len: usize,
+        bundle_len: usize,
+    },
+    PeerShareLength {
+        expected: usize,
+        actual: usize,
+    },
+    MacDigestMismatch,
+}
+
+impl fmt::Display for RevealError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadWireShape {
+                lambda_len,
+                bundle_len,
+            } => write!(
+                f,
+                "bad reveal wire shape: lambda={lambda_len}, bundle={bundle_len}"
+            ),
+            Self::PeerShareLength { expected, actual } => write!(
+                f,
+                "bad reveal peer share length: expected {expected}, got {actual}"
+            ),
+            Self::MacDigestMismatch => write!(f, "reveal MAC digest mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for RevealError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChannelFlow {
@@ -425,9 +559,58 @@ fn role_code(role: Role) -> u8 {
     }
 }
 
+fn select_block(bit: u8) -> Block {
+    if (bit & 1) == 0 {
+        Block::zero()
+    } else {
+        Block::from_bytes([0xff; BLOCK_BYTES])
+    }
+}
+
+fn block_lsb(block: Block) -> u8 {
+    u8::from(block.get_lsb())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn auth_pair(
+        local_bit: u8,
+        peer_bit: u8,
+        local_key_low: u64,
+        peer_key_low: u64,
+        local_delta: Block,
+        peer_delta: Block,
+    ) -> (AShareBundle, AShareBundle) {
+        let local_key = Block::make(0, local_key_low & !1);
+        let peer_key = Block::make(0, peer_key_low & !1);
+        let local_mac = peer_key.xor(select_block(local_bit).and(peer_delta));
+        let peer_mac = local_key.xor(select_block(peer_bit).and(local_delta));
+        (
+            AShareBundle {
+                mac: local_mac,
+                key: local_key,
+            },
+            AShareBundle {
+                mac: peer_mac,
+                key: peer_key,
+            },
+        )
+    }
+
+    fn auth_vectors() -> (Block, Block, Vec<AShareBundle>, Vec<AShareBundle>) {
+        let local_delta = Block::make(0, 0x101);
+        let peer_delta = Block::make(0, 0x201);
+        let pairs = [
+            auth_pair(1, 0, 0x10, 0x20, local_delta, peer_delta),
+            auth_pair(0, 1, 0x30, 0x40, local_delta, peer_delta),
+            auth_pair(1, 1, 0x50, 0x60, local_delta, peer_delta),
+        ];
+        let local = pairs.iter().map(|(local, _peer)| *local).collect();
+        let peer = pairs.iter().map(|(_local, peer)| *peer).collect();
+        (local_delta, peer_delta, local, peer)
+    }
 
     fn params() -> SessionParams {
         SessionParams::new(73, vec![0x11; 32], b"job-binding".to_vec())
@@ -495,6 +678,71 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.error(), &CoreError::Aborted);
         assert!(err.state().is_aborted());
+    }
+
+    #[test]
+    fn reveal_recovers_authenticated_public_bits() {
+        let (local_delta, peer_delta, local, peer) = auth_vectors();
+        assert!(verify_share_relation(
+            &local,
+            local_delta,
+            &peer,
+            peer_delta
+        ));
+        let peer_open = reveal_local_share(&peer);
+        let lambda = vec![1, 0, 1];
+        let bits = reveal_recipient_bits(
+            &lambda,
+            &local,
+            &peer_open.share_bits,
+            peer_open.mac_digest,
+            local_delta,
+        )
+        .unwrap();
+        assert_eq!(bits, vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn reveal_rejects_digest_tamper_and_bad_shape() {
+        let (local_delta, _peer_delta, local, peer) = auth_vectors();
+        let mut peer_open = reveal_local_share(&peer);
+        peer_open.mac_digest[0] ^= 1;
+        let err = reveal_recipient_bits(
+            &[1, 0, 1],
+            &local,
+            &peer_open.share_bits,
+            peer_open.mac_digest,
+            local_delta,
+        )
+        .unwrap_err();
+        assert_eq!(err, RevealError::MacDigestMismatch);
+
+        let err =
+            reveal_recipient_bits(&[1, 0], &local, &[0, 1, 1], [0; 32], local_delta).unwrap_err();
+        assert_eq!(
+            err,
+            RevealError::BadWireShape {
+                lambda_len: 2,
+                bundle_len: 3,
+            }
+        );
+
+        let peer_open = reveal_local_share(&peer);
+        let err = reveal_recipient_bits(
+            &[1, 0, 1],
+            &local,
+            &[0, 1],
+            peer_open.mac_digest,
+            local_delta,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RevealError::PeerShareLength {
+                expected: 3,
+                actual: 2,
+            }
+        );
     }
 
     #[test]

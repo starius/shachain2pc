@@ -19,7 +19,7 @@ pub use shachain2pc_mpc_core::{
 };
 use shachain2pc_mpc_core::{
     finalize_input_open, gf_inner_product, gf_mul, gf_pack_128, reveal_local_share,
-    reveal_recipient_bits, verify_share_relation, InputOpenError, RevealError,
+    reveal_recipient_bits, verify_share_relation, InputOpenError, Mitccrh8, RevealError,
 };
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
@@ -1188,102 +1188,6 @@ pub struct Ag2pcProtocol {
 pub enum Ag2pcRevealRecipient {
     Public,
     Party(Role),
-}
-
-struct Mitccrh8 {
-    start_point: Block,
-    gid: u64,
-    key_used: usize,
-    scheduled_bucket: Option<u64>,
-    scheduled_keys: Vec<Prp>,
-}
-
-impl Mitccrh8 {
-    fn new(seed: Block) -> Self {
-        Self {
-            start_point: seed,
-            gid: 0,
-            key_used: 8,
-            scheduled_bucket: None,
-            scheduled_keys: Vec::new(),
-        }
-    }
-
-    fn hash(&mut self, blocks: &mut [Block], k: usize, h: usize) {
-        self.hash_inner(blocks, k, h, false);
-    }
-
-    #[allow(dead_code)]
-    fn hash_cir(&mut self, blocks: &mut [Block], k: usize, h: usize) {
-        self.hash_inner(blocks, k, h, true);
-    }
-
-    fn hash_inner(&mut self, blocks: &mut [Block], k: usize, h: usize, cir: bool) {
-        assert!(k <= 8);
-        assert_eq!(8 % k, 0);
-        assert_eq!(blocks.len(), k * h);
-        if self.key_used == 8 {
-            self.renew_ks();
-        }
-        if self.scheduled_bucket.is_some() {
-            // All blocks share one key (gid is 8-aligned, so renew_ks always takes
-            // the single-bucket branch): batch the AES instead of one
-            // mitccrh_apply per block. result = AES_key(input) ^ input, with
-            // input = sigma(block) if cir else block.
-            let key = &self.scheduled_keys[0];
-            if cir {
-                for block in blocks.iter_mut() {
-                    *block = block.sigma();
-                }
-            }
-            for chunk in blocks.chunks_mut(16) {
-                let n = chunk.len();
-                let mut inp = [Block::zero(); 16];
-                inp[..n].copy_from_slice(chunk);
-                key.permute_block(chunk);
-                for i in 0..n {
-                    chunk[i] = chunk[i].xor(inp[i]);
-                }
-            }
-        } else {
-            for key_index in 0..k {
-                for j in 0..h {
-                    let offset = key_index * h + j;
-                    blocks[offset] = mitccrh_apply(
-                        &self.scheduled_keys[self.key_used + key_index],
-                        blocks[offset],
-                        cir,
-                    );
-                }
-            }
-        }
-        self.key_used += k;
-    }
-
-    fn renew_ks(&mut self) {
-        let first = self.gid >> 3;
-        let last = (self.gid + 7) >> 3;
-        self.scheduled_keys.clear();
-        if first == last {
-            self.scheduled_keys
-                .push(Prp::new(self.start_point.xor(Block::make(first, 0))));
-            self.scheduled_bucket = Some(first);
-        } else {
-            for i in 0..8 {
-                self.scheduled_keys.push(Prp::new(
-                    self.start_point.xor(Block::make((self.gid + i) >> 3, 0)),
-                ));
-            }
-            self.scheduled_bucket = None;
-        }
-        self.gid += 8;
-        self.key_used = 0;
-    }
-}
-
-fn mitccrh_apply(key: &Prp, block: Block, cir: bool) -> Block {
-    let input = if cir { block.sigma() } else { block };
-    key.permute_one(input).xor(input)
 }
 
 struct Ag2pcComputeHashes<'a> {

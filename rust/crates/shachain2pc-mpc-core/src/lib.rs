@@ -61,28 +61,55 @@ pub fn reveal_recipient_bits(
             bundle_len: wire_bundle.len(),
         });
     }
-    if peer_share.len() != wire_bundle.len() {
-        return Err(RevealError::PeerShareLength {
-            expected: wire_bundle.len(),
-            actual: peer_share.len(),
-        });
-    }
-
-    let mut expected_hash = Sha256::new();
-    for (wire, share) in wire_bundle.iter().zip(peer_share) {
-        let expected_mac = wire.key.xor(select_block(*share).and(delta));
-        expected_hash.update(expected_mac.as_bytes());
-    }
-    let expected_digest: [u8; REVEAL_DIGEST_BYTES] = expected_hash.finalize().into();
-    if expected_digest != peer_digest {
-        return Err(RevealError::MacDigestMismatch);
-    }
+    verify_peer_mac_digest(wire_bundle, peer_share, peer_digest, delta)
+        .map_err(RevealError::from_peer_check)?;
 
     let local = reveal_local_share(wire_bundle);
     Ok((0..wire_bundle.len())
         .map(|i| local.share_bits[i] ^ lambda[i] ^ (peer_share[i] & 1))
         .map(|bit| bit & 1)
         .collect())
+}
+
+pub fn finalize_input_open(
+    wire_bundle: &[AShareBundle],
+    own_x_bits: &[u8],
+    peer_indices: &[usize],
+    peer_share: &[u8],
+    peer_digest: [u8; REVEAL_DIGEST_BYTES],
+    peer_x_bits: &[u8],
+    delta: Block,
+) -> InputOpenResult<Vec<u8>> {
+    let n = wire_bundle.len();
+    if own_x_bits.len() != n {
+        return Err(InputOpenError::OwnInputLength {
+            expected: n,
+            actual: own_x_bits.len(),
+        });
+    }
+    if peer_x_bits.len() != peer_indices.len() {
+        return Err(InputOpenError::PeerInputLength {
+            expected: peer_indices.len(),
+            actual: peer_x_bits.len(),
+        });
+    }
+    for &idx in peer_indices {
+        if idx >= n {
+            return Err(InputOpenError::PeerInputIndex { index: idx, len: n });
+        }
+    }
+    verify_peer_mac_digest(wire_bundle, peer_share, peer_digest, delta)
+        .map_err(InputOpenError::from_peer_check)?;
+
+    let local = reveal_local_share(wire_bundle);
+    let mut lambda: Vec<u8> = (0..n)
+        .map(|i| local.share_bits[i] ^ (peer_share[i] & 1) ^ (own_x_bits[i] & 1))
+        .map(|bit| bit & 1)
+        .collect();
+    for (i, &wire_index) in peer_indices.iter().enumerate() {
+        lambda[wire_index] ^= peer_x_bits[i] & 1;
+    }
+    Ok(lambda)
 }
 
 pub fn verify_share_relation(
@@ -104,6 +131,13 @@ pub fn verify_share_relation(
 }
 
 pub type RevealResult<T> = std::result::Result<T, RevealError>;
+pub type InputOpenResult<T> = std::result::Result<T, InputOpenError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PeerMacCheckError {
+    PeerShareLength { expected: usize, actual: usize },
+    MacDigestMismatch,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevealError {
@@ -116,6 +150,17 @@ pub enum RevealError {
         actual: usize,
     },
     MacDigestMismatch,
+}
+
+impl RevealError {
+    fn from_peer_check(value: PeerMacCheckError) -> Self {
+        match value {
+            PeerMacCheckError::PeerShareLength { expected, actual } => {
+                Self::PeerShareLength { expected, actual }
+            }
+            PeerMacCheckError::MacDigestMismatch => Self::MacDigestMismatch,
+        }
+    }
 }
 
 impl fmt::Display for RevealError {
@@ -138,6 +183,52 @@ impl fmt::Display for RevealError {
 }
 
 impl std::error::Error for RevealError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InputOpenError {
+    OwnInputLength { expected: usize, actual: usize },
+    PeerShareLength { expected: usize, actual: usize },
+    PeerInputLength { expected: usize, actual: usize },
+    PeerInputIndex { index: usize, len: usize },
+    MacDigestMismatch,
+}
+
+impl InputOpenError {
+    fn from_peer_check(value: PeerMacCheckError) -> Self {
+        match value {
+            PeerMacCheckError::PeerShareLength { expected, actual } => {
+                Self::PeerShareLength { expected, actual }
+            }
+            PeerMacCheckError::MacDigestMismatch => Self::MacDigestMismatch,
+        }
+    }
+}
+
+impl fmt::Display for InputOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnInputLength { expected, actual } => write!(
+                f,
+                "bad input-open own input length: expected {expected}, got {actual}"
+            ),
+            Self::PeerShareLength { expected, actual } => write!(
+                f,
+                "bad input-open peer share length: expected {expected}, got {actual}"
+            ),
+            Self::PeerInputLength { expected, actual } => write!(
+                f,
+                "bad input-open peer input length: expected {expected}, got {actual}"
+            ),
+            Self::PeerInputIndex { index, len } => write!(
+                f,
+                "bad input-open peer input index {index} for length {len}"
+            ),
+            Self::MacDigestMismatch => write!(f, "input-open MAC digest mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for InputOpenError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChannelFlow {
@@ -559,6 +650,31 @@ fn role_code(role: Role) -> u8 {
     }
 }
 
+fn verify_peer_mac_digest(
+    wire_bundle: &[AShareBundle],
+    peer_share: &[u8],
+    peer_digest: [u8; REVEAL_DIGEST_BYTES],
+    delta: Block,
+) -> std::result::Result<(), PeerMacCheckError> {
+    if peer_share.len() != wire_bundle.len() {
+        return Err(PeerMacCheckError::PeerShareLength {
+            expected: wire_bundle.len(),
+            actual: peer_share.len(),
+        });
+    }
+
+    let mut expected_hash = Sha256::new();
+    for (wire, share) in wire_bundle.iter().zip(peer_share) {
+        let expected_mac = wire.key.xor(select_block(*share).and(delta));
+        expected_hash.update(expected_mac.as_bytes());
+    }
+    let expected_digest: [u8; REVEAL_DIGEST_BYTES] = expected_hash.finalize().into();
+    if expected_digest != peer_digest {
+        return Err(PeerMacCheckError::MacDigestMismatch);
+    }
+    Ok(())
+}
+
 fn select_block(bit: u8) -> Block {
     if (bit & 1) == 0 {
         Block::zero()
@@ -743,6 +859,54 @@ mod tests {
                 actual: 2,
             }
         );
+    }
+
+    #[test]
+    fn input_open_finalizes_authenticated_lambdas() {
+        let (local_delta, _peer_delta, local, peer) = auth_vectors();
+        let peer_open = reveal_local_share(&peer);
+        let lambda = finalize_input_open(
+            &local,
+            &[1, 0, 0],
+            &[1],
+            &peer_open.share_bits,
+            peer_open.mac_digest,
+            &[1],
+            local_delta,
+        )
+        .unwrap();
+        assert_eq!(lambda, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn input_open_rejects_tamper_and_bad_peer_index() {
+        let (local_delta, _peer_delta, local, peer) = auth_vectors();
+        let mut peer_open = reveal_local_share(&peer);
+        peer_open.mac_digest[0] ^= 1;
+        let err = finalize_input_open(
+            &local,
+            &[1, 0, 0],
+            &[1],
+            &peer_open.share_bits,
+            peer_open.mac_digest,
+            &[1],
+            local_delta,
+        )
+        .unwrap_err();
+        assert_eq!(err, InputOpenError::MacDigestMismatch);
+
+        let peer_open = reveal_local_share(&peer);
+        let err = finalize_input_open(
+            &local,
+            &[1, 0, 0],
+            &[3],
+            &peer_open.share_bits,
+            peer_open.mac_digest,
+            &[1],
+            local_delta,
+        )
+        .unwrap_err();
+        assert_eq!(err, InputOpenError::PeerInputIndex { index: 3, len: 3 });
     }
 
     #[test]

@@ -19,8 +19,8 @@ pub use shachain2pc_mpc_core::{
     SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_PPRF_CHECK_HIGH, SOFTSPOKEN_Q,
 };
 use shachain2pc_mpc_core::{
-    finalize_input_open, gf_inner_product, gf_mul, gf_pack_128, reveal_local_share,
-    reveal_recipient_bits, verify_share_relation, InputOpenError, Mitccrh8, RevealError,
+    finalize_input_open, gf_inner_product, gf_pack_128, reveal_local_share, reveal_recipient_bits,
+    verify_share_relation, InputOpenError, Mitccrh8, RevealError,
 };
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::sync::OnceLock;
@@ -634,24 +634,6 @@ impl SoftSpoken4 {
         Ok(out)
     }
 
-    fn reset_leftover(&mut self) {
-        self.leftover_pos = 0;
-        self.leftover_count = 0;
-    }
-
-    fn drain_leftover(&mut self, out: &mut [Block]) -> usize {
-        if self.leftover_count == 0 || out.is_empty() {
-            return 0;
-        }
-        let take = out.len().min(self.leftover_count);
-        let start = self.leftover_pos;
-        let end = start + take;
-        out[..take].copy_from_slice(&self.leftover[start..end]);
-        self.leftover_pos += take;
-        self.leftover_count -= take;
-        take
-    }
-
     async fn next_chunk<S: TranscriptIo>(
         &mut self,
         stream: &mut S,
@@ -669,12 +651,7 @@ impl SoftSpoken4 {
         if !self.setup_done {
             self.bootstrap_send(stream).await?;
         }
-        self.cur_send_session = self.session;
-        self.session += 1;
-        self.cur_send_b0 = 0;
-        if self.malicious {
-            self.check_q = Block::zero();
-        }
+        self.begin_send_session();
         Ok(())
     }
 
@@ -683,13 +660,7 @@ impl SoftSpoken4 {
         if !self.setup_done {
             self.bootstrap_recv(stream).await?;
         }
-        self.cur_recv_session = self.session;
-        self.session += 1;
-        self.cur_recv_b0 = 0;
-        if self.malicious {
-            self.check_t = Block::zero();
-            self.check_x = Block::zero();
-        }
+        self.begin_recv_session();
         Ok(())
     }
 
@@ -698,10 +669,8 @@ impl SoftSpoken4 {
             let _scratch = self.send_chunk_pipeline(stream, 1).await?;
             let x = stream.recv_block(1).await?[0];
             let t = stream.recv_block(1).await?[0];
-            let lhs = self.check_q.xor(gf_mul(x, self.delta));
-            if lhs != t {
-                return Err(CompatError::FeqMismatch);
-            }
+            self.verify_send_check(x, t)
+                .map_err(|_| CompatError::FeqMismatch)?;
         }
         Ok(())
     }
@@ -709,8 +678,9 @@ impl SoftSpoken4 {
     async fn recv_end<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
         if self.malicious {
             let _scratch = self.recv_chunk_pipeline(stream, 1).await?;
-            stream.send_block(&[self.check_x]).await?;
-            stream.send_block(&[self.check_t]).await?;
+            let (check_x, check_t) = self.recv_check_blocks();
+            stream.send_block(&[check_x]).await?;
+            stream.send_block(&[check_t]).await?;
         }
         stream.flush().await?;
         Ok(())

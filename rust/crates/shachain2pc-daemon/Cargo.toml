@@ -18,6 +18,7 @@ shachain2pc-emp-compat = { path = "../shachain2pc-emp-compat" }
 shachain2pc-emp-wire = { path = "../shachain2pc-emp-wire" }
 shachain2pc-party = { path = "../shachain2pc-party" }
 shachain2pc-types = { path = "../shachain2pc-types" }
+tokio-stream = "0.1"
 tokio = { workspace = true, features = [
     "macros",
     "net",

@@ -7,7 +7,7 @@ use shachain2pc_circuit::{
 use shachain2pc_emp_compat::{Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError};
 use shachain2pc_emp_wire::{Ag2pcStreams, EmpStream, TranscriptIo, WireError};
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -308,6 +308,117 @@ pub async fn run_precompute_path_job(
         open_ag2pc_streams_after_digest(endpoint.role, endpoint.port, endpoint.peer_ip, digest)
             .await?;
     run_precompute_path_with_streams(&mut streams, endpoint.role, share, index, delta, ssp).await
+}
+
+pub struct PrecomputeSession<S: TranscriptIo> {
+    streams: Ag2pcStreams<S>,
+    session: Ag2pcSession,
+    sha: Circuit,
+    seed_inputs: Ag2pcSecureWires,
+    cache: BTreeMap<u32, (u64, Ag2pcSecureWires)>,
+}
+
+impl<S: TranscriptIo> PrecomputeSession<S> {
+    pub async fn setup_with_streams(
+        mut streams: Ag2pcStreams<S>,
+        role: Role,
+        share: Value32,
+        delta: shachain2pc_emp_wire::Block,
+        ssp: usize,
+    ) -> Result<Self, PartyError> {
+        let sha = sha256_compress_gadget()?;
+        let mut session = Ag2pcSession::setup_with_delta(&mut streams, role, ssp, delta).await?;
+        streams.main.flush().await?;
+        let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
+        Ok(Self {
+            streams,
+            session,
+            sha,
+            seed_inputs,
+            cache: BTreeMap::new(),
+        })
+    }
+
+    pub fn streams_mut(&mut self) -> &mut Ag2pcStreams<S> {
+        &mut self.streams
+    }
+
+    pub fn planned_checked_units(&self, index: Index48) -> u64 {
+        self.missing_bits(index.get()).len() as u64
+    }
+
+    pub async fn precompute_target(
+        &mut self,
+        index: Index48,
+    ) -> Result<Ag2pcSecureWires, PartyError> {
+        let target = index.get();
+        if target == 0 {
+            let root_program = Ag2pcProgram::chunk_from_sha(&self.sha, &[], true)?;
+            let mut root = self
+                .session
+                .run_program(&mut self.streams, &root_program, &self.seed_inputs)
+                .await?;
+            root.strip_labels_for_reveal();
+            return Ok(root);
+        }
+
+        let mut mask = 0u64;
+        let mut carried = Ag2pcSecureWires::default();
+        let mut have_carried = false;
+        if let Some((parent_mask, parent)) = self.best_parent(target) {
+            mask = parent_mask;
+            carried = parent;
+            have_carried = true;
+        }
+        if mask == target {
+            carried.strip_labels_for_reveal();
+            return Ok(carried);
+        }
+
+        for bit in set_bits_desc(target & !mask) {
+            let first = !have_carried;
+            let input = if have_carried {
+                &carried
+            } else {
+                &self.seed_inputs
+            };
+            let program = Ag2pcProgram::chunk_from_sha(&self.sha, &[bit], first)?;
+            let child = self
+                .session
+                .run_program(&mut self.streams, &program, input)
+                .await?;
+            mask |= 1u64 << bit;
+            carried = child;
+            have_carried = true;
+            self.cache
+                .insert(mask.trailing_zeros(), (mask, carried.clone()));
+        }
+
+        let mut persisted = carried;
+        persisted.strip_labels_for_reveal();
+        Ok(persisted)
+    }
+
+    pub async fn finish(mut self) -> Result<(), PartyError> {
+        self.session.end(&mut self.streams).await?;
+        self.streams.main.flush().await?;
+        Ok(())
+    }
+
+    fn missing_bits(&self, target: u64) -> Vec<usize> {
+        let Some((parent_mask, _parent)) = self.best_parent(target) else {
+            return set_bits_desc(target);
+        };
+        set_bits_desc(target & !parent_mask)
+    }
+
+    fn best_parent(&self, target: u64) -> Option<(u64, Ag2pcSecureWires)> {
+        self.cache
+            .values()
+            .filter(|(mask, _wires)| can_derive_mask(*mask, target))
+            .max_by_key(|(mask, _wires)| mask.count_ones())
+            .map(|(mask, wires)| (*mask, wires.clone()))
+    }
 }
 
 pub async fn run_precompute_path_with_streams<S: TranscriptIo>(
@@ -1196,6 +1307,20 @@ fn set_bits_desc(value: u64) -> Vec<usize> {
     bits
 }
 
+fn can_derive_mask(from_index: u64, to_index: u64) -> bool {
+    if from_index & !to_index != 0 {
+        return false;
+    }
+    let missing = to_index & !from_index;
+    if from_index != 0 {
+        let lowest_applied = from_index.trailing_zeros();
+        if missing >> lowest_applied != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn ensure_mode_supported_for_now(
     index_spec: &IndexSpec,
     mode: RequestedMode,
@@ -1503,6 +1628,14 @@ mod tests {
         assert!(
             matches!(err, PartyError::Parse(msg) if msg == "range too large (max 100000 indices)")
         );
+    }
+
+    #[test]
+    fn precompute_cache_parent_rule_matches_shachain_derivability() {
+        assert!(can_derive_mask(0b10, 0b11));
+        assert!(can_derive_mask(0b100, 0b111));
+        assert!(!can_derive_mask(0b11, 0b10));
+        assert!(!can_derive_mask(0b10, 0b110));
     }
 
     #[test]

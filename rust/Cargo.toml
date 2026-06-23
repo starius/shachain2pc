@@ -27,5 +27,5 @@ tokio = "1"
 zeroize = "1"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1

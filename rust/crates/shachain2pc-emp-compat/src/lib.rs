@@ -3,8 +3,6 @@
 // in rust/.cargo/config.toml) unlocks it on the pinned stable toolchain.
 #![feature(portable_simd)]
 
-use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
-use aes::Aes128;
 use openssl::bn::{BigNum, BigNumContext, BigNumRef};
 use openssl::ec::{EcGroup, EcPoint, EcPointRef, PointConversionForm};
 use openssl::error::ErrorStack;
@@ -15,11 +13,11 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
-pub use shachain2pc_mpc_core::AShareBundle;
 use shachain2pc_mpc_core::{
     finalize_input_open, gf_inner_product, gf_mul, gf_pack_128, reveal_local_share,
     reveal_recipient_bits, verify_share_relation, InputOpenError, RevealError,
 };
+pub use shachain2pc_mpc_core::{AShareBundle, Prp};
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
 use std::sync::OnceLock;
@@ -185,40 +183,6 @@ impl EmpRo {
         self.buf.extend_from_slice(&typ.to_le_bytes());
         self.buf.extend_from_slice(&len.to_le_bytes());
         self.buf.extend_from_slice(data);
-    }
-}
-
-pub struct Prp {
-    cipher: Aes128,
-}
-
-impl Prp {
-    pub fn new(key: Block) -> Self {
-        Self {
-            cipher: Aes128::new(GenericArray::from_slice(key.as_bytes())),
-        }
-    }
-
-    pub fn zero_key() -> Self {
-        Self::new(Block::zero())
-    }
-
-    pub fn permute_block(&self, blocks: &mut [Block]) {
-        // Batch through AES-NI: encrypt_blocks pipelines 8 blocks wide, vs the
-        // ~4-cycle latency of one-at-a-time encrypt_block. Block is
-        // repr(transparent) over [u8; 16], the same layout as aes::Block.
-        let aes_blocks: &mut [aes::Block] = unsafe {
-            std::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast::<aes::Block>(), blocks.len())
-        };
-        self.cipher.encrypt_blocks(aes_blocks);
-    }
-
-    pub fn permute_one(&self, block: Block) -> Block {
-        let mut aes_block = GenericArray::clone_from_slice(block.as_bytes());
-        self.cipher.encrypt_block(&mut aes_block);
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&aes_block);
-        Block::from_bytes(bytes)
     }
 }
 

@@ -878,11 +878,6 @@ struct Ag2pcComputeHashes<'a> {
     feq: &'a mut Sha256,
 }
 
-struct Ag2pcLayerView<'a> {
-    mac: &'a [Block],
-    key: &'a [Block],
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ag2pcProgram {
     num_inputs: usize,
@@ -2523,18 +2518,8 @@ impl Ag2pcTriplePool {
                 .absorb_block(streams.main.get_digest()?)
                 .absorb_block(streams.sibling.get_digest()?)
                 .squeeze_block();
-            let mut prg = Prg::new(seed, 0);
-            let raw = u32::from_ne_bytes(
-                prg.random_data(4)
-                    .try_into()
-                    .expect("four random bytes for bucket shift"),
-            );
-            let r = (raw as usize) % l;
-            let layer = Ag2pcLayerView {
-                mac: &sac_mac,
-                key: &sac_key,
-            };
-            self.bucket_one_layer(streams, acc_mac, acc_key, layer, l, r)
+            let r = Ag2pcTriplePoolState::bucket_shift(seed, l);
+            self.bucket_one_layer(streams, acc_mac, acc_key, &sac_mac, &sac_key, l, r)
                 .await?;
         }
         Ok(())
@@ -2545,28 +2530,17 @@ impl Ag2pcTriplePool {
         streams: &mut Ag2pcStreams<S>,
         acc_mac: &mut [Block],
         acc_key: &mut [Block],
-        layer: Ag2pcLayerView<'_>,
+        layer_mac: &[Block],
+        layer_key: &[Block],
         l: usize,
         r: usize,
     ) -> Result<()> {
-        let mut d_me = vec![0u8; l];
-        let cut = l - r;
-        for i in 0..l {
-            let src = if i < cut { i + r } else { i + r - l };
-            acc_mac[i] = acc_mac[i].xor(layer.mac[src]);
-            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer.mac[2 * l + src]);
-            acc_key[i] = acc_key[i].xor(layer.key[src]);
-            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer.key[2 * l + src]);
-            d_me[i] = block_lsb(acc_mac[l + i]) ^ block_lsb(layer.mac[l + src]);
-        }
+        let d_me = self
+            .bucket_prepare_layer(acc_mac, acc_key, layer_mac, layer_key, l, r)
+            .map_err(|_| CompatError::BadAg2pcInputShape)?;
         let d_peer = self.exchange_bool_vector(streams, &d_me, l).await?;
-        for i in 0..l {
-            let src = if i < cut { i + r } else { i + r - l };
-            let mask = select_block(d_me[i] ^ d_peer[i]);
-            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer.mac[src].and(mask));
-            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer.key[src].and(mask));
-        }
-        Ok(())
+        self.bucket_finish_layer(acc_mac, acc_key, layer_mac, layer_key, l, r, &d_me, &d_peer)
+            .map_err(|_| CompatError::BadAg2pcInputShape)
     }
 
     async fn exchange_blocks<S: TranscriptIo>(

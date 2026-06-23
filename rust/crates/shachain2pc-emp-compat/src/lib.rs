@@ -16,7 +16,7 @@ use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError,
 pub use shachain2pc_mpc_core::{
     cggm_bit_reverse, cggm_build_sender, cggm_eval_receiver, sfvole_receiver_butterfly,
     sfvole_sender_butterfly, AShareBundle, Prg, Prp, SoftSpoken4State, SOFTSPOKEN_CHUNK_BLOCKS,
-    SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_PPRF_CHECK_HIGH, SOFTSPOKEN_Q,
+    SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_Q,
 };
 use shachain2pc_mpc_core::{
     finalize_input_open, gf_inner_product, gf_pack_128, reveal_local_share, reveal_recipient_bits,
@@ -747,61 +747,18 @@ impl SoftSpoken4 {
     }
 
     async fn pprf_check_send<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
-        let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
-        let mut t_buf = vec![Block::zero(); SOFTSPOKEN_N * 2];
-        let mut hash = Sha256::new();
-        for i in 0..SOFTSPOKEN_N {
-            let base = i * SOFTSPOKEN_Q;
-            let mut tx = Block::zero();
-            let mut ty = Block::zero();
-            for y in 0..SOFTSPOKEN_Q {
-                let exp = aes_dm_3(&check_key, self.leaves_send[base + y]);
-                self.leaves_send[base + y] = exp[0];
-                tx = tx.xor(exp[1]);
-                ty = ty.xor(exp[2]);
-                hash.update(exp[1].as_bytes());
-                hash.update(exp[2].as_bytes());
-            }
-            t_buf[i * 2] = tx;
-            t_buf[i * 2 + 1] = ty;
-        }
+        let (t_buf, digest) = self.pprf_check_send_prepare();
         stream.send_block(&t_buf).await?;
-        stream.send_data(&hash.finalize()).await?;
+        stream.send_data(&digest).await?;
         stream.flush().await?;
         Ok(())
     }
 
     async fn pprf_check_recv<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
-        let check_key = Prp::new(Block::make(SOFTSPOKEN_PPRF_CHECK_HIGH, 0));
         let t_buf = stream.recv_block(SOFTSPOKEN_N * 2).await?;
         let their_digest = stream.recv_data(HASH_DIGEST_BYTES).await?;
-        let mut hash = Sha256::new();
-        let mut s_buf = vec![Block::zero(); SOFTSPOKEN_Q * 2];
-        for i in 0..SOFTSPOKEN_N {
-            let base = i * SOFTSPOKEN_Q;
-            let mut tx = Block::zero();
-            let mut ty = Block::zero();
-            for y in 0..SOFTSPOKEN_Q {
-                if y == self.alphas[i] {
-                    continue;
-                }
-                let exp = aes_dm_3(&check_key, self.leaves_recv[base + y]);
-                self.leaves_recv[base + y] = exp[0];
-                s_buf[y * 2] = exp[1];
-                s_buf[y * 2 + 1] = exp[2];
-                tx = tx.xor(exp[1]);
-                ty = ty.xor(exp[2]);
-            }
-            s_buf[self.alphas[i] * 2] = t_buf[i * 2].xor(tx);
-            s_buf[self.alphas[i] * 2 + 1] = t_buf[i * 2 + 1].xor(ty);
-            for block in &s_buf {
-                hash.update(block.as_bytes());
-            }
-        }
-        if hash.finalize().as_slice() != their_digest.as_slice() {
-            return Err(CompatError::FeqMismatch);
-        }
-        Ok(())
+        self.pprf_check_recv_verify(&t_buf, &their_digest)
+            .map_err(|_| CompatError::FeqMismatch)
     }
 
     async fn send_chunk_pipeline<S: TranscriptIo>(
@@ -921,19 +878,6 @@ impl SoftSpoken4 {
         self.check_x = self.check_x.xor(gf_inner_product(&chi, u_canonical));
         Ok(())
     }
-}
-
-fn aes_dm(key: &Prp, counter: u64, tweak: Block) -> Block {
-    let pt = Block::make(0, counter).xor(tweak);
-    key.permute_one(pt).xor(pt)
-}
-
-fn aes_dm_3(key: &Prp, tweak: Block) -> [Block; 3] {
-    [
-        aes_dm(key, 0, tweak),
-        aes_dm(key, 1, tweak),
-        aes_dm(key, 2, tweak),
-    ]
 }
 
 fn transpose_softspoken_planes(planes: &[Block], bs: usize) -> Vec<Block> {

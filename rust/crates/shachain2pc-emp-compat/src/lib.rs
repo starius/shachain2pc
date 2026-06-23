@@ -14,9 +14,7 @@ use p256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{Circuit, GateType};
-use shachain2pc_emp_wire::{
-    Ag2pcStreams, Block, ByteIo, EmpStream, TranscriptIo, WireError, BLOCK_BYTES,
-};
+use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 use shachain2pc_types::{Role, INDEX_BITS, VALUE_BITS};
 use std::fmt;
 use std::sync::OnceLock;
@@ -2300,14 +2298,18 @@ pub struct Ag2pcSession {
 }
 
 impl Ag2pcSession {
-    pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
+    pub async fn setup<S: TranscriptIo>(
+        streams: &mut Ag2pcStreams<S>,
+        party: Role,
+        ssp: usize,
+    ) -> Result<Self> {
         Ok(Self {
             protocol: Ag2pcProtocol::setup(streams, party, ssp).await?,
         })
     }
 
-    pub async fn setup_with_delta(
-        streams: &mut Ag2pcStreams,
+    pub async fn setup_with_delta<S: TranscriptIo>(
+        streams: &mut Ag2pcStreams<S>,
         party: Role,
         ssp: usize,
         delta: Block,
@@ -2329,9 +2331,9 @@ impl Ag2pcSession {
         self.protocol.process_input_calls()
     }
 
-    pub async fn process_inputs(
+    pub async fn process_inputs<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         owners: &[Role],
         bits_per_owner: &[Vec<u8>],
     ) -> Result<Vec<Ag2pcSecureWires>> {
@@ -2344,9 +2346,9 @@ impl Ag2pcSession {
         self.protocol.public_wires(bits)
     }
 
-    pub async fn run_program(
+    pub async fn run_program<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         program: &Ag2pcProgram,
         inputs: &Ag2pcSecureWires,
     ) -> Result<Ag2pcSecureWires> {
@@ -2381,9 +2383,9 @@ impl Ag2pcSession {
         ag2pc_gather_outputs(&state, program)
     }
 
-    pub async fn reveal_public(
+    pub async fn reveal_public<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         wires: &Ag2pcSecureWires,
     ) -> Result<Vec<u8>> {
         self.protocol
@@ -2391,7 +2393,7 @@ impl Ag2pcSession {
             .await
     }
 
-    pub async fn end(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    pub async fn end<S: TranscriptIo>(&mut self, streams: &mut Ag2pcStreams<S>) -> Result<()> {
         self.protocol.end(streams).await
     }
 }
@@ -2420,11 +2422,11 @@ fn ag2pc_liveness_pass(state: &mut Ag2pcRunState, program: &Ag2pcProgram) {
     }
 }
 
-async fn ag2pc_slot_mask_pass(
+async fn ag2pc_slot_mask_pass<S: TranscriptIo>(
     state: &mut Ag2pcRunState,
     program: &Ag2pcProgram,
     triple_pool: &mut Ag2pcTriplePool,
-    streams: &mut Ag2pcStreams,
+    streams: &mut Ag2pcStreams<S>,
 ) -> Result<()> {
     let slot_capacity = ag2pc_slot_capacity(state, program);
     state
@@ -2563,10 +2565,10 @@ fn ag2pc_free_if_dead(
     }
 }
 
-async fn ag2pc_garbler_path(
+async fn ag2pc_garbler_path<S: TranscriptIo>(
     state: &mut Ag2pcRunState,
     program: &Ag2pcProgram,
-    streams: &mut Ag2pcStreams,
+    streams: &mut Ag2pcStreams<S>,
 ) -> Result<()> {
     let chunk_ands = state.num_ands.min(AG2PC_GARBLE_CHUNK_ANDS);
     let mut chunk_g = Vec::with_capacity(2 * chunk_ands);
@@ -2656,10 +2658,10 @@ fn ag2pc_garbler_and_gate(
     (g0, g1, block_lsb1(ml_g0))
 }
 
-async fn ag2pc_evaluator_path(
+async fn ag2pc_evaluator_path<S: TranscriptIo>(
     state: &mut Ag2pcRunState,
     program: &Ag2pcProgram,
-    streams: &mut Ag2pcStreams,
+    streams: &mut Ag2pcStreams<S>,
 ) -> Result<()> {
     let chunk_ands = state.num_ands.min(AG2PC_GARBLE_CHUNK_ANDS);
     let mut chunk_g = Vec::with_capacity(2 * chunk_ands);
@@ -2834,15 +2836,15 @@ fn ag2pc_gather_outputs(state: &Ag2pcRunState, program: &Ag2pcProgram) -> Result
     Ok(out)
 }
 
-async fn ag2pc_send_garble_chunk(stream: &mut EmpStream, g: &[Block], b: &[u8]) -> Result<()> {
+async fn ag2pc_send_garble_chunk<S: ByteIo>(stream: &mut S, g: &[Block], b: &[u8]) -> Result<()> {
     stream.send_block(g).await?;
     stream.send_data(b).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn ag2pc_recv_garble_chunk(
-    stream: &mut EmpStream,
+async fn ag2pc_recv_garble_chunk<S: ByteIo>(
+    stream: &mut S,
     n: usize,
 ) -> Result<(Vec<Block>, Vec<u8>)> {
     let g = stream.recv_block(2 * n).await?;
@@ -2853,13 +2855,17 @@ async fn ag2pc_recv_garble_chunk(
 const AG2PC_GARBLE_CHUNK_ANDS: usize = 1 << 16;
 
 impl Ag2pcProtocol {
-    pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
+    pub async fn setup<S: TranscriptIo>(
+        streams: &mut Ag2pcStreams<S>,
+        party: Role,
+        ssp: usize,
+    ) -> Result<Self> {
         let delta = random_ag2pc_delta(party)?;
         Self::setup_with_delta(streams, party, ssp, delta).await
     }
 
-    pub async fn setup_with_delta(
-        streams: &mut Ag2pcStreams,
+    pub async fn setup_with_delta<S: TranscriptIo>(
+        streams: &mut Ag2pcStreams<S>,
         party: Role,
         ssp: usize,
         delta: Block,
@@ -2887,11 +2893,14 @@ impl Ag2pcProtocol {
         self.process_input_calls
     }
 
-    pub async fn flush_cot_check(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    pub async fn flush_cot_check<S: TranscriptIo>(
+        &mut self,
+        streams: &mut Ag2pcStreams<S>,
+    ) -> Result<()> {
         self.triple_pool.maybe_flush_cot_check(streams).await
     }
 
-    pub async fn end(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    pub async fn end<S: TranscriptIo>(&mut self, streams: &mut Ag2pcStreams<S>) -> Result<()> {
         self.triple_pool.end(streams).await
     }
 
@@ -2922,9 +2931,9 @@ impl Ag2pcProtocol {
         wires
     }
 
-    pub async fn process_inputs(
+    pub async fn process_inputs<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         owners: &[Role],
         bits_per_owner: &[Vec<u8>],
     ) -> Result<Vec<Ag2pcSecureWires>> {
@@ -3036,9 +3045,9 @@ impl Ag2pcProtocol {
         Ok(out)
     }
 
-    pub async fn decode(
+    pub async fn decode<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         wires: &Ag2pcSecureWires,
         recipient: Ag2pcRevealRecipient,
     ) -> Result<Vec<u8>> {
@@ -3064,9 +3073,9 @@ impl Ag2pcProtocol {
         }
     }
 
-    async fn decode_to_party(
+    async fn decode_to_party<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         wires: &Ag2pcSecureWires,
         role: Role,
     ) -> Result<Vec<u8>> {
@@ -3107,9 +3116,9 @@ impl Ag2pcProtocol {
         }
     }
 
-    async fn exchange_input_open(
+    async fn exchange_input_open<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         share_msg: &[u8],
         d_me: &[u8; HASH_DIGEST_BYTES],
         own_x_packed: &[u8],
@@ -3154,8 +3163,8 @@ impl Ag2pcProtocol {
     }
 }
 
-async fn ag2pc_send_input_open(
-    stream: &mut EmpStream,
+async fn ag2pc_send_input_open<S: ByteIo>(
+    stream: &mut S,
     share_msg: &[u8],
     digest: &[u8; HASH_DIGEST_BYTES],
     own_x_packed: &[u8],
@@ -3169,8 +3178,8 @@ async fn ag2pc_send_input_open(
     Ok(())
 }
 
-async fn ag2pc_recv_input_open(
-    stream: &mut EmpStream,
+async fn ag2pc_recv_input_open<S: ByteIo>(
+    stream: &mut S,
     n_total: usize,
     peer_x_len: usize,
 ) -> Result<(Vec<u8>, [u8; HASH_DIGEST_BYTES], Vec<u8>)> {
@@ -3189,13 +3198,17 @@ async fn ag2pc_recv_input_open(
 }
 
 impl Ag2pcTriplePool {
-    pub async fn setup(streams: &mut Ag2pcStreams, party: Role, ssp: usize) -> Result<Self> {
+    pub async fn setup<S: TranscriptIo>(
+        streams: &mut Ag2pcStreams<S>,
+        party: Role,
+        ssp: usize,
+    ) -> Result<Self> {
         let delta = random_ag2pc_delta(party)?;
         Self::setup_with_delta(streams, party, ssp, delta).await
     }
 
-    pub async fn setup_with_delta(
-        streams: &mut Ag2pcStreams,
+    pub async fn setup_with_delta<S: TranscriptIo>(
+        streams: &mut Ag2pcStreams<S>,
         party: Role,
         ssp: usize,
         delta: Block,
@@ -3242,9 +3255,9 @@ impl Ag2pcTriplePool {
         bucket
     }
 
-    pub async fn draw(
+    pub async fn draw<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         count: usize,
     ) -> Result<Vec<AShareBundle>> {
         let (mac, key) = self.gen_cot_shares(streams, count).await?;
@@ -3255,9 +3268,9 @@ impl Ag2pcTriplePool {
             .collect())
     }
 
-    pub async fn compute_inplace(
+    pub async fn compute_inplace<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         rep_a: &[AShareBundle],
         rep_b: &[AShareBundle],
     ) -> Result<Vec<AShareBundle>> {
@@ -3265,9 +3278,9 @@ impl Ag2pcTriplePool {
             .await
     }
 
-    pub async fn compute_inplace_owned(
+    pub async fn compute_inplace_owned<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         mut rep_a: Vec<AShareBundle>,
         mut rep_b: Vec<AShareBundle>,
     ) -> Result<Vec<AShareBundle>> {
@@ -3356,27 +3369,33 @@ impl Ag2pcTriplePool {
         Ok(out)
     }
 
-    pub async fn maybe_flush_cot_check(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    pub async fn maybe_flush_cot_check<S: TranscriptIo>(
+        &mut self,
+        streams: &mut Ag2pcStreams<S>,
+    ) -> Result<()> {
         if self.cots_minted_since_check {
             self.flush_cot_check(streams).await?;
         }
         Ok(())
     }
 
-    pub async fn flush_cot_check(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    pub async fn flush_cot_check<S: TranscriptIo>(
+        &mut self,
+        streams: &mut Ag2pcStreams<S>,
+    ) -> Result<()> {
         self.cots_minted_since_check = false;
         self.end_abits(streams).await?;
         self.begin_abits(streams).await
     }
 
-    pub async fn end(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    pub async fn end<S: TranscriptIo>(&mut self, streams: &mut Ag2pcStreams<S>) -> Result<()> {
         self.cots_minted_since_check = false;
         self.end_abits(streams).await
     }
 
-    async fn gen_cot_shares(
+    async fn gen_cot_shares<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         count: usize,
     ) -> Result<(Vec<Block>, Vec<Block>)> {
         self.cots_minted_since_check = true;
@@ -3398,9 +3417,9 @@ impl Ag2pcTriplePool {
         }
     }
 
-    async fn leaky_and_halfgate(
+    async fn leaky_and_halfgate<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         mac: &mut [Block],
         key: &mut [Block],
         l: usize,
@@ -3480,9 +3499,9 @@ impl Ag2pcTriplePool {
         Ok(())
     }
 
-    async fn layered_bucket_into_acc(
+    async fn layered_bucket_into_acc<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         acc_mac: &mut [Block],
         acc_key: &mut [Block],
         bucket: usize,
@@ -3514,9 +3533,9 @@ impl Ag2pcTriplePool {
         Ok(())
     }
 
-    async fn bucket_one_layer(
+    async fn bucket_one_layer<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         acc_mac: &mut [Block],
         acc_key: &mut [Block],
         layer: Ag2pcLayerView<'_>,
@@ -3543,9 +3562,9 @@ impl Ag2pcTriplePool {
         Ok(())
     }
 
-    async fn exchange_blocks(
+    async fn exchange_blocks<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         mine: &[Block],
         peer_len: usize,
     ) -> Result<Vec<Block>> {
@@ -3567,9 +3586,9 @@ impl Ag2pcTriplePool {
         }
     }
 
-    async fn exchange_bool_vector(
+    async fn exchange_bool_vector<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         mine: &[u8],
         peer_len: usize,
     ) -> Result<Vec<u8>> {
@@ -3591,9 +3610,9 @@ impl Ag2pcTriplePool {
         }
     }
 
-    async fn exchange_two_bool_vectors(
+    async fn exchange_two_bool_vectors<S: TranscriptIo>(
         &mut self,
-        streams: &mut Ag2pcStreams,
+        streams: &mut Ag2pcStreams<S>,
         mine_a: &[u8],
         mine_b: &[u8],
         peer_len: usize,
@@ -3616,7 +3635,7 @@ impl Ag2pcTriplePool {
         }
     }
 
-    async fn begin_abits(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    async fn begin_abits<S: TranscriptIo>(&mut self, streams: &mut Ag2pcStreams<S>) -> Result<()> {
         match self.party {
             Role::Alice => {
                 tokio::try_join!(
@@ -3634,7 +3653,7 @@ impl Ag2pcTriplePool {
         Ok(())
     }
 
-    async fn end_abits(&mut self, streams: &mut Ag2pcStreams) -> Result<()> {
+    async fn end_abits<S: TranscriptIo>(&mut self, streams: &mut Ag2pcStreams<S>) -> Result<()> {
         match self.party {
             Role::Alice => {
                 tokio::try_join!(
@@ -3681,29 +3700,29 @@ async fn ag2pc_end_flush<S: TranscriptIo>(soft: &mut SoftSpoken4, stream: &mut S
     Ok(())
 }
 
-async fn ag2pc_send_blocks(stream: &mut EmpStream, blocks: &[Block]) -> Result<()> {
+async fn ag2pc_send_blocks<S: ByteIo>(stream: &mut S, blocks: &[Block]) -> Result<()> {
     stream.send_block(blocks).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn ag2pc_recv_blocks(stream: &mut EmpStream, len: usize) -> Result<Vec<Block>> {
+async fn ag2pc_recv_blocks<S: ByteIo>(stream: &mut S, len: usize) -> Result<Vec<Block>> {
     Ok(stream.recv_block(len).await?)
 }
 
-async fn ag2pc_send_bool_vector(stream: &mut EmpStream, data: &[u8]) -> Result<()> {
+async fn ag2pc_send_bool_vector<S: ByteIo>(stream: &mut S, data: &[u8]) -> Result<()> {
     stream.send_data(&ag2pc_pack_bools(data)).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn ag2pc_recv_bool_vector(stream: &mut EmpStream, len: usize) -> Result<Vec<u8>> {
+async fn ag2pc_recv_bool_vector<S: ByteIo>(stream: &mut S, len: usize) -> Result<Vec<u8>> {
     let encoded = stream.recv_data(ag2pc_bool_wire_len(len)).await?;
     Ok(ag2pc_unpack_bools(&encoded, len))
 }
 
-async fn ag2pc_send_two_bool_vectors(
-    stream: &mut EmpStream,
+async fn ag2pc_send_two_bool_vectors<S: ByteIo>(
+    stream: &mut S,
     first: &[u8],
     second: &[u8],
 ) -> Result<()> {
@@ -3713,8 +3732,8 @@ async fn ag2pc_send_two_bool_vectors(
     Ok(())
 }
 
-async fn ag2pc_recv_two_bool_vectors(
-    stream: &mut EmpStream,
+async fn ag2pc_recv_two_bool_vectors<S: ByteIo>(
+    stream: &mut S,
     len: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let first = ag2pc_recv_bool_vector(stream, len).await?;
@@ -3744,8 +3763,8 @@ fn ag2pc_unpack_bools(encoded: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
-async fn ag2pc_feq_check(
-    stream: &mut EmpStream,
+async fn ag2pc_feq_check<S: ByteIo>(
+    stream: &mut S,
     party: Role,
     local_digest: &[u8; HASH_DIGEST_BYTES],
 ) -> Result<()> {
@@ -4044,6 +4063,7 @@ mod tests {
     use shachain2pc_circuit::{
         build_chunk_circuit, build_tile_circuit, sha256_compress_gadget, Gate, CACHE_TILE_HEIGHT,
     };
+    use shachain2pc_emp_wire::EmpStream;
     use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
     #[cfg(feature = "cpp-probes")]
     use std::path::Path;

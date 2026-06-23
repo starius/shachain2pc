@@ -15,7 +15,7 @@ use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 pub use shachain2pc_mpc_core::{
     cggm_bit_reverse, cggm_build_sender, cggm_eval_receiver, sfvole_receiver_butterfly,
-    sfvole_sender_butterfly, AShareBundle, Prp,
+    sfvole_sender_butterfly, AShareBundle, Prg, Prp,
 };
 use shachain2pc_mpc_core::{
     finalize_input_open, gf_inner_product, gf_mul, gf_pack_128, reveal_local_share,
@@ -192,75 +192,6 @@ impl EmpRo {
 fn zero_key_prp() -> &'static Prp {
     static ZERO_KEY_PRP: OnceLock<Prp> = OnceLock::new();
     ZERO_KEY_PRP.get_or_init(Prp::zero_key)
-}
-
-pub struct Prg {
-    prp: Prp,
-    counter: u64,
-}
-
-impl Prg {
-    pub fn new(seed: Block, id: u64) -> Self {
-        let mut key = seed.into_bytes();
-        for (dst, src) in key[..8].iter_mut().zip(id.to_le_bytes()) {
-            *dst ^= src;
-        }
-        let prp = Prp::new(Block::from_bytes(key));
-        key.zeroize();
-        Self { prp, counter: 0 }
-    }
-
-    pub fn random() -> Result<Self> {
-        Ok(Self::new(random_block()?, 0))
-    }
-
-    pub fn random_block(&mut self, nblocks: usize) -> Vec<Block> {
-        let mut out = Vec::with_capacity(nblocks);
-        for _ in 0..nblocks {
-            out.push(Block::make(0, self.counter));
-            self.counter += 1;
-        }
-        self.prp.permute_block(&mut out);
-        out
-    }
-
-    pub fn random_data(&mut self, nbytes: usize) -> Vec<u8> {
-        let mut out = vec![0u8; nbytes];
-        self.fill_random_data(&mut out);
-        out
-    }
-
-    pub fn fill_random_data(&mut self, out: &mut [u8]) {
-        let mut chunks = out.chunks_exact_mut(BLOCK_BYTES);
-        for chunk in &mut chunks {
-            let block = self.next_block();
-            chunk.copy_from_slice(block.as_bytes());
-        }
-        let rem = chunks.into_remainder();
-        if !rem.is_empty() {
-            let block = self.next_block();
-            rem.copy_from_slice(&block.as_bytes()[..rem.len()]);
-        }
-    }
-
-    fn next_block(&mut self) -> Block {
-        let block = Block::make(0, self.counter);
-        self.counter += 1;
-        self.prp.permute_one(block)
-    }
-
-    pub fn random_bool_aligned(&mut self, length: usize) -> Vec<bool> {
-        self.random_data(length)
-            .into_iter()
-            .map(|byte| (byte & 1) != 0)
-            .collect()
-    }
-}
-
-impl Drop for Prg {
-    fn drop(&mut self) {
-        self.counter.zeroize();
-    }
 }
 
 pub fn garble_hash_preprocess(
@@ -644,7 +575,7 @@ impl SoftSpoken4 {
             setup_done: false,
             delta,
             delta_bool,
-            choice_prg: Prg::random()?,
+            choice_prg: Prg::new(random_block()?, 0),
             session: 0,
             cur_send_session: 0,
             cur_recv_session: 0,
@@ -2308,7 +2239,7 @@ impl Ag2pcProtocol {
             party,
             delta: triple_pool.delta(),
             triple_pool,
-            prg: Prg::random()?,
+            prg: Prg::new(random_block()?, 0),
             process_input_calls: 0,
         })
     }

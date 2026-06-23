@@ -69,6 +69,71 @@ impl Prp {
     }
 }
 
+pub struct Prg {
+    prp: Prp,
+    counter: u64,
+}
+
+impl Prg {
+    pub fn new(seed: Block, id: u64) -> Self {
+        let mut key = seed.into_bytes();
+        for (dst, src) in key[..8].iter_mut().zip(id.to_le_bytes()) {
+            *dst ^= src;
+        }
+        let prp = Prp::new(Block::from_bytes(key));
+        key.zeroize();
+        Self { prp, counter: 0 }
+    }
+
+    pub fn random_block(&mut self, nblocks: usize) -> Vec<Block> {
+        let mut out = Vec::with_capacity(nblocks);
+        for _ in 0..nblocks {
+            out.push(Block::make(0, self.counter));
+            self.counter += 1;
+        }
+        self.prp.permute_block(&mut out);
+        out
+    }
+
+    pub fn random_data(&mut self, nbytes: usize) -> Vec<u8> {
+        let mut out = vec![0u8; nbytes];
+        self.fill_random_data(&mut out);
+        out
+    }
+
+    pub fn fill_random_data(&mut self, out: &mut [u8]) {
+        let mut chunks = out.chunks_exact_mut(BLOCK_BYTES);
+        for chunk in &mut chunks {
+            let block = self.next_block();
+            chunk.copy_from_slice(block.as_bytes());
+        }
+        let rem = chunks.into_remainder();
+        if !rem.is_empty() {
+            let block = self.next_block();
+            rem.copy_from_slice(&block.as_bytes()[..rem.len()]);
+        }
+    }
+
+    fn next_block(&mut self) -> Block {
+        let block = Block::make(0, self.counter);
+        self.counter += 1;
+        self.prp.permute_one(block)
+    }
+
+    pub fn random_bool_aligned(&mut self, length: usize) -> Vec<bool> {
+        self.random_data(length)
+            .into_iter()
+            .map(|byte| (byte & 1) != 0)
+            .collect()
+    }
+}
+
+impl Drop for Prg {
+    fn drop(&mut self) {
+        self.counter.zeroize();
+    }
+}
+
 const CGGM_LSB_CLEAR_MASK: Block = Block::from_bytes([
     0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ]);

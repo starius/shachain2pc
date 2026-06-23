@@ -125,6 +125,37 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_precompute_repairs_peer_frontier_rollback() {
+    let mut pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "14"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "14"])
+        .await;
+
+    let first = pair
+        .cli(&pair.alice_control, &["precompute", "14", "1"])
+        .await;
+    assert!(first.contains("nodes=1"), "{first}");
+    pair.kill_children().await;
+
+    let bob_db = pair.dir.path().join("bob.db");
+    std::fs::remove_file(&bob_db).unwrap();
+    let pair = DaemonPair::start_with_dir_and_ports(pair.dir, pair.ports).await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "14"])
+        .await;
+    let repaired = pair
+        .cli(&pair.alice_control, &["precompute", "14", "1"])
+        .await;
+    assert!(repaired.contains("nodes=1"), "{repaired}");
+
+    let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
+    assert_channel_contains(&alice_channels, 14, "frontier=1");
+    assert_channel_contains(&bob_channels, 14, "frontier=1");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_background_precomputes_to_shared_target() {
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["config", "precompute", "1"])

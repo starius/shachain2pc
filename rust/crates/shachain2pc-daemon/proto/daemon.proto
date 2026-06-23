@@ -161,4 +161,6 @@ message JobFrame {
   bytes digest = 6;
   bool start = 7;
   bytes payload = 8;
+  uint32 ssp_target = 9;
+  uint64 delta_lifetime_checked_units_cap = 10;
 }

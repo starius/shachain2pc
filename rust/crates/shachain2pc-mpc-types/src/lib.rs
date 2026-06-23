@@ -245,6 +245,38 @@ impl SessionStart {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStartAck {
+    pub transcript_binding: Vec<u8>,
+}
+
+impl SessionStartAck {
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        self.to_proto().encode_to_vec()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MpcTypeError> {
+        let proto = proto::SessionStartAck::decode(bytes).map_err(MpcTypeError::Decode)?;
+        let out = Self::from_proto(proto);
+        if out.encode_to_vec().as_slice() != bytes {
+            return Err(MpcTypeError::NonCanonicalFrame);
+        }
+        Ok(out)
+    }
+
+    pub fn to_proto(&self) -> proto::SessionStartAck {
+        proto::SessionStartAck {
+            transcript_binding: self.transcript_binding.clone(),
+        }
+    }
+
+    pub fn from_proto(proto: proto::SessionStartAck) -> Self {
+        Self {
+            transcript_binding: proto.transcript_binding,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum MpcTypeError {
     Decode(prost::DecodeError),
@@ -359,6 +391,16 @@ mod tests {
         let encoded = msg.encode_to_vec();
         assert_eq!(hex(&encoded), "08401202abcd1a017f");
         assert_eq!(SessionStart::decode(&encoded).unwrap(), msg);
+    }
+
+    #[test]
+    fn session_start_ack_encoding_is_pinned() {
+        let msg = SessionStartAck {
+            transcript_binding: vec![0xab, 0xcd],
+        };
+        let encoded = msg.encode_to_vec();
+        assert_eq!(hex(&encoded), "0a02abcd");
+        assert_eq!(SessionStartAck::decode(&encoded).unwrap(), msg);
     }
 
     #[test]

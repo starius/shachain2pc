@@ -356,6 +356,10 @@ There are two gRPC surfaces:
 Use `tonic` initially. For peer transport, use mTLS or pinned peer certificates
 from the start. Unix domain sockets and Windows named pipes are deliberately
 deferred to avoid platform-specific transport work in the first daemon version.
+The daemon should keep one reusable tonic channel to its peer and clone it for
+RPCs. Tonic clones share the underlying HTTP/2 connection, so frontier queries
+and each job's `main`/`sibling` JobStream pair multiplex over one peer
+connection instead of reconnecting per operation.
 
 ### Peer API
 

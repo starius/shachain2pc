@@ -363,6 +363,69 @@ impl Ag2pcTriplePoolState {
         sout.zeroize();
         Ok(())
     }
+
+    pub fn bucket_shift(seed: Block, l: usize) -> usize {
+        let mut prg = Prg::new(seed, 0);
+        let raw = u32::from_ne_bytes(
+            prg.random_data(4)
+                .try_into()
+                .expect("four random bytes for bucket shift"),
+        );
+        (raw as usize) % l
+    }
+
+    pub fn bucket_prepare_layer(
+        &self,
+        acc_mac: &mut [Block],
+        acc_key: &mut [Block],
+        layer_mac: &[Block],
+        layer_key: &[Block],
+        l: usize,
+        r: usize,
+    ) -> Result<Vec<u8>, Ag2pcTriplePoolError> {
+        require_len("acc_mac", acc_mac.len(), 3 * l)?;
+        require_len("acc_key", acc_key.len(), 3 * l)?;
+        require_len("layer_mac", layer_mac.len(), 3 * l)?;
+        require_len("layer_key", layer_key.len(), 3 * l)?;
+        let mut d_me = vec![0u8; l];
+        let cut = l - r;
+        for i in 0..l {
+            let src = if i < cut { i + r } else { i + r - l };
+            acc_mac[i] = acc_mac[i].xor(layer_mac[src]);
+            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer_mac[2 * l + src]);
+            acc_key[i] = acc_key[i].xor(layer_key[src]);
+            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer_key[2 * l + src]);
+            d_me[i] = block_lsb(acc_mac[l + i]) ^ block_lsb(layer_mac[l + src]);
+        }
+        Ok(d_me)
+    }
+
+    pub fn bucket_finish_layer(
+        &self,
+        acc_mac: &mut [Block],
+        acc_key: &mut [Block],
+        layer_mac: &[Block],
+        layer_key: &[Block],
+        l: usize,
+        r: usize,
+        d_me: &[u8],
+        d_peer: &[u8],
+    ) -> Result<(), Ag2pcTriplePoolError> {
+        require_len("acc_mac", acc_mac.len(), 3 * l)?;
+        require_len("acc_key", acc_key.len(), 3 * l)?;
+        require_len("layer_mac", layer_mac.len(), 3 * l)?;
+        require_len("layer_key", layer_key.len(), 3 * l)?;
+        require_len("d_me", d_me.len(), l)?;
+        require_len("d_peer", d_peer.len(), l)?;
+        let cut = l - r;
+        for i in 0..l {
+            let src = if i < cut { i + r } else { i + r - l };
+            let mask = select_block(d_me[i] ^ d_peer[i]);
+            acc_mac[2 * l + i] = acc_mac[2 * l + i].xor(layer_mac[src].and(mask));
+            acc_key[2 * l + i] = acc_key[2 * l + i].xor(layer_key[src].and(mask));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Ag2pcTriplePoolState {

@@ -11,16 +11,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::generate_from_seed;
 use shachain2pc_emp_compat::{normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires};
-use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
+use shachain2pc_emp_wire::{Ag2pcStreams, Block, ChannelByteStream, BLOCK_BYTES};
 use shachain2pc_party::{
     reveal_node_job, run_party, run_precompute_path_with_streams, run_seed_root_job,
     Args as PartyArgs, IndexSpec, MpcTcpEndpoint, PartyOutput,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -234,15 +233,6 @@ struct IncomingPrecomputeJob {
     planned_checked_units: u64,
 }
 
-struct GrpcAg2pcStream {
-    tx: mpsc::Sender<Vec<u8>>,
-    rx: mpsc::Receiver<Vec<u8>>,
-    recv_buf: VecDeque<u8>,
-    fs_send_first: bool,
-    fs_send: Option<Sha256>,
-    fs_recv: Option<Sha256>,
-}
-
 enum PrecomputeStart {
     AlreadyStored,
     Run(PrecomputeJob),
@@ -261,92 +251,8 @@ struct GrpcJobDescriptor {
 
 struct PendingGrpcJob {
     descriptor: GrpcJobDescriptor,
-    main: Option<GrpcAg2pcStream>,
-    sibling: Option<GrpcAg2pcStream>,
-}
-
-impl GrpcAg2pcStream {
-    fn new(tx: mpsc::Sender<Vec<u8>>, rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self {
-            tx,
-            rx,
-            recv_buf: VecDeque::new(),
-            fs_send_first: false,
-            fs_send: None,
-            fs_recv: None,
-        }
-    }
-}
-
-impl ByteIo for GrpcAg2pcStream {
-    async fn send_data<'a>(&'a mut self, data: &'a [u8]) -> shachain2pc_emp_wire::Result<()> {
-        if let Some(fs_send) = &mut self.fs_send {
-            fs_send.update(data);
-        }
-        self.tx
-            .send(data.to_vec())
-            .await
-            .map_err(|_| wire_closed("gRPC MPC send stream closed"))
-    }
-
-    async fn recv_data(&mut self, len: usize) -> shachain2pc_emp_wire::Result<Vec<u8>> {
-        while self.recv_buf.len() < len {
-            let chunk = self
-                .rx
-                .recv()
-                .await
-                .ok_or_else(|| wire_closed("gRPC MPC receive stream closed"))?;
-            self.recv_buf.extend(chunk);
-        }
-        let out: Vec<u8> = self.recv_buf.drain(..len).collect();
-        if let Some(fs_recv) = &mut self.fs_recv {
-            fs_recv.update(&out);
-        }
-        Ok(out)
-    }
-
-    async fn flush(&mut self) -> shachain2pc_emp_wire::Result<()> {
-        Ok(())
-    }
-}
-
-impl TranscriptIo for GrpcAg2pcStream {
-    fn enable_fs(&mut self, send_first: bool) -> shachain2pc_emp_wire::Result<()> {
-        if self.fs_send.is_some() {
-            return Err(WireError::FsAlreadyEnabled);
-        }
-        self.fs_send_first = send_first;
-        self.fs_send = Some(Sha256::new());
-        self.fs_recv = Some(Sha256::new());
-        Ok(())
-    }
-
-    fn fs_enabled(&self) -> bool {
-        self.fs_send.is_some()
-    }
-
-    fn get_send_digest(&self) -> shachain2pc_emp_wire::Result<Block> {
-        digest_block(self.fs_send.as_ref().ok_or(WireError::FsNotEnabled)?)
-    }
-
-    fn get_recv_digest(&self) -> shachain2pc_emp_wire::Result<Block> {
-        digest_block(self.fs_recv.as_ref().ok_or(WireError::FsNotEnabled)?)
-    }
-
-    fn get_digest(&self) -> shachain2pc_emp_wire::Result<Block> {
-        let send = digest_bytes(self.fs_send.as_ref().ok_or(WireError::FsNotEnabled)?);
-        let recv = digest_bytes(self.fs_recv.as_ref().ok_or(WireError::FsNotEnabled)?);
-        let mut h = Sha256::new();
-        if self.fs_send_first {
-            h.update(send);
-            h.update(recv);
-        } else {
-            h.update(recv);
-            h.update(send);
-        }
-        let digest: [u8; 32] = h.finalize().into();
-        Ok(first_digest_block(&digest))
-    }
+    main: Option<ChannelByteStream>,
+    sibling: Option<ChannelByteStream>,
 }
 
 struct EncryptedStore {
@@ -762,7 +668,7 @@ async fn open_peer_job_stream(
     (
         GrpcJobDescriptor,
         u32,
-        GrpcAg2pcStream,
+        ChannelByteStream,
         ReceiverStream<std::result::Result<pb::JobFrame, Status>>,
     ),
     Status,
@@ -817,7 +723,7 @@ async fn open_peer_job_stream(
     Ok((
         descriptor,
         channel,
-        GrpcAg2pcStream::new(out_tx, in_rx),
+        ChannelByteStream::new(out_tx, in_rx),
         ReceiverStream::new(response_rx),
     ))
 }
@@ -826,7 +732,7 @@ async fn open_peer_job_channel(
     peer_url: &str,
     descriptor: &GrpcJobDescriptor,
     channel: u32,
-) -> Result<GrpcAg2pcStream> {
+) -> Result<ChannelByteStream> {
     let channel =
         validate_job_channel(channel).map_err(|msg| DaemonError::Refused(msg.to_owned()))?;
     let (request_tx, request_rx) = mpsc::channel::<pb::JobFrame>(64);
@@ -872,7 +778,7 @@ async fn open_peer_job_channel(
         }
     });
 
-    Ok(GrpcAg2pcStream::new(out_tx, in_rx))
+    Ok(ChannelByteStream::new(out_tx, in_rx))
 }
 
 impl DaemonState {
@@ -896,7 +802,7 @@ impl DaemonState {
         &self,
         descriptor: GrpcJobDescriptor,
         channel: u32,
-        stream: GrpcAg2pcStream,
+        stream: ChannelByteStream,
     ) -> std::result::Result<(), Status> {
         let mut jobs = self.grpc_jobs.lock().await;
         let entry = jobs
@@ -939,7 +845,7 @@ impl DaemonState {
     async fn run_incoming_precompute_job(
         self,
         descriptor: GrpcJobDescriptor,
-        mut streams: Ag2pcStreams<GrpcAg2pcStream>,
+        mut streams: Ag2pcStreams<ChannelByteStream>,
     ) -> Result<()> {
         let index =
             Index48::new(descriptor.target_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
@@ -1636,7 +1542,7 @@ impl DaemonState {
     async fn open_peer_job_streams(
         &self,
         descriptor: &GrpcJobDescriptor,
-    ) -> Result<Ag2pcStreams<GrpcAg2pcStream>> {
+    ) -> Result<Ag2pcStreams<ChannelByteStream>> {
         let peer_url = {
             let inner = self.inner.lock().await;
             inner.cfg.peer_url.clone()
@@ -2055,24 +1961,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
-}
-
-fn wire_closed(reason: &'static str) -> WireError {
-    WireError::Io(io::Error::new(io::ErrorKind::BrokenPipe, reason))
-}
-
-fn digest_bytes(hasher: &Sha256) -> [u8; 32] {
-    hasher.clone().finalize().into()
-}
-
-fn digest_block(hasher: &Sha256) -> shachain2pc_emp_wire::Result<Block> {
-    Ok(first_digest_block(&digest_bytes(hasher)))
-}
-
-fn first_digest_block(digest: &[u8; 32]) -> Block {
-    let mut out = [0u8; BLOCK_BYTES];
-    out.copy_from_slice(&digest[..BLOCK_BYTES]);
-    Block::from_bytes(out)
 }
 
 fn info_with_u64(prefix: &[u8], value: u64) -> Vec<u8> {

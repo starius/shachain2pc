@@ -82,12 +82,12 @@ impl ChannelFlow {
             return Err(StepError::new(self, CoreError::Aborted));
         }
         if frame.job_id != self.job_id {
-            return Err(StepError::new(self, CoreError::JobMismatch));
+            return Err(aborting_error(self, CoreError::JobMismatch));
         }
         if frame.sender_role != self.local_role {
             let expected = self.local_role;
             let got = frame.sender_role;
-            return Err(StepError::new(
+            return Err(aborting_error(
                 self,
                 CoreError::RoleMismatch { expected, got },
             ));
@@ -95,7 +95,7 @@ impl ChannelFlow {
         if frame.channel != self.channel {
             let expected = self.channel;
             let got = frame.channel;
-            return Err(StepError::new(
+            return Err(aborting_error(
                 self,
                 CoreError::ChannelMismatch { expected, got },
             ));
@@ -103,7 +103,7 @@ impl ChannelFlow {
         if frame.sequence != self.next_send {
             let expected = self.next_send;
             let got = frame.sequence;
-            return Err(StepError::new(
+            return Err(aborting_error(
                 self,
                 CoreError::SequenceMismatch { expected, got },
             ));
@@ -117,12 +117,12 @@ impl ChannelFlow {
             return Err(StepError::new(self, CoreError::Aborted));
         }
         if frame.job_id != self.job_id {
-            return Err(StepError::new(self, CoreError::JobMismatch));
+            return Err(aborting_error(self, CoreError::JobMismatch));
         }
         if frame.sender_role == self.local_role {
             let expected = opposite_role(self.local_role);
             let got = frame.sender_role;
-            return Err(StepError::new(
+            return Err(aborting_error(
                 self,
                 CoreError::RoleMismatch { expected, got },
             ));
@@ -130,7 +130,7 @@ impl ChannelFlow {
         if frame.channel != self.channel {
             let expected = self.channel;
             let got = frame.channel;
-            return Err(StepError::new(
+            return Err(aborting_error(
                 self,
                 CoreError::ChannelMismatch { expected, got },
             ));
@@ -138,7 +138,7 @@ impl ChannelFlow {
         if frame.sequence != self.next_recv {
             let expected = self.next_recv;
             let got = frame.sequence;
-            return Err(StepError::new(
+            return Err(aborting_error(
                 self,
                 CoreError::SequenceMismatch { expected, got },
             ));
@@ -484,6 +484,7 @@ mod tests {
             }
         );
         assert_eq!(err.state().next_send(), 0);
+        assert!(err.state().is_aborted());
     }
 
     #[test]

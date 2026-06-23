@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::generate_from_seed;
 use shachain2pc_emp_compat::{normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires};
-use shachain2pc_emp_wire::{Ag2pcStreams, Block, ChannelByteStream, BLOCK_BYTES};
+use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, ChannelByteStream, BLOCK_BYTES};
 use shachain2pc_mpc_runner::{
     run_session_handshake, ByteFrameTransport, RunnerSessionParams, TransportPair,
 };
 use shachain2pc_party::{
-    reveal_node_job, run_party, run_precompute_path_with_streams, run_seed_root_job,
-    Args as PartyArgs, IndexSpec, MpcTcpEndpoint, PartyOutput,
+    reveal_node_job, run_party, run_seed_root_job, Args as PartyArgs, IndexSpec, MpcTcpEndpoint,
+    PartyOutput, PrecomputeSession,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
 use std::collections::{BTreeMap, HashMap};
@@ -26,10 +26,12 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint, Server};
+use tonic::transport::{
+    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
+};
 use tonic::{Request, Response, Status, Streaming};
 use zeroize::Zeroize;
 
@@ -108,6 +110,12 @@ impl From<shachain2pc_party::PartyError> for DaemonError {
     }
 }
 
+impl From<shachain2pc_emp_wire::WireError> for DaemonError {
+    fn from(value: shachain2pc_emp_wire::WireError) -> Self {
+        Self::Party(shachain2pc_party::PartyError::Wire(value))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, DaemonError>;
 
 #[derive(Clone, Debug)]
@@ -117,12 +125,21 @@ pub struct DaemonConfig {
     pub control_addr: SocketAddr,
     pub peer_addr: SocketAddr,
     pub peer_url: Option<String>,
+    pub peer_tls: Option<PeerTlsConfig>,
     pub mpc_port: u16,
     pub max_ram_bytes: u64,
     pub workers: u32,
     pub precompute: u64,
     pub control_file: Option<PathBuf>,
     pub cookie_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub ca_path: PathBuf,
+    pub domain_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,6 +163,7 @@ impl DaemonHandle {
 pub struct DaemonState {
     inner: Arc<Mutex<Inner>>,
     grpc_jobs: Arc<Mutex<BTreeMap<String, PendingGrpcJob>>>,
+    precompute_sessions: Arc<Mutex<BTreeMap<u64, PrecomputeSessionHandle>>>,
     peer_channel: Option<Channel>,
 }
 
@@ -221,21 +239,17 @@ struct PeerFrontierConfig {
 
 struct PrecomputeJob {
     job_id: String,
-    endpoint: MpcTcpEndpoint,
-    delta: Block,
-    ssp: usize,
-    ssp_target: u32,
-    delta_lifetime_checked_units_cap: u64,
-    share: Value32,
     planned_checked_units: u64,
 }
 
 struct IncomingPrecomputeJob {
     job_id: String,
+}
+
+struct IncomingPrecomputeSession {
     delta: Block,
     ssp: usize,
     share: Value32,
-    planned_checked_units: u64,
 }
 
 enum PrecomputeStart {
@@ -258,6 +272,22 @@ struct PendingGrpcJob {
     descriptor: GrpcJobDescriptor,
     main: Option<ChannelByteStream>,
     sibling: Option<ChannelByteStream>,
+}
+
+#[derive(Clone)]
+struct PrecomputeSessionHandle {
+    tx: mpsc::Sender<PrecomputeSessionCommand>,
+}
+
+enum PrecomputeSessionCommand {
+    Plan {
+        index: Index48,
+        response: oneshot::Sender<Result<u64>>,
+    },
+    Precompute {
+        index: Index48,
+        response: oneshot::Sender<Result<Ag2pcSecureWires>>,
+    },
 }
 
 struct EncryptedStore {
@@ -354,9 +384,16 @@ pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()>
     let control_server = Server::builder()
         .add_service(ControlServiceServer::new(control))
         .serve(bind);
-    let peer_server = Server::builder()
-        .add_service(PeerServiceServer::new(peer))
-        .serve(peer_addr);
+    let peer_server = {
+        let inner = state.inner.lock().await;
+        let mut builder = Server::builder();
+        if let Some(tls) = &inner.cfg.peer_tls {
+            builder = builder.tls_config(peer_server_tls_config(tls)?)?;
+        }
+        builder
+            .add_service(PeerServiceServer::new(peer))
+            .serve(peer_addr)
+    };
     tokio::try_join!(control_server, peer_server)?;
     Ok(())
 }
@@ -376,7 +413,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
     }
     let (store, db) = EncryptedStore::open(cfg.db_path.clone(), &master_secret)?;
     let cookie = load_or_create_cookie(&cfg)?;
-    let peer_channel = peer_channel_from_url(&cfg.peer_url)?;
+    let peer_channel = peer_channel_from_url(&cfg.peer_url, cfg.peer_tls.as_ref())?;
     Ok(DaemonState {
         inner: Arc::new(Mutex::new(Inner {
             cfg,
@@ -388,6 +425,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             next_job_id: 0,
         })),
         grpc_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         peer_channel,
     })
 }
@@ -787,6 +825,63 @@ async fn open_peer_job_channel(
     Ok(ChannelByteStream::new(out_tx, in_rx))
 }
 
+impl PrecomputeSessionHandle {
+    async fn plan(&self, index: Index48) -> Result<u64> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(PrecomputeSessionCommand::Plan { index, response })
+            .await
+            .map_err(|_| DaemonError::Refused("precompute session is closed".to_owned()))?;
+        rx.await
+            .map_err(|_| DaemonError::Refused("precompute session stopped".to_owned()))?
+    }
+
+    async fn precompute(&self, index: Index48) -> Result<Ag2pcSecureWires> {
+        let (response, rx) = oneshot::channel();
+        self.tx
+            .send(PrecomputeSessionCommand::Precompute { index, response })
+            .await
+            .map_err(|_| DaemonError::Refused("precompute session is closed".to_owned()))?;
+        rx.await
+            .map_err(|_| DaemonError::Refused("precompute session stopped".to_owned()))?
+    }
+}
+
+async fn run_outgoing_precompute_session(
+    mut session: PrecomputeSession<ChannelByteStream>,
+    mut rx: mpsc::Receiver<PrecomputeSessionCommand>,
+) {
+    while let Some(command) = rx.recv().await {
+        match command {
+            PrecomputeSessionCommand::Plan { index, response } => {
+                let _ = response.send(Ok(session.planned_checked_units(index)));
+            }
+            PrecomputeSessionCommand::Precompute { index, response } => {
+                let target_bytes = index.get().to_le_bytes();
+                let send_result = async {
+                    session.streams_mut().main.send_data(&target_bytes).await?;
+                    session.streams_mut().main.flush().await?;
+                    Ok::<(), shachain2pc_emp_wire::WireError>(())
+                }
+                .await
+                .map_err(DaemonError::from);
+                let result = match send_result {
+                    Ok(()) => session
+                        .precompute_target(index)
+                        .await
+                        .map_err(DaemonError::from),
+                    Err(e) => Err(e),
+                };
+                let failed = result.is_err();
+                let _ = response.send(result);
+                if failed {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 impl DaemonState {
     async fn check_cookie<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
         let cookie = request
@@ -841,61 +936,73 @@ impl DaemonState {
             let state = self.clone();
             tokio::spawn(async move {
                 let _ = state
-                    .run_incoming_precompute_job(ready.descriptor, streams)
+                    .run_incoming_precompute_session(ready.descriptor, streams)
                     .await;
             });
         }
         Ok(())
     }
 
-    async fn run_incoming_precompute_job(
+    async fn run_incoming_precompute_session(
         self,
         descriptor: GrpcJobDescriptor,
         mut streams: Ag2pcStreams<ChannelByteStream>,
     ) -> Result<()> {
-        let index =
-            Index48::new(descriptor.target_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
-        let job = self
-            .begin_incoming_precompute_job(&descriptor, index)
-            .await?;
+        let job = self.begin_incoming_precompute_session(&descriptor).await?;
         streams =
             match run_jobstream_session_handshake(self.role().await, &descriptor, streams).await {
                 Ok(streams) => streams,
-                Err(e) => {
-                    self.finish_job(&job.job_id, true).await;
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             };
-        let nodes = match run_precompute_path_with_streams(
-            &mut streams,
+        let mut session = match PrecomputeSession::setup_with_streams(
+            streams,
             self.role().await,
             job.share,
-            index,
             job.delta,
             job.ssp,
         )
         .await
         {
-            Ok(nodes) => nodes,
-            Err(e) => {
-                self.finish_job(&job.job_id, true).await;
-                return Err(e.into());
-            }
+            Ok(session) => session,
+            Err(e) => return Err(e.into()),
         };
-        if let Err(e) = self
-            .store_precomputed_target_and_finish_job(
-                descriptor.channel_index,
-                &job.job_id,
-                job.planned_checked_units,
-                index.get(),
-                nodes,
-            )
-            .await
-        {
-            self.finish_job(&job.job_id, true).await;
-            return Err(e);
+        loop {
+            let target_bytes = match session.streams_mut().main.recv_data(8).await {
+                Ok(bytes) => bytes,
+                Err(e) => return Err(e.into()),
+            };
+            let target_index = u64::from_le_bytes(
+                target_bytes
+                    .try_into()
+                    .map_err(|_| DaemonError::Parse("bad precompute target command".to_owned()))?,
+            );
+            let index =
+                Index48::new(target_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
+            let planned_checked_units = session.planned_checked_units(index);
+            let target_job = self
+                .begin_incoming_precompute_target(&descriptor, index, planned_checked_units)
+                .await?;
+            let wires = match session.precompute_target(index).await {
+                Ok(wires) => wires,
+                Err(e) => {
+                    self.finish_job(&target_job.job_id, true).await;
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = self
+                .store_precomputed_target_wires_and_finish_job(
+                    descriptor.channel_index,
+                    &target_job.job_id,
+                    planned_checked_units,
+                    index.get(),
+                    wires,
+                )
+                .await
+            {
+                self.finish_job(&target_job.job_id, true).await;
+                return Err(e);
+            }
         }
-        Ok(())
     }
 
     async fn role(&self) -> Role {
@@ -1104,6 +1211,79 @@ impl DaemonState {
             .await
     }
 
+    async fn precompute_session_handle(
+        &self,
+        channel_index: u64,
+        peer: PeerFrontierConfig,
+    ) -> Result<PrecomputeSessionHandle> {
+        {
+            let mut sessions = self.precompute_sessions.lock().await;
+            if let Some(handle) = sessions.get(&channel_index) {
+                if !handle.tx.is_closed() {
+                    return Ok(handle.clone());
+                }
+            }
+            sessions.remove(&channel_index);
+        }
+
+        let (role, delta, ssp, ssp_target, cap, share, session_id) = {
+            let mut inner = self.inner.lock().await;
+            let key = channel_key(channel_index);
+            let channel = inner
+                .db
+                .channels
+                .get(&key)
+                .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+            if !channel.enabled {
+                return Err(DaemonError::Refused("channel is disabled".to_owned()));
+            }
+            if peer.ssp_target != channel.ssp_target
+                || peer.delta_lifetime_checked_units_cap != channel.delta_lifetime_checked_units_cap
+            {
+                return Err(DaemonError::Refused(
+                    "peer channel security parameters do not match".to_owned(),
+                ));
+            }
+            let ssp_target = channel.ssp_target;
+            let cap = channel.delta_lifetime_checked_units_cap;
+            inner.next_job_id = inner.next_job_id.saturating_add(1);
+            (
+                inner.cfg.role,
+                channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role),
+                ssp_effective(ssp_target, cap),
+                ssp_target,
+                cap,
+                channel_seed_share(&inner.master_secret.0, channel_index),
+                format!("precompute-session-{}-{}", channel_index, inner.next_job_id),
+            )
+        };
+        let descriptor = GrpcJobDescriptor {
+            job_id: session_id,
+            channel_index,
+            target_index: 0,
+            ssp: ssp as u32,
+            ssp_target,
+            delta_lifetime_checked_units_cap: cap,
+            digest: job_digest(channel_index, "precompute-session", 0, 0, ssp as u32),
+        };
+        let mut streams = self.open_peer_job_streams(&descriptor).await?;
+        streams = run_jobstream_session_handshake(role, &descriptor, streams).await?;
+        let session =
+            PrecomputeSession::setup_with_streams(streams, role, share, delta, ssp).await?;
+        let (tx, rx) = mpsc::channel(8);
+        let handle = PrecomputeSessionHandle { tx };
+        self.precompute_sessions
+            .lock()
+            .await
+            .insert(channel_index, handle.clone());
+        tokio::spawn(run_outgoing_precompute_session(session, rx));
+        Ok(handle)
+    }
+
+    async fn drop_precompute_session(&self, channel_index: u64) {
+        self.precompute_sessions.lock().await.remove(&channel_index);
+    }
+
     async fn precompute_path_jobstream(
         &self,
         channel_index: u64,
@@ -1133,8 +1313,16 @@ impl DaemonState {
             return Err(e);
         }
         self.reconcile_with_peer(channel_index).await?;
+        let session = self.precompute_session_handle(channel_index, peer).await?;
+        let planned_checked_units = match session.plan(index).await {
+            Ok(planned) => planned,
+            Err(e) => {
+                self.drop_precompute_session(channel_index).await;
+                return Err(e);
+            }
+        };
         let job = match self
-            .begin_precompute_jobstream(channel_index, index, peer)
+            .begin_precompute_jobstream(channel_index, index, peer, planned_checked_units)
             .await?
         {
             PrecomputeStart::AlreadyStored => {
@@ -1147,60 +1335,21 @@ impl DaemonState {
             }
             PrecomputeStart::Run(job) => job,
         };
-        let digest = job_digest(
-            channel_index,
-            "precompute-path",
-            0,
-            index.get(),
-            job.ssp as u32,
-        );
-        let descriptor = GrpcJobDescriptor {
-            job_id: job.job_id.clone(),
-            channel_index,
-            target_index: index.get(),
-            ssp: job.ssp as u32,
-            ssp_target: job.ssp_target,
-            delta_lifetime_checked_units_cap: job.delta_lifetime_checked_units_cap,
-            digest,
-        };
-        let mut streams = match self.open_peer_job_streams(&descriptor).await {
-            Ok(streams) => streams,
+        let wires = match session.precompute(index).await {
+            Ok(wires) => wires,
             Err(e) => {
+                self.drop_precompute_session(channel_index).await;
                 self.finish_job(&job.job_id, true).await;
                 return Err(e);
             }
         };
-        streams =
-            match run_jobstream_session_handshake(job.endpoint.role, &descriptor, streams).await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    self.finish_job(&job.job_id, true).await;
-                    return Err(e);
-                }
-            };
-        let nodes = match run_precompute_path_with_streams(
-            &mut streams,
-            job.endpoint.role,
-            job.share,
-            index,
-            job.delta,
-            job.ssp,
-        )
-        .await
-        {
-            Ok(nodes) => nodes,
-            Err(e) => {
-                self.finish_job(&job.job_id, true).await;
-                return Err(e.into());
-            }
-        };
         let nodes_stored = match self
-            .store_precomputed_target_and_finish_job(
+            .store_precomputed_target_wires_and_finish_job(
                 channel_index,
                 &job.job_id,
                 job.planned_checked_units,
                 index.get(),
-                nodes,
+                wires,
             )
             .await
         {
@@ -1251,9 +1400,31 @@ impl DaemonState {
             .channels
             .get_mut(&key)
             .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
-        channel
-            .known_secrets
-            .insert(index.get().to_string(), secret.to_hex());
+        let mut redundant = false;
+        let mut drop_keys = Vec::new();
+        for (stored_index_s, stored_secret_hex) in &channel.known_secrets {
+            let Ok(stored_index) = stored_index_s.parse::<u64>() else {
+                drop_keys.push(stored_index_s.clone());
+                continue;
+            };
+            let stored_secret = Value32::from_hex(stored_secret_hex)
+                .map_err(|e| DaemonError::Parse(e.to_string()))?;
+            if derive_from_known(stored_index, stored_secret, index.get()) == Some(secret) {
+                redundant = true;
+                break;
+            }
+            if derive_from_known(index.get(), secret, stored_index) == Some(stored_secret) {
+                drop_keys.push(stored_index_s.clone());
+            }
+        }
+        if !redundant {
+            for key in drop_keys {
+                channel.known_secrets.remove(&key);
+            }
+            channel
+                .known_secrets
+                .insert(index.get().to_string(), secret.to_hex());
+        }
         channel.last_observed_next_reveal_index = Some(expected_next_index.saturating_sub(1));
         inner.save()
     }
@@ -1342,8 +1513,8 @@ impl DaemonState {
         channel_index: u64,
         index: Index48,
         peer: PeerFrontierConfig,
+        planned_checked_units: u64,
     ) -> Result<PrecomputeStart> {
-        let planned_checked_units = set_bits_desc(index.get()).len() as u64;
         let mut inner = self.inner.lock().await;
         let key = channel_key(channel_index);
         let key_node = node_key(index.get());
@@ -1401,12 +1572,6 @@ impl DaemonState {
                 channel.delta_lifetime_checked_units_cap
             )));
         }
-        let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
-        let ssp = ssp_effective(channel.ssp_target, channel.delta_lifetime_checked_units_cap);
-        let ssp_target = channel.ssp_target;
-        let delta_lifetime_checked_units_cap = channel.delta_lifetime_checked_units_cap;
-        let share = channel_seed_share(&inner.master_secret.0, channel_index);
-        let role = inner.cfg.role;
         let channel = inner
             .db
             .channels
@@ -1429,16 +1594,6 @@ impl DaemonState {
         inner.save()?;
         Ok(PrecomputeStart::Run(PrecomputeJob {
             job_id,
-            endpoint: MpcTcpEndpoint {
-                role,
-                port: 0,
-                peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            },
-            delta,
-            ssp,
-            ssp_target,
-            delta_lifetime_checked_units_cap,
-            share,
             planned_checked_units,
         }))
     }
@@ -1461,13 +1616,11 @@ impl DaemonState {
         inner.save()
     }
 
-    async fn begin_incoming_precompute_job(
+    async fn begin_incoming_precompute_session(
         &self,
         descriptor: &GrpcJobDescriptor,
-        index: Index48,
-    ) -> Result<IncomingPrecomputeJob> {
-        let planned_checked_units = set_bits_desc(index.get()).len() as u64;
-        let mut inner = self.inner.lock().await;
+    ) -> Result<IncomingPrecomputeSession> {
+        let inner = self.inner.lock().await;
         let key = channel_key(descriptor.channel_index);
         let channel = inner
             .db
@@ -1491,21 +1644,59 @@ impl DaemonState {
                 "incoming JobStream uses the wrong security parameter".to_owned(),
             ));
         }
-        if inner.active_jobs.len() >= inner.cfg.workers as usize {
-            return Err(DaemonError::Refused(
-                "all local precompute workers are busy".to_owned(),
-            ));
-        }
         let expected_digest = job_digest(
             descriptor.channel_index,
-            "precompute-path",
+            "precompute-session",
             0,
-            index.get(),
+            0,
             descriptor.ssp,
         );
         if descriptor.digest != expected_digest {
             return Err(DaemonError::Refused(
                 "incoming JobStream digest does not match local job".to_owned(),
+            ));
+        }
+        if descriptor.target_index != 0 {
+            return Err(DaemonError::Refused(
+                "incoming precompute session must use target index 0".to_owned(),
+            ));
+        }
+        let delta = channel_delta(
+            &inner.master_secret.0,
+            descriptor.channel_index,
+            inner.cfg.role,
+        );
+        let share = channel_seed_share(&inner.master_secret.0, descriptor.channel_index);
+        Ok(IncomingPrecomputeSession { delta, ssp, share })
+    }
+
+    async fn begin_incoming_precompute_target(
+        &self,
+        descriptor: &GrpcJobDescriptor,
+        index: Index48,
+        planned_checked_units: u64,
+    ) -> Result<IncomingPrecomputeJob> {
+        let mut inner = self.inner.lock().await;
+        let key = channel_key(descriptor.channel_index);
+        let channel = inner
+            .db
+            .channels
+            .get(&key)
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        if !channel.enabled {
+            return Err(DaemonError::Refused("channel is disabled".to_owned()));
+        }
+        if descriptor.ssp_target != channel.ssp_target
+            || descriptor.delta_lifetime_checked_units_cap
+                != channel.delta_lifetime_checked_units_cap
+        {
+            return Err(DaemonError::Refused(
+                "incoming JobStream security parameters do not match".to_owned(),
+            ));
+        }
+        if inner.active_jobs.len() >= inner.cfg.workers as usize {
+            return Err(DaemonError::Refused(
+                "all local precompute workers are busy".to_owned(),
             ));
         }
         if inner
@@ -1532,12 +1723,6 @@ impl DaemonState {
                 "incoming JobStream would exceed Delta lifetime checked-unit cap".to_owned(),
             ));
         }
-        let delta = channel_delta(
-            &inner.master_secret.0,
-            descriptor.channel_index,
-            inner.cfg.role,
-        );
-        let share = channel_seed_share(&inner.master_secret.0, descriptor.channel_index);
         let channel = inner
             .db
             .channels
@@ -1546,8 +1731,9 @@ impl DaemonState {
         channel.attempted_checked_units = channel
             .attempted_checked_units
             .saturating_add(planned_checked_units);
+        let job_id = format!("{}-target-{}", descriptor.job_id, index.get());
         inner.active_jobs.insert(
-            descriptor.job_id.clone(),
+            job_id.clone(),
             JobRecord {
                 channel_index: descriptor.channel_index,
                 kind: "precompute".to_owned(),
@@ -1556,13 +1742,7 @@ impl DaemonState {
             },
         );
         inner.save()?;
-        Ok(IncomingPrecomputeJob {
-            job_id: descriptor.job_id.clone(),
-            delta,
-            ssp,
-            share,
-            planned_checked_units,
-        })
+        Ok(IncomingPrecomputeJob { job_id })
     }
 
     async fn open_peer_job_streams(
@@ -1624,19 +1804,14 @@ impl DaemonState {
         inner.save()
     }
 
-    async fn store_precomputed_target_and_finish_job(
+    async fn store_precomputed_target_wires_and_finish_job(
         &self,
         channel_index: u64,
         job_id: &str,
         planned_checked_units: u64,
         target_mask: u64,
-        nodes: Vec<(u64, Ag2pcSecureWires)>,
+        wires: Ag2pcSecureWires,
     ) -> Result<u64> {
-        let Some((_mask, wires)) = nodes.into_iter().find(|(mask, _)| *mask == target_mask) else {
-            return Err(DaemonError::Crypto(format!(
-                "precompute did not return target node {target_mask}"
-            )));
-        };
         let mut inner = self.inner.lock().await;
         let key = channel_key(channel_index);
         let (public, local) = binding_pair(&inner, channel_index, target_mask);
@@ -2028,13 +2203,42 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn peer_channel_from_url(peer_url: &Option<String>) -> Result<Option<Channel>> {
+fn peer_channel_from_url(
+    peer_url: &Option<String>,
+    tls: Option<&PeerTlsConfig>,
+) -> Result<Option<Channel>> {
     let Some(peer_url) = peer_url else {
         return Ok(None);
     };
-    let endpoint = Endpoint::from_shared(peer_url.clone())
+    let mut endpoint = Endpoint::from_shared(peer_url.clone())
         .map_err(|e| DaemonError::Parse(format!("bad peer URL: {e}")))?;
+    if let Some(tls) = tls {
+        endpoint = endpoint.tls_config(peer_client_tls_config(tls)?)?;
+    }
     Ok(Some(endpoint.connect_lazy()))
+}
+
+fn peer_server_tls_config(tls: &PeerTlsConfig) -> Result<ServerTlsConfig> {
+    Ok(ServerTlsConfig::new()
+        .identity(load_tls_identity(tls)?)
+        .client_ca_root(load_tls_ca(tls)?))
+}
+
+fn peer_client_tls_config(tls: &PeerTlsConfig) -> Result<ClientTlsConfig> {
+    Ok(ClientTlsConfig::new()
+        .ca_certificate(load_tls_ca(tls)?)
+        .identity(load_tls_identity(tls)?)
+        .domain_name(tls.domain_name.clone()))
+}
+
+fn load_tls_identity(tls: &PeerTlsConfig) -> Result<Identity> {
+    let cert = fs::read(&tls.cert_path)?;
+    let key = fs::read(&tls.key_path)?;
+    Ok(Identity::from_pem(cert, key))
+}
+
+fn load_tls_ca(tls: &PeerTlsConfig) -> Result<Certificate> {
+    Ok(Certificate::from_pem(fs::read(&tls.ca_path)?))
 }
 
 fn info_with_u64(prefix: &[u8], value: u64) -> Vec<u8> {
@@ -2315,6 +2519,29 @@ mod tests {
             1,
             generate_from_seed(seed, Index48::from_hex("1").unwrap()),
             to.get()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn known_secret_derivation_rejects_unreachable_prefixes() {
+        let seed =
+            Value32::from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .unwrap();
+        let from = Index48::from_hex("2").unwrap();
+        let from_secret = generate_from_seed(seed, from);
+        assert_eq!(
+            derive_from_known(
+                from.get(),
+                from_secret,
+                Index48::from_hex("3").unwrap().get()
+            ),
+            Some(generate_from_seed(seed, Index48::from_hex("3").unwrap()))
+        );
+        assert!(derive_from_known(
+            from.get(),
+            from_secret,
+            Index48::from_hex("6").unwrap().get()
         )
         .is_none());
     }

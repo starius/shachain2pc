@@ -125,6 +125,39 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_precompute_persists_only_requested_leaf() {
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "16"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "16"])
+        .await;
+
+    let alice_precompute = pair
+        .cli(&pair.alice_control, &["precompute", "16", "3"])
+        .await;
+    assert!(alice_precompute.contains("nodes=1"), "{alice_precompute}");
+    assert!(alice_precompute.contains("checked=2"), "{alice_precompute}");
+
+    let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
+    assert_channel_contains(&alice_channels, 16, "frontier=1");
+    assert_channel_contains(&bob_channels, 16, "frontier=1");
+
+    let expected =
+        reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 16, Index48::new(3).unwrap());
+    let pair = DaemonPair::restart(pair).await;
+    let (alice, bob) = tokio::join!(
+        pair.cli(&pair.alice_control, &["reveal", "16", "3", "3"]),
+        pair.cli(&pair.bob_control, &["reveal", "16", "3", "3"])
+    );
+    assert_eq!(parse_result(&alice), expected.to_hex());
+    assert_eq!(parse_result(&bob), expected.to_hex());
+    assert_eq!(parse_cache(&alice), Some(true));
+    assert_eq!(parse_cache(&bob), Some(true));
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precompute_repairs_peer_frontier_rollback() {
     let mut pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "14"])

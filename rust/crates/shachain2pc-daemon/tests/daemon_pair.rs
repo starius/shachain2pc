@@ -140,6 +140,8 @@ async fn daemon_pair_background_precomputes_to_shared_target() {
         .await;
     pair.wait_channel_contains(&pair.bob_control, 15, "frontier=1")
         .await;
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
 
     let expected =
         reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 15, Index48::new(1).unwrap());
@@ -365,6 +367,19 @@ impl DaemonPair {
                     .any(|line| line.starts_with(&prefix) && line.contains(needle))
                 {
                     return channels;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn wait_jobs_empty(&self, control: &Path) {
+        timeout(Duration::from_secs(120), async {
+            loop {
+                if self.cli(control, &["jobs"]).await.trim().is_empty() {
+                    return;
                 }
                 sleep(Duration::from_millis(200)).await;
             }

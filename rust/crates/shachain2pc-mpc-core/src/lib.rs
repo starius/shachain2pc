@@ -148,6 +148,7 @@ pub enum SoftSpokenStateError {
     PprfBufferLength { expected: usize, actual: usize },
     PprfDigestLength { expected: usize, actual: usize },
     PprfCheckMismatch,
+    BaseOtLength { expected: usize, actual: usize },
 }
 
 impl fmt::Display for SoftSpokenStateError {
@@ -167,6 +168,10 @@ impl fmt::Display for SoftSpokenStateError {
                 "SoftSpoken PPRF digest length mismatch: expected {expected}, got {actual}"
             ),
             Self::PprfCheckMismatch => write!(f, "SoftSpoken PPRF check mismatch"),
+            Self::BaseOtLength { expected, actual } => write!(
+                f,
+                "SoftSpoken base OT length mismatch: expected {expected}, got {actual}"
+            ),
         }
     }
 }
@@ -287,6 +292,67 @@ impl SoftSpoken4State {
 
     pub fn recv_check_blocks(&self) -> (Block, Block) {
         (self.check_x, self.check_t)
+    }
+
+    pub fn bootstrap_send_choices(&mut self) -> Vec<bool> {
+        let mut choices = Vec::with_capacity(128);
+        for i in 0..SOFTSPOKEN_N {
+            let mut alpha = 0usize;
+            for bit in 0..SOFTSPOKEN_K {
+                if self.delta_bool[i * SOFTSPOKEN_K + bit] {
+                    alpha |= 1 << bit;
+                }
+            }
+            self.alphas[i] = alpha;
+            for bit in 0..SOFTSPOKEN_K {
+                choices.push(((alpha >> bit) & 1) == 0);
+            }
+        }
+        choices
+    }
+
+    pub fn bootstrap_send_apply_received(
+        &mut self,
+        received: &[Block],
+    ) -> Result<(), SoftSpokenStateError> {
+        if received.len() != SOFTSPOKEN_N * SOFTSPOKEN_K {
+            return Err(SoftSpokenStateError::BaseOtLength {
+                expected: SOFTSPOKEN_N * SOFTSPOKEN_K,
+                actual: received.len(),
+            });
+        }
+        self.leaves_recv = vec![Block::zero(); SOFTSPOKEN_N * SOFTSPOKEN_Q];
+        for i in 0..SOFTSPOKEN_N {
+            let path = cggm_bit_reverse(self.alphas[i] as u32, SOFTSPOKEN_K) as usize;
+            let leaves = cggm_eval_receiver(
+                SOFTSPOKEN_K,
+                path,
+                &received[i * SOFTSPOKEN_K..(i + 1) * SOFTSPOKEN_K],
+                false,
+            );
+            self.leaves_recv[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q].copy_from_slice(&leaves);
+        }
+        Ok(())
+    }
+
+    pub fn bootstrap_recv_keys(&mut self) -> (Vec<Block>, Vec<Block>) {
+        self.leaves_send = vec![Block::zero(); SOFTSPOKEN_N * SOFTSPOKEN_Q];
+        let mut k0 = Vec::with_capacity(128);
+        let mut k1 = Vec::with_capacity(128);
+        for i in 0..SOFTSPOKEN_N {
+            let pair = self.choice_prg.random_block(2);
+            let (leaves, k0_i) = cggm_build_sender(SOFTSPOKEN_K, pair[0], pair[1], false);
+            self.leaves_send[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q].copy_from_slice(&leaves);
+            for key in k0_i {
+                k0.push(key);
+                k1.push(key.xor(pair[0]));
+            }
+        }
+        (k0, k1)
+    }
+
+    pub fn mark_setup_done(&mut self) {
+        self.setup_done = true;
     }
 
     pub fn pprf_check_send_prepare(&mut self) -> (Vec<Block>, [u8; REVEAL_DIGEST_BYTES]) {

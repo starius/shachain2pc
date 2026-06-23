@@ -687,54 +687,22 @@ impl SoftSpoken4 {
     }
 
     async fn bootstrap_send<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
-        let mut choices = Vec::with_capacity(128);
-        for i in 0..SOFTSPOKEN_N {
-            let mut alpha = 0usize;
-            for bit in 0..SOFTSPOKEN_K {
-                if self.delta_bool[i * SOFTSPOKEN_K + bit] {
-                    alpha |= 1 << bit;
-                }
-            }
-            self.alphas[i] = alpha;
-            for bit in 0..SOFTSPOKEN_K {
-                choices.push(((alpha >> bit) & 1) == 0);
-            }
-        }
+        let choices = self.bootstrap_send_choices();
         let received = csw_recv(stream, &choices).await?;
-        self.leaves_recv = vec![Block::zero(); SOFTSPOKEN_N * SOFTSPOKEN_Q];
-        for i in 0..SOFTSPOKEN_N {
-            let path = cggm_bit_reverse(self.alphas[i] as u32, SOFTSPOKEN_K) as usize;
-            let leaves = cggm_eval_receiver(
-                SOFTSPOKEN_K,
-                path,
-                &received[i * SOFTSPOKEN_K..(i + 1) * SOFTSPOKEN_K],
-                false,
-            );
-            self.leaves_recv[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q].copy_from_slice(&leaves);
-        }
+        self.bootstrap_send_apply_received(&received)
+            .map_err(|_| CompatError::BadCswLength(received.len()))?;
         if self.malicious {
             self.pprf_check_recv(stream).await?;
             if !stream.fs_enabled() {
                 stream.enable_fs(true)?;
             }
         }
-        self.setup_done = true;
+        self.mark_setup_done();
         Ok(())
     }
 
     async fn bootstrap_recv<S: TranscriptIo>(&mut self, stream: &mut S) -> Result<()> {
-        self.leaves_send = vec![Block::zero(); SOFTSPOKEN_N * SOFTSPOKEN_Q];
-        let mut k0 = Vec::with_capacity(128);
-        let mut k1 = Vec::with_capacity(128);
-        for i in 0..SOFTSPOKEN_N {
-            let pair = self.choice_prg.random_block(2);
-            let (leaves, k0_i) = cggm_build_sender(SOFTSPOKEN_K, pair[0], pair[1], false);
-            self.leaves_send[i * SOFTSPOKEN_Q..(i + 1) * SOFTSPOKEN_Q].copy_from_slice(&leaves);
-            for key in k0_i {
-                k0.push(key);
-                k1.push(key.xor(pair[0]));
-            }
-        }
+        let (k0, k1) = self.bootstrap_recv_keys();
         csw_send(stream, &k0, &k1).await?;
         if self.malicious {
             self.pprf_check_send(stream).await?;
@@ -742,7 +710,7 @@ impl SoftSpoken4 {
                 stream.enable_fs(false)?;
             }
         }
-        self.setup_done = true;
+        self.mark_setup_done();
         Ok(())
     }
 

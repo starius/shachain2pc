@@ -41,6 +41,170 @@ pub struct Ag2pcTriplePoolState {
     pub cots_minted_since_check: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Ag2pcTriplePoolError {
+    BadInputShape,
+    CotLength { expected: usize, actual: usize },
+    PeerBitLength { expected: usize, actual: usize },
+}
+
+impl fmt::Display for Ag2pcTriplePoolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadInputShape => write!(f, "AG2PC input share vectors differ in length"),
+            Self::CotLength { expected, actual } => {
+                write!(
+                    f,
+                    "AG2PC COT length mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::PeerBitLength { expected, actual } => write!(
+                f,
+                "AG2PC peer bit length mismatch: expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Ag2pcTriplePoolError {}
+
+pub struct Ag2pcComputeBuffer {
+    l: usize,
+    bucket: usize,
+    rep_a_lsb: Vec<u8>,
+    rep_b_lsb: Vec<u8>,
+    pub acc_mac: Vec<Block>,
+    pub acc_key: Vec<Block>,
+}
+
+impl Ag2pcComputeBuffer {
+    pub fn new(
+        pool: &Ag2pcTriplePoolState,
+        mut rep_a: Vec<AShareBundle>,
+        mut rep_b: Vec<AShareBundle>,
+    ) -> Result<Self, Ag2pcTriplePoolError> {
+        if rep_a.len() != rep_b.len() {
+            return Err(Ag2pcTriplePoolError::BadInputShape);
+        }
+        let l = rep_a.len();
+        let bucket = pool.get_bucket_size(l);
+        let mut acc_mac = vec![Block::zero(); 3 * l];
+        let mut acc_key = vec![Block::zero(); 3 * l];
+        let mut rep_a_lsb = Vec::with_capacity(l);
+        let mut rep_b_lsb = Vec::with_capacity(l);
+        for i in 0..l {
+            acc_mac[i] = rep_a[i].mac;
+            acc_key[i] = rep_a[i].key;
+            acc_mac[l + i] = rep_b[i].mac;
+            acc_key[l + i] = rep_b[i].key;
+            rep_a_lsb.push(block_lsb(rep_a[i].mac));
+            rep_b_lsb.push(block_lsb(rep_b[i].mac));
+        }
+        rep_a.zeroize();
+        rep_b.zeroize();
+        Ok(Self {
+            l,
+            bucket,
+            rep_a_lsb,
+            rep_b_lsb,
+            acc_mac,
+            acc_key,
+        })
+    }
+
+    pub fn l(&self) -> usize {
+        self.l
+    }
+
+    pub fn bucket(&self) -> usize {
+        self.bucket
+    }
+
+    pub fn insert_random_cots(
+        &mut self,
+        mut r_mac: Vec<Block>,
+        mut r_key: Vec<Block>,
+    ) -> Result<(), Ag2pcTriplePoolError> {
+        if r_mac.len() != self.l {
+            return Err(Ag2pcTriplePoolError::CotLength {
+                expected: self.l,
+                actual: r_mac.len(),
+            });
+        }
+        if r_key.len() != self.l {
+            return Err(Ag2pcTriplePoolError::CotLength {
+                expected: self.l,
+                actual: r_key.len(),
+            });
+        }
+        let l = self.l;
+        self.acc_mac[2 * l..3 * l].copy_from_slice(&r_mac);
+        self.acc_key[2 * l..3 * l].copy_from_slice(&r_key);
+        r_mac.zeroize();
+        r_key.zeroize();
+        Ok(())
+    }
+
+    pub fn opening_bits(&self) -> (Vec<u8>, Vec<u8>) {
+        let l = self.l;
+        let mut xb_me = vec![0u8; l];
+        let mut yb_me = vec![0u8; l];
+        for i in 0..l {
+            xb_me[i] = self.rep_a_lsb[i] ^ block_lsb(self.acc_mac[i]);
+            yb_me[i] = self.rep_b_lsb[i] ^ block_lsb(self.acc_mac[l + i]);
+        }
+        (xb_me, yb_me)
+    }
+
+    pub fn finish(
+        &self,
+        pool: &Ag2pcTriplePoolState,
+        xb_me: &[u8],
+        yb_me: &[u8],
+        xb_peer: &[u8],
+        yb_peer: &[u8],
+    ) -> Result<Vec<AShareBundle>, Ag2pcTriplePoolError> {
+        let l = self.l;
+        for bits in [xb_me, yb_me, xb_peer, yb_peer] {
+            if bits.len() != l {
+                return Err(Ag2pcTriplePoolError::PeerBitLength {
+                    expected: l,
+                    actual: bits.len(),
+                });
+            }
+        }
+        let mut out = vec![AShareBundle::default(); l];
+        let dxor = pool.delta.xor(bit0_mask());
+        for i in 0..l {
+            let xb = xb_me[i] ^ xb_peer[i];
+            let yb = yb_me[i] ^ yb_peer[i];
+            let mut mac = self.acc_mac[2 * l + i]
+                .xor(select_block(xb).and(self.acc_mac[l + i]))
+                .xor(select_block(yb).and(self.acc_mac[i]));
+            let mut key = self.acc_key[2 * l + i]
+                .xor(select_block(xb).and(self.acc_key[l + i]))
+                .xor(select_block(yb).and(self.acc_key[i]));
+            let both = select_block(xb & yb);
+            if pool.party == Role::Alice {
+                mac = mac.xor(both.and(bit0_mask()));
+            } else {
+                key = key.xor(both.and(dxor));
+            }
+            out[i] = AShareBundle { mac, key };
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for Ag2pcComputeBuffer {
+    fn drop(&mut self) {
+        self.rep_a_lsb.zeroize();
+        self.rep_b_lsb.zeroize();
+        self.acc_mac.zeroize();
+        self.acc_key.zeroize();
+    }
+}
+
 impl Ag2pcTriplePoolState {
     pub fn new(party: Role, ssp: usize, delta: Block) -> Self {
         Self {
@@ -1918,6 +2082,10 @@ fn select_block(bit: u8) -> Block {
 
 fn block_lsb(block: Block) -> u8 {
     u8::from(block.get_lsb())
+}
+
+fn bit0_mask() -> Block {
+    Block::make(0, 1)
 }
 
 #[cfg(test)]

@@ -1,6 +1,9 @@
 # MPC Protocol Refactor Plan
 
-Status: planning document for review before implementation.
+Status: implementation in progress. The transport seams, shared stream traits,
+heavy AG2PC extraction, and daemon JobStream precompute path are implemented;
+the remaining work is cleanup of old runner surfaces and later reviewed
+import/relabel frontier crypto.
 
 The goal is to separate the MPC protocol from its runner and concrete
 transport, following the pure-round style used in
@@ -348,17 +351,17 @@ Required gates:
 
 ## Phase 6: Add Daemon gRPC JobStream
 
-Add peer service RPCs:
+Add a peer service RPC:
 
 ```text
-rpc JobMainStream(stream MpcFrame) returns (stream MpcFrame);
-rpc JobSiblingStream(stream MpcFrame) returns (stream MpcFrame);
+rpc JobStream(stream JobFrame) returns (stream JobFrame);
 ```
 
-One pair of streams represents one MPC job. Both streams carry the same job id;
-one carries the `main` logical channel and the other carries `sibling`. A future
-single-stream variant may use `MpcFrame.channel_id`, but only with a dispatcher
-that keeps both logical channels drained into per-channel queues.
+One pair of JobStream calls represents one MPC job. Both streams carry the same
+job id and security parameters; one stream carries the `main` logical channel
+and the other carries `sibling`. A future single-stream variant may use
+`JobFrame.channel`, but only with a dispatcher that keeps both logical channels
+drained into per-channel queues.
 
 The daemon scheduler stops assigning raw worker ports. Instead:
 
@@ -375,6 +378,9 @@ Tests:
 - reveal priority can cancel or delay background jobs without corrupting DB.
 
 ## Phase 7: Remove Raw-Port Worker Scheme
+
+Status: implemented for daemon background precompute. The base `mpc_port`
+remains for the legacy EMP/TCP reveal and full-derivation fallback path.
 
 After JobStream is green:
 

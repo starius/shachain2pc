@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
 use shachain2pc_types::Role;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -7,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use zeroize::Zeroize;
 
@@ -344,6 +346,108 @@ pub trait TranscriptIo: ByteIo {
     fn get_recv_digest(&self) -> Result<Block>;
 
     fn get_digest(&self) -> Result<Block>;
+}
+
+/// In-memory byte stream backed by paired Tokio channels.
+///
+/// This is used by non-EMP transports, such as daemon JobStream, after their
+/// frame layer has already validated job and channel metadata.
+pub struct ChannelByteStream {
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    recv_buf: VecDeque<u8>,
+    fs_send_first: bool,
+    fs_send: Option<Sha256>,
+    fs_recv: Option<Sha256>,
+}
+
+impl ChannelByteStream {
+    pub fn new(tx: mpsc::Sender<Vec<u8>>, rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            rx,
+            recv_buf: VecDeque::new(),
+            fs_send_first: false,
+            fs_send: None,
+            fs_recv: None,
+        }
+    }
+}
+
+impl ByteIo for ChannelByteStream {
+    async fn send_data<'a>(&'a mut self, data: &'a [u8]) -> Result<()> {
+        if let Some(fs_send) = &mut self.fs_send {
+            fs_send.update(data);
+        }
+        self.tx.send(data.to_vec()).await.map_err(|_| {
+            WireError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "byte channel closed",
+            ))
+        })
+    }
+
+    async fn recv_data(&mut self, len: usize) -> Result<Vec<u8>> {
+        while self.recv_buf.len() < len {
+            let chunk = self.rx.recv().await.ok_or_else(|| {
+                WireError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "byte channel closed",
+                ))
+            })?;
+            self.recv_buf.extend(chunk);
+        }
+        let out: Vec<u8> = self.recv_buf.drain(..len).collect();
+        if let Some(fs_recv) = &mut self.fs_recv {
+            fs_recv.update(&out);
+        }
+        Ok(out)
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl TranscriptIo for ChannelByteStream {
+    fn enable_fs(&mut self, send_first: bool) -> Result<()> {
+        if self.fs_send.is_some() {
+            return Err(WireError::FsAlreadyEnabled);
+        }
+        self.fs_send_first = send_first;
+        self.fs_send = Some(Sha256::new());
+        self.fs_recv = Some(Sha256::new());
+        Ok(())
+    }
+
+    fn fs_enabled(&self) -> bool {
+        self.fs_send.is_some()
+    }
+
+    fn get_send_digest(&self) -> Result<Block> {
+        let digest = digest_snapshot(self.fs_send.as_ref().ok_or(WireError::FsNotEnabled)?);
+        Ok(first_digest_block(&digest))
+    }
+
+    fn get_recv_digest(&self) -> Result<Block> {
+        let digest = digest_snapshot(self.fs_recv.as_ref().ok_or(WireError::FsNotEnabled)?);
+        Ok(first_digest_block(&digest))
+    }
+
+    fn get_digest(&self) -> Result<Block> {
+        let send = digest_snapshot(self.fs_send.as_ref().ok_or(WireError::FsNotEnabled)?);
+        let recv = digest_snapshot(self.fs_recv.as_ref().ok_or(WireError::FsNotEnabled)?);
+        let mut h = Sha256::new();
+        if self.fs_send_first {
+            h.update(send);
+            h.update(recv);
+        } else {
+            h.update(recv);
+            h.update(send);
+        }
+        let digest: [u8; 32] = h.finalize().into();
+        Ok(first_digest_block(&digest))
+    }
 }
 
 pub struct EmpStream {
@@ -959,6 +1063,37 @@ mod tests {
         assert_eq!(alice_digest, bob_digest);
         assert_eq!(alice_rounds, 3);
         assert_eq!(bob_rounds, 3);
+    }
+
+    #[tokio::test]
+    async fn channel_byte_stream_buffers_and_hashes_transcript() {
+        let (alice_tx, bob_rx) = mpsc::channel(4);
+        let (bob_tx, alice_rx) = mpsc::channel(4);
+        let mut alice = ChannelByteStream::new(alice_tx, alice_rx);
+        let mut bob = ChannelByteStream::new(bob_tx, bob_rx);
+
+        alice.enable_fs(true).unwrap();
+        bob.enable_fs(false).unwrap();
+
+        alice.send_data(b"alpha").await.unwrap();
+        assert_eq!(bob.recv_data(2).await.unwrap(), b"al");
+        assert_eq!(bob.recv_data(3).await.unwrap(), b"pha");
+
+        bob.send_data(b"beta").await.unwrap();
+        assert_eq!(alice.recv_data(4).await.unwrap(), b"beta");
+
+        alice.send_data(b"gamma").await.unwrap();
+        assert_eq!(bob.recv_data(5).await.unwrap(), b"gamma");
+
+        assert_eq!(
+            alice.get_send_digest().unwrap(),
+            bob.get_recv_digest().unwrap()
+        );
+        assert_eq!(
+            alice.get_recv_digest().unwrap(),
+            bob.get_send_digest().unwrap()
+        );
+        assert_eq!(alice.get_digest().unwrap(), bob.get_digest().unwrap());
     }
 
     #[cfg(feature = "cpp-probes")]

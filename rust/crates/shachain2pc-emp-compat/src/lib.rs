@@ -15,8 +15,9 @@ use shachain2pc_circuit::{Circuit, GateType};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, TranscriptIo, WireError, BLOCK_BYTES};
 pub use shachain2pc_mpc_core::{
     cggm_bit_reverse, cggm_build_sender, cggm_eval_receiver, sfvole_receiver_butterfly,
-    sfvole_sender_butterfly, AShareBundle, Ag2pcTriplePoolState, Prg, Prp, SoftSpoken4State,
-    SOFTSPOKEN_CHUNK_BLOCKS, SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N, SOFTSPOKEN_Q,
+    sfvole_sender_butterfly, AShareBundle, Ag2pcComputeBuffer, Ag2pcTriplePoolState, Prg, Prp,
+    SoftSpoken4State, SOFTSPOKEN_CHUNK_BLOCKS, SOFTSPOKEN_CHUNK_OTS, SOFTSPOKEN_K, SOFTSPOKEN_N,
+    SOFTSPOKEN_Q,
 };
 use shachain2pc_mpc_core::{
     finalize_input_open, reveal_local_share, reveal_recipient_bits, verify_share_relation,
@@ -2377,17 +2378,16 @@ impl Ag2pcTriplePool {
     pub async fn compute_inplace_owned<S: TranscriptIo>(
         &mut self,
         streams: &mut Ag2pcStreams<S>,
-        mut rep_a: Vec<AShareBundle>,
-        mut rep_b: Vec<AShareBundle>,
+        rep_a: Vec<AShareBundle>,
+        rep_b: Vec<AShareBundle>,
     ) -> Result<Vec<AShareBundle>> {
-        if rep_a.len() != rep_b.len() {
-            return Err(CompatError::BadAg2pcInputShape);
-        }
-        let l = rep_a.len();
+        let mut compute = Ag2pcComputeBuffer::new(self, rep_a, rep_b)
+            .map_err(|_| CompatError::BadAg2pcInputShape)?;
+        let l = compute.l();
         if l == 0 {
             return Ok(Vec::new());
         }
-        let bucket = self.get_bucket_size(l);
+        let bucket = compute.bucket();
         let pair_seed = {
             let mine = u64::from(self.party.party_id());
             let peer = u64::from(3 - self.party.party_id());
@@ -2402,67 +2402,38 @@ impl Ag2pcTriplePool {
             feq: &mut feq,
         };
 
-        let mut acc_mac = vec![Block::zero(); 3 * l];
-        let mut acc_key = vec![Block::zero(); 3 * l];
-        let mut rep_a_lsb = Vec::with_capacity(l);
-        let mut rep_b_lsb = Vec::with_capacity(l);
-        for i in 0..l {
-            acc_mac[i] = rep_a[i].mac;
-            acc_key[i] = rep_a[i].key;
-            acc_mac[l + i] = rep_b[i].mac;
-            acc_key[l + i] = rep_b[i].key;
-            rep_a_lsb.push(block_lsb(rep_a[i].mac));
-            rep_b_lsb.push(block_lsb(rep_b[i].mac));
-        }
-        rep_a.zeroize();
-        rep_b.zeroize();
-        drop(rep_a);
-        drop(rep_b);
-        let (mut r_mac, mut r_key) = self.gen_cot_shares(streams, l).await?;
-        acc_mac[2 * l..3 * l].copy_from_slice(&r_mac);
-        acc_key[2 * l..3 * l].copy_from_slice(&r_key);
-        r_mac.zeroize();
-        r_key.zeroize();
-        drop(r_mac);
-        drop(r_key);
-        self.leaky_and_halfgate(streams, &mut acc_mac, &mut acc_key, l, &mut hashes)
-            .await?;
-        self.layered_bucket_into_acc(streams, &mut acc_mac, &mut acc_key, bucket, l, &mut hashes)
-            .await?;
+        let (r_mac, r_key) = self.gen_cot_shares(streams, l).await?;
+        compute
+            .insert_random_cots(r_mac, r_key)
+            .map_err(|_| CompatError::BadAg2pcInputShape)?;
+        self.leaky_and_halfgate(
+            streams,
+            &mut compute.acc_mac,
+            &mut compute.acc_key,
+            l,
+            &mut hashes,
+        )
+        .await?;
+        self.layered_bucket_into_acc(
+            streams,
+            &mut compute.acc_mac,
+            &mut compute.acc_key,
+            bucket,
+            l,
+            &mut hashes,
+        )
+        .await?;
 
         let dme: [u8; HASH_DIGEST_BYTES] = feq.finalize().into();
         ag2pc_feq_check(&mut streams.main, self.party, &dme).await?;
 
-        let mut xb_me = vec![0u8; l];
-        let mut yb_me = vec![0u8; l];
-        for i in 0..l {
-            xb_me[i] = rep_a_lsb[i] ^ block_lsb(acc_mac[i]);
-            yb_me[i] = rep_b_lsb[i] ^ block_lsb(acc_mac[l + i]);
-        }
+        let (xb_me, yb_me) = compute.opening_bits();
         let (xb_peer, yb_peer) = self
             .exchange_two_bool_vectors(streams, &xb_me, &yb_me, l)
             .await?;
-
-        let mut out = vec![AShareBundle::default(); l];
-        let dxor = self.delta.xor(bit0_mask());
-        for i in 0..l {
-            let xb = xb_me[i] ^ xb_peer[i];
-            let yb = yb_me[i] ^ yb_peer[i];
-            let mut mac = acc_mac[2 * l + i]
-                .xor(select_block(xb).and(acc_mac[l + i]))
-                .xor(select_block(yb).and(acc_mac[i]));
-            let mut key = acc_key[2 * l + i]
-                .xor(select_block(xb).and(acc_key[l + i]))
-                .xor(select_block(yb).and(acc_key[i]));
-            let both = select_block(xb & yb);
-            if self.party == Role::Alice {
-                mac = mac.xor(both.and(bit0_mask()));
-            } else {
-                key = key.xor(both.and(dxor));
-            }
-            out[i] = AShareBundle { mac, key };
-        }
-        Ok(out)
+        compute
+            .finish(self, &xb_me, &yb_me, &xb_peer, &yb_peer)
+            .map_err(|_| CompatError::BadAg2pcInputShape)
     }
 
     pub async fn maybe_flush_cot_check<S: TranscriptIo>(

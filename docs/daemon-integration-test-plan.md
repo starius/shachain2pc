@@ -251,14 +251,14 @@ Current implementation status:
   daemon target, peer daemon target)`.
 - CPU budget: approximated only by the `workers` concurrency limit. There is no
   OS-level CPU quota or CPU-time admission control.
-- RAM budget: not implemented yet. `max_ram_bytes` is parsed, configurable, and
-  reported by status/config, but it is not used to reserve memory or refuse
-  precompute. This is the main resource-control gap for 100-channel testing.
+- RAM budget: implemented for precompute admission. `max_ram_bytes` is parsed,
+  configurable, reported by status/config, and converted into
+  `effective_workers` using the idle-session-aware/current-RSS-aware formula
+  below. If the raw RAM-derived worker count is zero, the daemon still exposes
+  one effective worker and reports a RAM warning.
 
-Before treating the daemon as resource-safe under large channel counts, RAM
-must reduce worker concurrency. The daemon already has a measured or configured
-peak RAM cost per active one-H worker, so the first implementation should turn
-RAM into a worker cap and then reuse the existing worker-budget machinery.
+The daemon has a measured or configured peak RAM cost per active one-H worker.
+It turns RAM into a worker cap and reuses the existing worker-budget machinery.
 
 The model is intentionally idle-session aware:
 
@@ -267,7 +267,13 @@ rss_floor =
     baseline_daemon_rss +
     live_idle_sessions * idle_session_rss_estimate
 
-worker_ram_budget = max(max_ram_bytes - rss_floor, 0)
+observed_floor =
+    max(current_rss_bytes -
+        active_jobs * one_h_worker_peak_rss_estimate, 0)
+
+admission_floor = max(rss_floor, observed_floor)
+
+worker_ram_budget = max(max_ram_bytes - admission_floor, 0)
 
 ram_limited_workers_raw =
     floor(worker_ram_budget / one_h_worker_peak_rss_estimate)
@@ -277,6 +283,13 @@ ram_limited_workers = max(ram_limited_workers_raw, 1)
 ram_overcommit_warning =
     ram_limited_workers_raw == 0
 ```
+
+`admission_floor` uses the greater of the modeled floor and observed current RSS
+after subtracting currently active worker reservations. This catches memory
+consumers the simple formula missed, including allocator
+retention after previous H jobs, gRPC/HTTP2 buffers, TLS state, and DB buffers.
+The 100-channel benchmark showed this matters: after precompute completed, RSS
+remained much higher than the small live-session estimate alone.
 
 Then compute locally:
 
@@ -348,9 +361,16 @@ The first implementation can be conservative and static. Initial values should
 come from the measured one-H peak with a safety margin, for example:
 
 ```text
-one_h_rss_estimate_mb = 32
+one_h_rss_estimate_mb = 192
 idle_session_rss_estimate_mb = 1
 ```
+
+The initial worker estimate is intentionally conservative for the daemon, not
+the library-only party path. A 100-channel daemon benchmark with 4 workers
+observed per-node peak RSS in the 718-760 MB range, which includes tonic/tokio,
+mTLS, live sessions, worker allocation, and allocator-retained memory. The RAM
+gate should therefore treat the real daemon as the calibration source and
+continue refining this value from benchmark p95/peak data.
 
 Then the benchmark should replace guesses with observed p95/peak values. The
 daemon should expose `effective_workers`, reserved RAM, and observed peak RSS in

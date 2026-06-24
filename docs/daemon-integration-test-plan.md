@@ -224,6 +224,12 @@ The circuit should be a singleton.
 Priority: high. This is the largest confirmed retained-RAM win and does not
 change protocol bytes or cryptography.
 
+Status: implemented. The daemon parses the SHA-256 compression circuit once at
+startup, stores it as `Arc<Circuit>`, and threads the same allocation through
+incoming and outgoing live precompute sessions. Daemon callers use
+circuit-aware party helpers; standalone compatibility paths keep their existing
+public API.
+
 Implementation plan:
 
 - parse `sha256_compress_gadget()` once when the daemon initializes;
@@ -261,6 +267,11 @@ across tokio tasks without a lock or gate-data clone.
 Priority: medium. The current cache is bounded, so this is not the hundred-MB
 issue, but it is the next cleanup.
 
+Status: implemented for the live session cache. Retention follows the
+shachain future-storage closure, keeps at most one labeled node per
+trailing-zero bucket, and prunes obsolete one-shot intermediates after each
+target. Durable DB persistence remains exact-target-only.
+
 The live session should keep at most one labeled node per shachain layer, and
 only nodes that can still be selected as a future parent by the shachain
 derivability rules. "Future parent" means the full shachain-storage closure for
@@ -297,6 +308,11 @@ clones, no retained one-shot trunk material, and clearer invariants.
 
 Priority: medium after measuring.
 
+Status: implemented for the safe leftover class found in this pass.
+`trim_idle_allocations()` drops unused SoftSpoken leftover COT chunks after a
+successful live-session precompute, but keeps setup state, PPRF leaves, session
+counters, authenticated labels, and the live frontier intact.
+
 Review found retained SoftSpoken/triple-pool buffers on the order of hundreds
 of KiB per live channel. Some state is required for a live session, but large
 spent COT/PPRF buffers and compute temporaries should not remain resident when
@@ -319,6 +335,12 @@ frontier remain RAM-only and must be fresh-session state.
 ### 4. Avoid Fresh Setup For Cached Reveal
 
 Priority: high for throughput, medium for RAM.
+
+Status: implemented for persisted cached leaves. The daemon cached-reveal path
+now performs a lightweight two-party MAC-open over persisted
+`lambda + wire_bundle` material and the re-derived fixed channel Delta. It keeps
+the existing two-sided reveal rendezvous and IT-MAC correct-or-abort check, but
+skips base OT, SoftSpoken bootstrap, COT, and garbling setup.
 
 The current cached reveal benchmark is setup-bound: about 474 ms per reveal on
 the measured 100-channel run, mostly because reveal opens a fresh AG2PC/EMP
@@ -351,6 +373,11 @@ by public reveal.
 
 Priority: required before treating benchmarks as capacity numbers.
 
+Status: pending empirical run. The ignored benchmark harnesses now report
+steady `VmRSS` as well as `VmHWM`, so calibration can separate fill-time peak
+from idle floor. Defaults remain conservative until those measurements are run
+and reviewed.
+
 After the circuit sharing and any idle-buffer trimming land, rerun the
 calibration sequence in this document and update the configured estimates:
 
@@ -365,6 +392,11 @@ calibration sequence in this document and update the configured estimates:
 - 100-channel and 1000-channel scaling;
 - disabled-channel RSS drop.
 
+The 1000-channel idle-floor run is implemented as
+`daemon_bench_1000_channels_idle_floor`; it fills one target per channel,
+records steady RSS, disables all channels, and records the post-disable RSS
+floor.
+
 The current `one_h_worker_peak_rss_estimate` is deliberately conservative. If
 the measured p95 daemon worker peak is materially below the configured value,
 lower the default only after the slope check across `workers=1/2/4` confirms
@@ -376,7 +408,8 @@ The current 100-channel benchmark measured serial cached reveal and cold-ish
 precompute behavior. Add follow-up benchmark modes:
 
 - parallel cached reveals across channels;
-- warm incremental precompute loop, for example fill `I=2` then `I=3`;
+- warm incremental precompute loop, for example fill `I=2` then `I=3`
+  (implemented as `daemon_bench_100_channels_warm_refill`);
 - mixed steady state that consumes one cached reveal and refills one future
   target per channel;
 - optional 50 ms RTT run for remote-cosigner sensitivity.

@@ -71,9 +71,21 @@ frontier state because they are session-local randomness and are not reusable
 after restart. The DB stores only exact requested leaves that can be revealed
 later.
 
+The daemon shares one parsed SHA-256 compression `Circuit` across all live
+sessions with `Arc<Circuit>`. Live-session cache retention follows the
+shachain future-storage closure and prunes obsolete one-shot intermediates
+after each target. Successful precompute also trims unused SoftSpoken leftover
+COT chunks while keeping setup state, PPRF leaves, authenticated labels, and
+the live frontier intact.
+
 A later daemon process can reveal an exact persisted node because public reveal
 checks only the MAC/lambda authenticated value and does not need session-local
 labels.
+
+Cached daemon reveal now uses a lightweight fixed-Delta MAC-open over the
+persisted `lambda + wire_bundle` material. This keeps the existing two-sided
+reveal rendezvous and IT-MAC correct-or-abort check, but skips the fresh AG2PC
+session setup that dominated cached-reveal latency.
 
 Precompute reserves checked-unit budget before starting MPC. A request that
 would exceed the configured fixed-Delta lifetime cap is refused before the

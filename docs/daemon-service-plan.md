@@ -640,22 +640,20 @@ frames.
 ## Remaining Work
 
 - RAM optimization and calibration:
-  - share one parsed SHA circuit across incoming and outgoing live sessions;
-  - prune any live cache entries outside the future shachain-storage closure;
-  - never retain one-shot in-trunc intermediates after they are consumed;
-  - trim safe idle AG2PC buffers after measuring;
+  - shared SHA circuit, closure-based live-cache pruning, no durable trunk
+    persistence, and safe idle COT-leftover trimming are implemented;
   - update daemon RAM constants from the benchmark calibration sequence.
 - Cached reveal latency:
-  - avoid fresh AG2PC setup for daemon cached reveals when a live session or a
-    lightweight MAC-open path can serve the request;
-  - preserve persisted `lambda` and MAC/key bundles needed for fixed-Delta
-    MAC-open after restart;
+  - persisted daemon cached reveals now use a lightweight fixed-Delta MAC-open
+    path instead of fresh AG2PC setup;
+  - persisted `lambda` and MAC/key bundles remain required DB material for
+    restart reveal;
   - keep EMP/TCP reveal fallback for compatibility until daemon reveal is fully
     tested.
 - Integration and benchmark expansion:
   - malicious/tamper daemon-boundary tests;
   - peer restart/reconnect tests;
-  - 100-channel and 1000-channel RAM/throughput benchmarks.
+  - run and record the ignored 100-channel and 1000-channel benchmark harnesses.
 - Production hardening:
   - schema migrations;
   - metrics endpoint;

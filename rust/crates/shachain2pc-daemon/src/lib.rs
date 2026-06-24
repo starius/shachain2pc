@@ -9,15 +9,15 @@ use pb::control_service_server::{ControlService, ControlServiceServer};
 use pb::peer_service_server::{PeerService, PeerServiceServer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use shachain2pc_circuit::generate_from_seed;
+use shachain2pc_circuit::{generate_from_seed, sha256_compress_gadget, Circuit};
 use shachain2pc_emp_compat::{normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, ChannelByteStream, BLOCK_BYTES};
 use shachain2pc_mpc_runner::{
     run_session_handshake, ByteFrameTransport, RunnerSessionParams, TransportPair,
 };
 use shachain2pc_party::{
-    reveal_node_job, run_party, run_seed_root_job, Args as PartyArgs, IndexSpec, MpcTcpEndpoint,
-    PartyOutput, PrecomputeSession,
+    reveal_node_job, run_party, run_seed_root_job_with_circuit, Args as PartyArgs, IndexSpec,
+    MpcTcpEndpoint, PartyOutput, PrecomputeSession,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
 use std::collections::{BTreeMap, HashMap};
@@ -170,6 +170,7 @@ pub struct DaemonState {
     precompute_sessions: Arc<Mutex<BTreeMap<u64, PrecomputeSessionHandle>>>,
     incoming_precompute_sessions: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
     peer_channel: Option<Channel>,
+    sha: Arc<Circuit>,
 }
 
 struct Inner {
@@ -438,6 +439,10 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
     let cookie = load_or_create_cookie(&cfg)?;
     let peer_channel = peer_channel_from_url(&cfg.peer_url, cfg.peer_tls.as_ref())?;
     let baseline_daemon_rss_bytes = current_rss_bytes().unwrap_or(0);
+    let sha = Arc::new(
+        sha256_compress_gadget()
+            .map_err(|e| DaemonError::Crypto(format!("failed to load SHA circuit: {e}")))?,
+    );
     Ok(DaemonState {
         inner: Arc::new(Mutex::new(Inner {
             cfg,
@@ -453,6 +458,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
         precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         incoming_precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         peer_channel,
+        sha,
     })
 }
 
@@ -1042,12 +1048,14 @@ impl DaemonState {
                 Ok(streams) => streams,
                 Err(e) => return Err(e),
             };
-        let mut session = match PrecomputeSession::setup_with_streams(
+        let role = self.role().await;
+        let mut session = match PrecomputeSession::setup_with_streams_and_circuit(
             streams,
-            self.role().await,
+            role,
             job.share,
             job.delta,
             job.ssp,
+            self.sha.clone(),
         )
         .await
         {
@@ -1357,8 +1365,15 @@ impl DaemonState {
         };
         let mut streams = self.open_peer_job_streams(&descriptor).await?;
         streams = run_jobstream_session_handshake(role, &descriptor, streams).await?;
-        let session =
-            PrecomputeSession::setup_with_streams(streams, role, share, delta, ssp).await?;
+        let session = PrecomputeSession::setup_with_streams_and_circuit(
+            streams,
+            role,
+            share,
+            delta,
+            ssp,
+            self.sha.clone(),
+        )
+        .await?;
         let (tx, rx) = mpsc::channel(8);
         let handle = PrecomputeSessionHandle { tx };
         self.precompute_sessions
@@ -1581,7 +1596,9 @@ impl DaemonState {
         let (endpoint, delta, ssp) = self.job_context(channel_index).await?;
         let share = self.channel_share(channel_index).await?;
         let digest = job_digest(channel_index, "root", 0, 0, ssp as u32);
-        let root = run_seed_root_job(endpoint, share, delta, digest, ssp).await?;
+        let root =
+            run_seed_root_job_with_circuit(endpoint, share, delta, digest, ssp, self.sha.as_ref())
+                .await?;
         self.store_node(channel_index, 0, &root).await?;
         Ok(root)
     }
@@ -2682,6 +2699,19 @@ mod tests {
         assert_eq!(loaded.wire_bundle, wires.wire_bundle);
         assert!(loaded.label0.is_empty());
         assert!(loaded.eval_label.is_empty());
+    }
+
+    #[test]
+    fn daemon_has_single_sha_circuit_parse_site() {
+        const NEEDLE: &str = concat!("sha256_compress_", "gadget(");
+        let source = include_str!("lib.rs");
+        assert_eq!(source.matches(NEEDLE).count(), 1);
+    }
+
+    #[test]
+    fn circuit_is_shareable_between_tasks() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Circuit>();
     }
 
     #[test]

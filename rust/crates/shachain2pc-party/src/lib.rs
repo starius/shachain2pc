@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
@@ -252,7 +253,18 @@ pub async fn run_seed_root_job(
     ssp: usize,
 ) -> Result<Ag2pcSecureWires, PartyError> {
     let sha = sha256_compress_gadget()?;
-    let program = Ag2pcProgram::chunk_from_sha(&sha, &[], true)?;
+    run_seed_root_job_with_circuit(endpoint, share, delta, digest, ssp, &sha).await
+}
+
+pub async fn run_seed_root_job_with_circuit(
+    endpoint: MpcTcpEndpoint,
+    share: Value32,
+    delta: shachain2pc_emp_wire::Block,
+    digest: [u8; 32],
+    ssp: usize,
+    sha: &Circuit,
+) -> Result<Ag2pcSecureWires, PartyError> {
+    let program = Ag2pcProgram::chunk_from_sha(sha, &[], true)?;
     let mut streams =
         open_ag2pc_streams_after_digest(endpoint.role, endpoint.port, endpoint.peer_ip, digest)
             .await?;
@@ -283,7 +295,24 @@ pub async fn run_one_hash_job(
         ));
     }
     let sha = sha256_compress_gadget()?;
-    let program = Ag2pcProgram::chunk_from_sha(&sha, &[bit], false)?;
+    run_one_hash_job_with_circuit(endpoint, parent, bit, delta, digest, ssp, &sha).await
+}
+
+pub async fn run_one_hash_job_with_circuit(
+    endpoint: MpcTcpEndpoint,
+    parent: &Ag2pcSecureWires,
+    bit: usize,
+    delta: shachain2pc_emp_wire::Block,
+    digest: [u8; 32],
+    ssp: usize,
+    sha: &Circuit,
+) -> Result<Ag2pcSecureWires, PartyError> {
+    if bit >= INDEX_BITS as usize {
+        return Err(PartyError::UnsupportedMode(
+            "one-H job bit is outside the 48-bit shachain index",
+        ));
+    }
+    let program = Ag2pcProgram::chunk_from_sha(sha, &[bit], false)?;
     let mut streams =
         open_ag2pc_streams_after_digest(endpoint.role, endpoint.port, endpoint.peer_ip, digest)
             .await?;
@@ -313,20 +342,31 @@ pub async fn run_precompute_path_job(
 pub struct PrecomputeSession<S: TranscriptIo> {
     streams: Ag2pcStreams<S>,
     session: Ag2pcSession,
-    sha: Circuit,
+    sha: Arc<Circuit>,
     seed_inputs: Ag2pcSecureWires,
     cache: BTreeMap<u32, (u64, Ag2pcSecureWires)>,
 }
 
 impl<S: TranscriptIo> PrecomputeSession<S> {
     pub async fn setup_with_streams(
-        mut streams: Ag2pcStreams<S>,
+        streams: Ag2pcStreams<S>,
         role: Role,
         share: Value32,
         delta: shachain2pc_emp_wire::Block,
         ssp: usize,
     ) -> Result<Self, PartyError> {
         let sha = sha256_compress_gadget()?;
+        Self::setup_with_streams_and_circuit(streams, role, share, delta, ssp, Arc::new(sha)).await
+    }
+
+    pub async fn setup_with_streams_and_circuit(
+        mut streams: Ag2pcStreams<S>,
+        role: Role,
+        share: Value32,
+        delta: shachain2pc_emp_wire::Block,
+        ssp: usize,
+        sha: Arc<Circuit>,
+    ) -> Result<Self, PartyError> {
         let mut session = Ag2pcSession::setup_with_delta(&mut streams, role, ssp, delta).await?;
         streams.main.flush().await?;
         let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
@@ -343,6 +383,10 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
         &mut self.streams
     }
 
+    pub fn circuit(&self) -> &Arc<Circuit> {
+        &self.sha
+    }
+
     pub fn planned_checked_units(&self, index: Index48) -> u64 {
         self.missing_bits(index.get()).len() as u64
     }
@@ -353,7 +397,7 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
     ) -> Result<Ag2pcSecureWires, PartyError> {
         let target = index.get();
         if target == 0 {
-            let root_program = Ag2pcProgram::chunk_from_sha(&self.sha, &[], true)?;
+            let root_program = Ag2pcProgram::chunk_from_sha(self.sha.as_ref(), &[], true)?;
             let mut root = self
                 .session
                 .run_program(&mut self.streams, &root_program, &self.seed_inputs)
@@ -382,7 +426,7 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
             } else {
                 &self.seed_inputs
             };
-            let program = Ag2pcProgram::chunk_from_sha(&self.sha, &[bit], first)?;
+            let program = Ag2pcProgram::chunk_from_sha(self.sha.as_ref(), &[bit], first)?;
             let child = self
                 .session
                 .run_program(&mut self.streams, &program, input)
@@ -430,6 +474,19 @@ pub async fn run_precompute_path_with_streams<S: TranscriptIo>(
     ssp: usize,
 ) -> Result<Vec<(u64, Ag2pcSecureWires)>, PartyError> {
     let sha = sha256_compress_gadget()?;
+    run_precompute_path_with_streams_and_circuit(streams, role, share, index, delta, ssp, &sha)
+        .await
+}
+
+pub async fn run_precompute_path_with_streams_and_circuit<S: TranscriptIo>(
+    streams: &mut Ag2pcStreams<S>,
+    role: Role,
+    share: Value32,
+    index: Index48,
+    delta: shachain2pc_emp_wire::Block,
+    ssp: usize,
+    sha: &Circuit,
+) -> Result<Vec<(u64, Ag2pcSecureWires)>, PartyError> {
     let mut session = Ag2pcSession::setup_with_delta(streams, role, ssp, delta).await?;
     streams.main.flush().await?;
 
@@ -437,7 +494,7 @@ pub async fn run_precompute_path_with_streams<S: TranscriptIo>(
     let bits = set_bits_desc(index.get());
     let mut out = Vec::with_capacity(bits.len().max(1));
     if bits.is_empty() {
-        let root_program = Ag2pcProgram::chunk_from_sha(&sha, &[], true)?;
+        let root_program = Ag2pcProgram::chunk_from_sha(sha, &[], true)?;
         let mut root = session
             .run_program(streams, &root_program, &seed_inputs)
             .await?;
@@ -453,7 +510,7 @@ pub async fn run_precompute_path_with_streams<S: TranscriptIo>(
         .next()
         .expect("non-empty bit vector has a first bit");
     let mut mask = 1u64 << first_bit;
-    let first_program = Ag2pcProgram::chunk_from_sha(&sha, &[first_bit], true)?;
+    let first_program = Ag2pcProgram::chunk_from_sha(sha, &[first_bit], true)?;
     let mut carried = session
         .run_program(streams, &first_program, &seed_inputs)
         .await?;
@@ -463,7 +520,7 @@ pub async fn run_precompute_path_with_streams<S: TranscriptIo>(
 
     for bit in bits_iter {
         mask |= 1u64 << bit;
-        let program = Ag2pcProgram::chunk_from_sha(&sha, &[bit], false)?;
+        let program = Ag2pcProgram::chunk_from_sha(sha, &[bit], false)?;
         carried = session.run_program(streams, &program, &carried).await?;
         let mut persisted = carried.clone();
         persisted.strip_labels_for_reveal();

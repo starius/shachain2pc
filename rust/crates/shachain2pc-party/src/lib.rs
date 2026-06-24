@@ -434,9 +434,12 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
             mask |= 1u64 << bit;
             carried = child;
             have_carried = true;
-            self.cache
-                .insert(mask.trailing_zeros(), (mask, carried.clone()));
+            if retain_cache_mask_for_future(mask, target) {
+                self.cache
+                    .insert(mask.trailing_zeros(), (mask, carried.clone()));
+            }
         }
+        prune_cache_for_target(&mut self.cache, target);
 
         let mut persisted = carried;
         persisted.strip_labels_for_reveal();
@@ -1378,6 +1381,27 @@ fn can_derive_mask(from_index: u64, to_index: u64) -> bool {
     true
 }
 
+fn max_derivable_mask(from_index: u64) -> u64 {
+    if from_index == 0 {
+        return MAX_INDEX;
+    }
+    let lowest_applied = from_index.trailing_zeros();
+    let lower_bits = if lowest_applied == 0 {
+        0
+    } else {
+        (1u64 << lowest_applied) - 1
+    };
+    (from_index | lower_bits) & MAX_INDEX
+}
+
+fn retain_cache_mask_for_future(mask: u64, current_target: u64) -> bool {
+    mask == current_target || max_derivable_mask(mask) > current_target
+}
+
+fn prune_cache_for_target(cache: &mut BTreeMap<u32, (u64, Ag2pcSecureWires)>, current_target: u64) {
+    cache.retain(|_, (mask, _)| retain_cache_mask_for_future(*mask, current_target));
+}
+
 fn ensure_mode_supported_for_now(
     index_spec: &IndexSpec,
     mode: RequestedMode,
@@ -1693,6 +1717,44 @@ mod tests {
         assert!(can_derive_mask(0b100, 0b111));
         assert!(!can_derive_mask(0b11, 0b10));
         assert!(!can_derive_mask(0b10, 0b110));
+    }
+
+    #[test]
+    fn precompute_cache_retention_keeps_future_storage_closure() {
+        assert_eq!(max_derivable_mask(0b1_0000), 0b1_1111);
+        assert_eq!(max_derivable_mask(0b1_0010), 0b1_0011);
+
+        assert!(retain_cache_mask_for_future(0b1_0000, 0b1_0010));
+        assert!(retain_cache_mask_for_future(0b1_0010, 0b1_0010));
+        assert!(!retain_cache_mask_for_future(0b1_0010, 0b1_0011));
+        assert!(retain_cache_mask_for_future(0b1_0011, 0b1_0011));
+    }
+
+    #[test]
+    fn precompute_cache_pruning_preserves_adjacent_warm_parent() {
+        let mut cache: BTreeMap<u32, (u64, Ag2pcSecureWires)> = BTreeMap::new();
+        cache.insert(4, (0b1_0000, Ag2pcSecureWires::default()));
+        cache.insert(1, (0b1_0010, Ag2pcSecureWires::default()));
+
+        let parent_19 = cache
+            .values()
+            .filter(|(mask, _)| can_derive_mask(*mask, 0b1_0011))
+            .max_by_key(|(mask, _)| mask.count_ones())
+            .map(|(mask, _)| *mask);
+        assert_eq!(parent_19, Some(0b1_0010));
+
+        cache.insert(0, (0b1_0011, Ag2pcSecureWires::default()));
+        prune_cache_for_target(&mut cache, 0b1_0011);
+        assert!(cache.values().any(|(mask, _)| *mask == 0b1_0000));
+        assert!(cache.values().any(|(mask, _)| *mask == 0b1_0011));
+        assert!(!cache.values().any(|(mask, _)| *mask == 0b1_0010));
+
+        let parent_20 = cache
+            .values()
+            .filter(|(mask, _)| can_derive_mask(*mask, 0b1_0100))
+            .max_by_key(|(mask, _)| mask.count_ones())
+            .map(|(mask, _)| *mask);
+        assert_eq!(parent_20, Some(0b1_0000));
     }
 
     #[test]

@@ -27,6 +27,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::AbortHandle;
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{
@@ -46,6 +47,9 @@ const DEFAULT_SSP_TARGET: u32 = 40;
 const DEFAULT_DELTA_CAP: u64 = 1u64 << 32;
 const PROTOCOL_VERSION: u32 = 1;
 const JOBSTREAM_SESSION_BINDING_DOMAIN: &[u8] = b"shachain2pc daemon JobStream precompute v1";
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES: u64 = 192 * MIB;
+const DEFAULT_IDLE_SESSION_RSS_BYTES: u64 = MIB;
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -164,6 +168,7 @@ pub struct DaemonState {
     inner: Arc<Mutex<Inner>>,
     grpc_jobs: Arc<Mutex<BTreeMap<String, PendingGrpcJob>>>,
     precompute_sessions: Arc<Mutex<BTreeMap<u64, PrecomputeSessionHandle>>>,
+    incoming_precompute_sessions: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
     peer_channel: Option<Channel>,
 }
 
@@ -175,6 +180,7 @@ struct Inner {
     db: PlainDb,
     active_jobs: BTreeMap<String, JobRecord>,
     next_job_id: u64,
+    baseline_daemon_rss_bytes: u64,
 }
 
 struct SecretBytes(Vec<u8>);
@@ -233,8 +239,25 @@ struct PeerFrontierConfig {
     channel_enabled: bool,
     precompute: u64,
     workers: u32,
+    effective_workers: u32,
+    ram_limited_workers_raw: u32,
+    ram_overcommit_warning: bool,
     ssp_target: u32,
     delta_lifetime_checked_units_cap: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResourceModel {
+    configured_workers: u32,
+    effective_workers: u32,
+    ram_limited_workers_raw: u32,
+    ram_overcommit_warning: bool,
+    baseline_daemon_rss_bytes: u64,
+    current_rss_bytes: u64,
+    idle_session_rss_estimate_bytes: u64,
+    one_h_worker_peak_rss_estimate_bytes: u64,
+    live_session_count: u64,
+    reserved_ram_bytes: u64,
 }
 
 struct PrecomputeJob {
@@ -414,6 +437,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
     let (store, db) = EncryptedStore::open(cfg.db_path.clone(), &master_secret)?;
     let cookie = load_or_create_cookie(&cfg)?;
     let peer_channel = peer_channel_from_url(&cfg.peer_url, cfg.peer_tls.as_ref())?;
+    let baseline_daemon_rss_bytes = current_rss_bytes().unwrap_or(0);
     Ok(DaemonState {
         inner: Arc::new(Mutex::new(Inner {
             cfg,
@@ -423,9 +447,11 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             db,
             active_jobs: BTreeMap::new(),
             next_job_id: 0,
+            baseline_daemon_rss_bytes,
         })),
         grpc_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        incoming_precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         peer_channel,
     })
 }
@@ -442,6 +468,7 @@ impl ControlService for ControlApi {
         request: Request<pb::StatusRequest>,
     ) -> std::result::Result<Response<pb::StatusResponse>, Status> {
         self.state.check_cookie(&request).await?;
+        let resources = self.state.resource_model().await;
         let inner = self.state.inner.lock().await;
         Ok(Response::new(pb::StatusResponse {
             role: inner.cfg.role.party_id() as u32,
@@ -452,10 +479,19 @@ impl ControlService for ControlApi {
                 .clone()
                 .unwrap_or_else(|| inner.cfg.peer_addr.to_string()),
             max_ram_bytes: inner.cfg.max_ram_bytes,
-            workers: inner.cfg.workers,
+            workers: resources.configured_workers,
             precompute: inner.cfg.precompute,
             channel_count: inner.db.channels.len() as u64,
             active_job_count: inner.active_jobs.len() as u64,
+            effective_workers: resources.effective_workers,
+            ram_limited_workers_raw: resources.ram_limited_workers_raw,
+            ram_overcommit_warning: resources.ram_overcommit_warning,
+            baseline_daemon_rss_bytes: resources.baseline_daemon_rss_bytes,
+            current_rss_bytes: resources.current_rss_bytes,
+            idle_session_rss_estimate_bytes: resources.idle_session_rss_estimate_bytes,
+            one_h_worker_peak_rss_estimate_bytes: resources.one_h_worker_peak_rss_estimate_bytes,
+            live_session_count: resources.live_session_count,
+            reserved_ram_bytes: resources.reserved_ram_bytes,
         }))
     }
 
@@ -475,10 +511,15 @@ impl ControlService for ControlApi {
         if let Some(v) = req.precompute {
             inner.cfg.precompute = v;
         }
+        drop(inner);
+        let resources = self.state.resource_model().await;
+        let inner = self.state.inner.lock().await;
         Ok(Response::new(pb::SetConfigResponse {
             max_ram_bytes: inner.cfg.max_ram_bytes,
             workers: inner.cfg.workers,
             precompute: inner.cfg.precompute,
+            effective_workers: resources.effective_workers,
+            ram_overcommit_warning: resources.ram_overcommit_warning,
         }))
     }
 
@@ -540,6 +581,15 @@ impl ControlService for ControlApi {
         let req = request.into_inner();
         let mut inner = self.state.inner.lock().await;
         let key = channel_key(req.channel_index);
+        if inner
+            .active_jobs
+            .values()
+            .any(|job| job.channel_index == req.channel_index)
+        {
+            return Err(Status::failed_precondition(
+                "channel has an active precompute job",
+            ));
+        }
         let channel = inner
             .db
             .channels
@@ -548,6 +598,8 @@ impl ControlService for ControlApi {
         channel.enabled = false;
         let response = channel_response(req.channel_index, channel);
         inner.save().map_err(to_status)?;
+        drop(inner);
+        self.state.drop_precompute_session(req.channel_index).await;
         Ok(Response::new(response))
     }
 
@@ -648,6 +700,7 @@ impl PeerService for PeerApi {
         &self,
         _request: Request<pb::ConfigUpdate>,
     ) -> std::result::Result<Response<pb::ConfigUpdate>, Status> {
+        let resources = self.state.resource_model().await;
         let inner = self.state.inner.lock().await;
         Ok(Response::new(pb::ConfigUpdate {
             max_ram_bytes: inner.cfg.max_ram_bytes,
@@ -655,6 +708,9 @@ impl PeerService for PeerApi {
             precompute: inner.cfg.precompute,
             ssp_target: DEFAULT_SSP_TARGET,
             delta_lifetime_checked_units_cap: DEFAULT_DELTA_CAP,
+            effective_workers: resources.effective_workers,
+            ram_limited_workers_raw: resources.ram_limited_workers_raw,
+            ram_overcommit_warning: resources.ram_overcommit_warning,
         }))
     }
 
@@ -662,6 +718,7 @@ impl PeerService for PeerApi {
         &self,
         request: Request<pb::GetFrontierRequest>,
     ) -> std::result::Result<Response<pb::GetFrontierResponse>, Status> {
+        let resources = self.state.resource_model().await;
         let req = request.into_inner();
         let inner = self.state.inner.lock().await;
         let Some(channel) = inner.db.channels.get(&channel_key(req.channel_index)) else {
@@ -672,6 +729,9 @@ impl PeerService for PeerApi {
                 ssp_target: 0,
                 delta_lifetime_checked_units_cap: 0,
                 workers: inner.cfg.workers,
+                effective_workers: resources.effective_workers,
+                ram_limited_workers_raw: resources.ram_limited_workers_raw,
+                ram_overcommit_warning: resources.ram_overcommit_warning,
             }));
         };
         let nodes = channel
@@ -691,6 +751,9 @@ impl PeerService for PeerApi {
             ssp_target: channel.ssp_target,
             delta_lifetime_checked_units_cap: channel.delta_lifetime_checked_units_cap,
             workers: inner.cfg.workers,
+            effective_workers: resources.effective_workers,
+            ram_limited_workers_raw: resources.ram_limited_workers_raw,
+            ram_overcommit_warning: resources.ram_overcommit_warning,
         }))
     }
 
@@ -883,6 +946,14 @@ async fn run_outgoing_precompute_session(
 }
 
 impl DaemonState {
+    async fn resource_model(&self) -> ResourceModel {
+        let outgoing = self.precompute_sessions.lock().await.len() as u64;
+        let incoming = self.incoming_precompute_sessions.lock().await.len() as u64;
+        let live_session_count = outgoing.saturating_add(incoming);
+        let inner = self.inner.lock().await;
+        resource_model(&inner, live_session_count)
+    }
+
     async fn check_cookie<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
         let cookie = request
             .metadata()
@@ -934,11 +1005,28 @@ impl DaemonState {
                 sibling: ready.sibling.take().expect("sibling stream is ready"),
             };
             let state = self.clone();
-            tokio::spawn(async move {
-                let _ = state
+            let channel_index = ready.descriptor.channel_index;
+            let task_state = state.clone();
+            let task = tokio::spawn(async move {
+                let _ = task_state
+                    .clone()
                     .run_incoming_precompute_session(ready.descriptor, streams)
                     .await;
+                task_state
+                    .unregister_incoming_precompute_session(channel_index)
+                    .await;
             });
+            let abort_handle = task.abort_handle();
+            let old = {
+                state
+                    .incoming_precompute_sessions
+                    .lock()
+                    .await
+                    .insert(channel_index, abort_handle)
+            };
+            if let Some(old) = old {
+                old.abort();
+            }
         }
         Ok(())
     }
@@ -1111,11 +1199,12 @@ impl DaemonState {
     }
 
     async fn scheduler_candidates(&self) -> Vec<u64> {
+        let resources = self.resource_model().await;
         let inner = self.inner.lock().await;
         if inner.cfg.workers == 0 || inner.cfg.precompute == 0 {
             return Vec::new();
         }
-        if inner.active_jobs.len() >= inner.cfg.workers as usize {
+        if inner.active_jobs.len() >= resources.effective_workers as usize {
             return Vec::new();
         }
         inner
@@ -1282,6 +1371,21 @@ impl DaemonState {
 
     async fn drop_precompute_session(&self, channel_index: u64) {
         self.precompute_sessions.lock().await.remove(&channel_index);
+        if let Some(handle) = self
+            .incoming_precompute_sessions
+            .lock()
+            .await
+            .remove(&channel_index)
+        {
+            handle.abort();
+        }
+    }
+
+    async fn unregister_incoming_precompute_session(&self, channel_index: u64) {
+        self.incoming_precompute_sessions
+            .lock()
+            .await
+            .remove(&channel_index);
     }
 
     async fn precompute_path_jobstream(
@@ -1515,6 +1619,7 @@ impl DaemonState {
         peer: PeerFrontierConfig,
         planned_checked_units: u64,
     ) -> Result<PrecomputeStart> {
+        let resources = self.resource_model().await;
         let mut inner = self.inner.lock().await;
         let key = channel_key(channel_index);
         let key_node = node_key(index.get());
@@ -1542,7 +1647,9 @@ impl DaemonState {
                 "channel already has an active precompute job".to_owned(),
             ));
         }
-        let worker_count = inner.cfg.workers.min(peer.workers);
+        let worker_count = resources
+            .effective_workers
+            .min(peer.effective_workers.min(peer.workers.max(1)));
         if worker_count == 0 {
             return Err(DaemonError::Refused(
                 "no shared precompute worker is available".to_owned(),
@@ -1552,6 +1659,13 @@ impl DaemonState {
             return Err(DaemonError::Refused(
                 "all shared precompute workers are busy".to_owned(),
             ));
+        }
+        if resources.ram_overcommit_warning || peer.ram_overcommit_warning {
+            eprintln!(
+                "WARNING: RAM budget is below the modeled idle-session plus one-worker floor; precompute may exceed max_ram_bytes (local_raw_workers={}, peer_raw_workers={})",
+                resources.ram_limited_workers_raw,
+                peer.ram_limited_workers_raw
+            );
         }
         let reserved: u64 = inner
             .active_jobs
@@ -1676,6 +1790,7 @@ impl DaemonState {
         index: Index48,
         planned_checked_units: u64,
     ) -> Result<IncomingPrecomputeJob> {
+        let resources = self.resource_model().await;
         let mut inner = self.inner.lock().await;
         let key = channel_key(descriptor.channel_index);
         let channel = inner
@@ -1694,10 +1809,15 @@ impl DaemonState {
                 "incoming JobStream security parameters do not match".to_owned(),
             ));
         }
-        if inner.active_jobs.len() >= inner.cfg.workers as usize {
+        if inner.active_jobs.len() >= resources.effective_workers as usize {
             return Err(DaemonError::Refused(
                 "all local precompute workers are busy".to_owned(),
             ));
+        }
+        if resources.ram_overcommit_warning {
+            eprintln!(
+                "WARNING: RAM budget is below the modeled idle-session plus one-worker floor; incoming precompute may exceed max_ram_bytes"
+            );
         }
         if inner
             .active_jobs
@@ -1820,6 +1940,9 @@ impl DaemonState {
             .channels
             .get_mut(&key)
             .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        if !channel.enabled {
+            return Err(DaemonError::Refused("channel is disabled".to_owned()));
+        }
         channel.frontier_nodes.insert(
             node_key(target_mask),
             WireRecord {
@@ -1861,6 +1984,9 @@ impl DaemonState {
             channel_enabled: response.channel_enabled,
             precompute: response.precompute,
             workers: response.workers,
+            effective_workers: response.effective_workers.max(1),
+            ram_limited_workers_raw: response.ram_limited_workers_raw,
+            ram_overcommit_warning: response.ram_overcommit_warning,
             ssp_target: response.ssp_target,
             delta_lifetime_checked_units_cap: response.delta_lifetime_checked_units_cap,
         };
@@ -2257,6 +2383,60 @@ fn ssp_effective(ssp_target: u32, cap: u64) -> usize {
     (ssp_target + cap_log) as usize
 }
 
+fn resource_model(inner: &Inner, live_session_count: u64) -> ResourceModel {
+    let current = current_rss_bytes().unwrap_or(0);
+    resource_model_with_current_rss(inner, live_session_count, current)
+}
+
+fn resource_model_with_current_rss(
+    inner: &Inner,
+    live_session_count: u64,
+    current: u64,
+) -> ResourceModel {
+    let baseline = inner.baseline_daemon_rss_bytes;
+    let idle_sessions = live_session_count.saturating_mul(DEFAULT_IDLE_SESSION_RSS_BYTES);
+    let modeled_floor = baseline.saturating_add(idle_sessions);
+    let active_jobs = inner.active_jobs.len() as u64;
+    let observed_floor =
+        current.saturating_sub(active_jobs.saturating_mul(DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES));
+    let rss_floor = modeled_floor.max(observed_floor);
+    let worker_budget = inner.cfg.max_ram_bytes.saturating_sub(rss_floor);
+    let raw = worker_budget / DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES;
+    let ram_limited_workers_raw = raw.min(u32::MAX as u64) as u32;
+    let ram_limited_workers = ram_limited_workers_raw.max(1);
+    let effective_workers = inner.cfg.workers.min(ram_limited_workers).max(1);
+    let modeled_reserved =
+        rss_floor.saturating_add(active_jobs.saturating_mul(DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES));
+    let active_reserved = active_jobs
+        .saturating_mul(DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES)
+        .saturating_add(idle_sessions);
+    let reserved_ram_bytes = modeled_reserved.max(current).max(active_reserved);
+    ResourceModel {
+        configured_workers: inner.cfg.workers,
+        effective_workers,
+        ram_limited_workers_raw,
+        ram_overcommit_warning: ram_limited_workers_raw == 0,
+        baseline_daemon_rss_bytes: baseline,
+        current_rss_bytes: current,
+        idle_session_rss_estimate_bytes: DEFAULT_IDLE_SESSION_RSS_BYTES,
+        one_h_worker_peak_rss_estimate_bytes: DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES,
+        live_session_count,
+        reserved_ram_bytes,
+    }
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    parse_proc_status_kib(&status, "VmRSS:").map(|kib| kib.saturating_mul(1024))
+}
+
+fn parse_proc_status_kib(status: &str, field: &str) -> Option<u64> {
+    let line = status.lines().find(|line| line.starts_with(field))?;
+    let mut parts = line.split_whitespace();
+    let _name = parts.next()?;
+    parts.next()?.parse().ok()
+}
+
 fn set_bits_desc(value: u64) -> Vec<usize> {
     let mut bits = Vec::new();
     for bit in (0..INDEX_BITS).rev() {
@@ -2544,5 +2724,85 @@ mod tests {
             Index48::from_hex("6").unwrap().get()
         )
         .is_none());
+    }
+
+    #[test]
+    fn ram_model_derives_effective_workers_after_idle_sessions() {
+        let mut inner = test_inner(
+            100 * MIB
+                + 3 * DEFAULT_IDLE_SESSION_RSS_BYTES
+                + 2 * DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES,
+            8,
+            100 * MIB,
+        );
+        inner.active_jobs.insert(
+            "job".to_owned(),
+            JobRecord {
+                channel_index: 1,
+                kind: "precompute".to_owned(),
+                state: "test".to_owned(),
+                planned_checked_units: 1,
+            },
+        );
+        let model = resource_model_with_current_rss(&inner, 3, 0);
+        assert_eq!(model.configured_workers, 8);
+        assert_eq!(model.ram_limited_workers_raw, 2);
+        assert_eq!(model.effective_workers, 2);
+        assert!(!model.ram_overcommit_warning);
+        assert_eq!(
+            model.reserved_ram_bytes,
+            100 * MIB + DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES + 3 * DEFAULT_IDLE_SESSION_RSS_BYTES
+        );
+    }
+
+    #[test]
+    fn ram_model_warns_but_keeps_one_effective_worker() {
+        let inner = test_inner(
+            100 * MIB + 3 * DEFAULT_IDLE_SESSION_RSS_BYTES - 1,
+            4,
+            100 * MIB,
+        );
+        let model = resource_model_with_current_rss(&inner, 3, 0);
+        assert_eq!(model.ram_limited_workers_raw, 0);
+        assert_eq!(model.effective_workers, 1);
+        assert!(model.ram_overcommit_warning);
+    }
+
+    #[test]
+    fn ram_model_accounts_for_observed_rss_floor() {
+        let inner = test_inner(1024 * MIB, 8, 100 * MIB);
+        let model = resource_model_with_current_rss(&inner, 0, 800 * MIB);
+        assert_eq!(model.ram_limited_workers_raw, 1);
+        assert_eq!(model.effective_workers, 1);
+        assert_eq!(model.reserved_ram_bytes, 800 * MIB);
+    }
+
+    fn test_inner(max_ram_bytes: u64, workers: u32, baseline_daemon_rss_bytes: u64) -> Inner {
+        let dir = tempdir().unwrap();
+        let master = vec![1u8; 32];
+        let (store, db) = EncryptedStore::open(dir.path().join("test.db"), &master).unwrap();
+        Inner {
+            cfg: DaemonConfig {
+                role: Role::Alice,
+                db_path: dir.path().join("test.db"),
+                control_addr: "127.0.0.1:1".parse().unwrap(),
+                peer_addr: "127.0.0.1:2".parse().unwrap(),
+                peer_url: None,
+                peer_tls: None,
+                mpc_port: 30000,
+                max_ram_bytes,
+                workers,
+                precompute: 0,
+                control_file: None,
+                cookie_file: None,
+            },
+            master_secret: SecretBytes(master),
+            cookie: "cookie".to_owned(),
+            store,
+            db,
+            active_jobs: BTreeMap::new(),
+            next_job_id: 0,
+            baseline_daemon_rss_bytes,
+        }
     }
 }

@@ -31,6 +31,15 @@ message StatusResponse {
   uint64 precompute = 6;
   uint64 channel_count = 7;
   uint64 active_job_count = 8;
+  uint32 effective_workers = 9;
+  uint32 ram_limited_workers_raw = 10;
+  bool ram_overcommit_warning = 11;
+  uint64 baseline_daemon_rss_bytes = 12;
+  uint64 current_rss_bytes = 13;
+  uint64 idle_session_rss_estimate_bytes = 14;
+  uint64 one_h_worker_peak_rss_estimate_bytes = 15;
+  uint64 live_session_count = 16;
+  uint64 reserved_ram_bytes = 17;
 }
 
 message SetConfigRequest {
@@ -43,6 +52,8 @@ message SetConfigResponse {
   uint64 max_ram_bytes = 1;
   uint32 workers = 2;
   uint64 precompute = 3;
+  uint32 effective_workers = 4;
+  bool ram_overcommit_warning = 5;
 }
 
 message EnableChannelRequest {
@@ -132,6 +143,9 @@ message ConfigUpdate {
   uint64 precompute = 3;
   uint32 ssp_target = 4;
   uint64 delta_lifetime_checked_units_cap = 5;
+  uint32 effective_workers = 6;
+  uint32 ram_limited_workers_raw = 7;
+  bool ram_overcommit_warning = 8;
 }
 
 message GetFrontierRequest {
@@ -150,6 +164,9 @@ message GetFrontierResponse {
   uint32 ssp_target = 4;
   uint64 delta_lifetime_checked_units_cap = 5;
   uint32 workers = 6;
+  uint32 effective_workers = 7;
+  uint32 ram_limited_workers_raw = 8;
+  bool ram_overcommit_warning = 9;
 }
 
 message JobFrame {

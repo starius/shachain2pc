@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -12,9 +12,93 @@ use tokio::time::{sleep, timeout};
 const MASTER_A: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const MASTER_B: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
 static NEXT_PORT: AtomicUsize = AtomicUsize::new(23_000);
+static DAEMON_PAIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark harness; run explicitly"]
+async fn daemon_bench_100_channels_good_case() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start_mtls().await;
+    pair.cli(&pair.alice_control, &["config", "workers", "4"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "workers", "4"])
+        .await;
+    pair.cli(&pair.alice_control, &["config", "precompute", "1"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "1"])
+        .await;
+
+    let channels: Vec<u64> = (1000..1100).collect();
+    let setup_start = Instant::now();
+    for channel in &channels {
+        let channel_s = channel.to_string();
+        pair.cli(&pair.alice_control, &["channel", "enable", &channel_s])
+            .await;
+        pair.cli(&pair.bob_control, &["channel", "enable", &channel_s])
+            .await;
+    }
+    let setup_ms = setup_start.elapsed().as_millis() as u64;
+
+    let precompute_start = Instant::now();
+    pair.wait_frontier_total(&pair.alice_control, channels.len(), 1)
+        .await;
+    pair.wait_frontier_total(&pair.bob_control, channels.len(), 1)
+        .await;
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
+    let precompute_ms = precompute_start.elapsed().as_millis() as u64;
+
+    let mut reveal_latencies = Vec::with_capacity(channels.len());
+    for channel in &channels {
+        let channel_s = channel.to_string();
+        let reveal_start = Instant::now();
+        let alice_args = ["reveal", channel_s.as_str(), "1", "1"];
+        let bob_args = ["reveal", channel_s.as_str(), "1", "1"];
+        let (alice, bob) = tokio::join!(
+            pair.cli(&pair.alice_control, &alice_args),
+            pair.cli(&pair.bob_control, &bob_args)
+        );
+        assert_eq!(parse_result(&alice), parse_result(&bob));
+        assert_eq!(parse_cache(&alice), Some(true));
+        assert_eq!(parse_cache(&bob), Some(true));
+        reveal_latencies.push(reveal_start.elapsed().as_millis() as u64);
+    }
+
+    let alice_hwm = pair.alice.vm_hwm_bytes().unwrap_or(0);
+    let bob_hwm = pair.bob.vm_hwm_bytes().unwrap_or(0);
+    let summary = serde_json::json!({
+        "channels": channels.len(),
+        "workers": 4,
+        "setup_ms": setup_ms,
+        "precompute": {
+            "committed": channels.len(),
+            "wall_ms": precompute_ms,
+            "ms_per_secret": precompute_ms as f64 / channels.len() as f64
+        },
+        "cached_reveal": {
+            "count": reveal_latencies.len(),
+            "p50_ms": percentile(&mut reveal_latencies.clone(), 50),
+            "p95_ms": percentile(&mut reveal_latencies.clone(), 95),
+            "p99_ms": percentile(&mut reveal_latencies.clone(), 99),
+            "max_ms": reveal_latencies.iter().copied().max().unwrap_or(0),
+            "avg_ms": reveal_latencies.iter().sum::<u64>() as f64
+                / reveal_latencies.len().max(1) as f64
+        },
+        "rss": {
+            "alice_peak_mb": alice_hwm / (1024 * 1024),
+            "bob_peak_mb": bob_hwm / (1024 * 1024),
+            "pair_peak_sum_mb": (alice_hwm + bob_hwm) / (1024 * 1024)
+        },
+        "alice_status": pair.cli(&pair.alice_control, &["status"]).await.trim(),
+        "bob_status": pair.cli(&pair.bob_control, &["status"]).await.trim()
+    });
+    println!("{summary}");
+    pair.stop().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_seed_reveal_restart_and_local_cache() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "7"])
         .await;
@@ -55,6 +139,7 @@ async fn daemon_pair_seed_reveal_restart_and_local_cache() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_nonzero_reveal_matches_reference() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "9"])
         .await;
@@ -78,6 +163,7 @@ async fn daemon_pair_nonzero_reveal_matches_reference() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precomputed_frontier_survives_restart() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "13"])
         .await;
@@ -126,6 +212,7 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precompute_persists_only_requested_leaf() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "16"])
         .await;
@@ -159,6 +246,7 @@ async fn daemon_pair_precompute_persists_only_requested_leaf() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_reuses_live_session_prefix_between_precomputes() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "18"])
         .await;
@@ -199,6 +287,7 @@ async fn daemon_pair_reuses_live_session_prefix_between_precomputes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_peer_mtls_precompute_jobstream() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start_mtls().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "24"])
         .await;
@@ -215,6 +304,7 @@ async fn daemon_pair_peer_mtls_precompute_jobstream() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precompute_repairs_peer_frontier_rollback() {
+    let _guard = daemon_pair_lock().await;
     let mut pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "14"])
         .await;
@@ -246,6 +336,7 @@ async fn daemon_pair_precompute_repairs_peer_frontier_rollback() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_background_precomputes_to_shared_target() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["config", "precompute", "1"])
         .await;
@@ -279,6 +370,7 @@ async fn daemon_pair_background_precomputes_to_shared_target() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precomputes_two_channels_over_jobstream() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["config", "workers", "2"])
         .await;
@@ -314,7 +406,83 @@ async fn daemon_pair_precomputes_two_channels_over_jobstream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_disable_channel_drops_live_sessions() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "26"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "26"])
+        .await;
+
+    let first = pair
+        .cli(&pair.alice_control, &["precompute", "26", "1"])
+        .await;
+    assert!(first.contains("nodes=1"), "{first}");
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
+
+    pair.wait_status_field(&pair.alice_control, "live_sessions", 1)
+        .await;
+    pair.wait_status_field(&pair.bob_control, "live_sessions", 1)
+        .await;
+
+    pair.cli(&pair.alice_control, &["channel", "disable", "26"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "disable", "26"])
+        .await;
+    pair.wait_status_field(&pair.alice_control, "live_sessions", 0)
+        .await;
+    pair.wait_status_field(&pair.bob_control, "live_sessions", 0)
+        .await;
+
+    pair.cli(&pair.alice_control, &["channel", "enable", "26"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "26"])
+        .await;
+    let second = pair
+        .cli(&pair.alice_control, &["precompute", "26", "2"])
+        .await;
+    assert!(second.contains("nodes=1"), "{second}");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_low_ram_warns_but_allows_one_worker() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["config", "workers", "4"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "workers", "4"])
+        .await;
+    pair.cli(&pair.alice_control, &["config", "max-ram-mb", "1"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "max-ram-mb", "1"])
+        .await;
+
+    let alice_status = pair.cli(&pair.alice_control, &["status"]).await;
+    let bob_status = pair.cli(&pair.bob_control, &["status"]).await;
+    assert_eq!(status_field(&alice_status, "workers"), Some(4));
+    assert_eq!(status_field(&bob_status, "workers"), Some(4));
+    assert_eq!(status_field(&alice_status, "effective_workers"), Some(1));
+    assert_eq!(status_field(&bob_status, "effective_workers"), Some(1));
+    assert!(alice_status.contains("ram_warning=true"), "{alice_status}");
+    assert!(bob_status.contains("ram_warning=true"), "{bob_status}");
+
+    pair.cli(&pair.alice_control, &["channel", "enable", "27"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "27"])
+        .await;
+    let out = pair
+        .cli(&pair.alice_control, &["precompute", "27", "1"])
+        .await;
+    assert!(out.contains("nodes=1"), "{out}");
+    assert!(out.contains("checked=1"), "{out}");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(
         &pair.alice_control,
@@ -346,6 +514,7 @@ async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_failed_precompute_attempt_is_counted() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(
         &pair.alice_control,
@@ -376,6 +545,7 @@ async fn daemon_pair_failed_precompute_attempt_is_counted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_rejects_ahead_reveal_without_expected_index() {
+    let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["channel", "enable", "11"])
         .await;
@@ -393,11 +563,45 @@ async fn daemon_pair_rejects_ahead_reveal_without_expected_index() {
 
 struct DaemonPair {
     dir: TempDir,
-    alice: Child,
-    bob: Child,
+    alice: ChildGuard,
+    bob: ChildGuard,
     alice_control: PathBuf,
     bob_control: PathBuf,
     ports: Ports,
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(Child::id)
+    }
+
+    fn vm_hwm_bytes(&self) -> Option<u64> {
+        proc_status_kib(self.id()?, "VmHWM:").map(|kib| kib.saturating_mul(1024))
+    }
+
+    async fn kill_and_wait(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        self.child = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -520,11 +724,43 @@ impl DaemonPair {
         .unwrap()
     }
 
+    async fn wait_frontier_total(&self, control: &Path, expected: usize, frontier: u64) -> String {
+        timeout(Duration::from_secs(600), async {
+            loop {
+                let channels = self.cli(control, &["channels"]).await;
+                let count = channels
+                    .lines()
+                    .filter(|line| line.contains(&format!("frontier={frontier}")))
+                    .count();
+                if count >= expected {
+                    return channels;
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
     async fn wait_jobs_empty(&self, control: &Path) {
         timeout(Duration::from_secs(120), async {
             loop {
                 if self.cli(control, &["jobs"]).await.trim().is_empty() {
                     return;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn wait_status_field(&self, control: &Path, key: &str, value: u64) -> String {
+        timeout(Duration::from_secs(120), async {
+            loop {
+                let status = self.cli(control, &["status"]).await;
+                if status_field(&status, key) == Some(value) {
+                    return status;
                 }
                 sleep(Duration::from_millis(200)).await;
             }
@@ -560,10 +796,8 @@ impl DaemonPair {
     }
 
     async fn kill_children(&mut self) {
-        let _ = self.alice.kill().await;
-        let _ = self.bob.kill().await;
-        let _ = self.alice.wait().await;
-        let _ = self.bob.wait().await;
+        self.alice.kill_and_wait().await;
+        self.bob.kill_and_wait().await;
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -582,7 +816,7 @@ fn spawn_daemon(
     ports: Ports,
     control: &Path,
     tls: Option<&TlsFiles>,
-) -> Child {
+) -> ChildGuard {
     let name = if role == 1 { "alice" } else { "bob" };
     let (local_port, peer_port, remote_peer_port) = if role == 1 {
         (ports.alice_local, ports.alice_peer, ports.bob_peer)
@@ -624,7 +858,7 @@ fn spawn_daemon(
             .arg("--peer-tls-domain")
             .arg("localhost");
     }
-    cmd.spawn().unwrap()
+    ChildGuard::new(cmd.spawn().unwrap())
 }
 
 fn generate_tls_files(dir: &Path) -> TlsFiles {
@@ -699,6 +933,10 @@ fn openssl_cmd(args: &[&str]) {
     );
 }
 
+async fn daemon_pair_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    DAEMON_PAIR_LOCK.lock().await
+}
+
 fn parse_result(output: &str) -> String {
     output
         .lines()
@@ -713,6 +951,34 @@ fn parse_cache(output: &str) -> Option<bool> {
         "CACHE false" => Some(false),
         _ => None,
     })
+}
+
+fn status_field(output: &str, key: &str) -> Option<u64> {
+    output.split_whitespace().find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if name == key {
+            value.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn percentile(values: &mut [u64], pct: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let rank = ((values.len() - 1) * pct).div_ceil(100);
+    values[rank.min(values.len() - 1)]
+}
+
+fn proc_status_kib(pid: u32, field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|line| line.starts_with(field))?;
+    let mut parts = line.split_whitespace();
+    let _name = parts.next()?;
+    parts.next()?.parse().ok()
 }
 
 fn assert_channel_contains(channels: &str, channel: u64, needle: &str) {

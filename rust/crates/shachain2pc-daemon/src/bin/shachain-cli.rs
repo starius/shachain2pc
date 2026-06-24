@@ -47,15 +47,24 @@ async fn real_main() -> Result<(), DaemonError> {
                 .await?
                 .into_inner();
             println!(
-                "role={} local={} peer={} ram={} workers={} precompute={} channels={} jobs={}",
+                "role={} local={} peer={} ram={} workers={} effective_workers={} ram_workers_raw={} ram_warning={} precompute={} channels={} jobs={} live_sessions={} reserved_ram={} baseline_rss={} current_rss={} idle_session_estimate={} one_h_worker_estimate={}",
                 out.role,
                 out.local_addr,
                 out.peer_addr,
                 out.max_ram_bytes,
                 out.workers,
+                out.effective_workers,
+                out.ram_limited_workers_raw,
+                out.ram_overcommit_warning,
                 out.precompute,
                 out.channel_count,
-                out.active_job_count
+                out.active_job_count,
+                out.live_session_count,
+                out.reserved_ram_bytes,
+                out.baseline_daemon_rss_bytes,
+                out.current_rss_bytes,
+                out.idle_session_rss_estimate_bytes,
+                out.one_h_worker_peak_rss_estimate_bytes
             );
         }
         [cmd, key, value] if cmd == "config" && key == "workers" => {
@@ -70,7 +79,10 @@ async fn real_main() -> Result<(), DaemonError> {
                 )?)
                 .await?
                 .into_inner();
-            println!("workers={}", out.workers);
+            println!(
+                "workers={} effective_workers={} ram_warning={}",
+                out.workers, out.effective_workers, out.ram_overcommit_warning
+            );
         }
         [cmd, key, value] if cmd == "config" && key == "precompute" => {
             let out = client
@@ -84,7 +96,10 @@ async fn real_main() -> Result<(), DaemonError> {
                 )?)
                 .await?
                 .into_inner();
-            println!("precompute={}", out.precompute);
+            println!(
+                "precompute={} effective_workers={} ram_warning={}",
+                out.precompute, out.effective_workers, out.ram_overcommit_warning
+            );
         }
         [cmd, key, value] if cmd == "config" && key == "max-ram-mb" => {
             let out = client
@@ -100,7 +115,10 @@ async fn real_main() -> Result<(), DaemonError> {
                 )?)
                 .await?
                 .into_inner();
-            println!("max_ram_bytes={}", out.max_ram_bytes);
+            println!(
+                "max_ram_bytes={} effective_workers={} ram_warning={}",
+                out.max_ram_bytes, out.effective_workers, out.ram_overcommit_warning
+            );
         }
         [cmd, sub, channel] if cmd == "channel" && sub == "enable" => {
             enable_channel(&mut client, &cookie, channel, 0, 0, 0).await?;

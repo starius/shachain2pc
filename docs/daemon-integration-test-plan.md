@@ -156,11 +156,12 @@ optimization.
 `daemon_bench_100_channels_low_ram_refusal`:
 
 - Configure `max_ram_mb` below the estimated need.
-- Expected future behavior: precompute refuses or queues rather than exceeding
-  the configured RAM budget.
-- Current expected behavior: this test should be marked `expected_fail` or
-  documented as pending until RAM reservation is implemented, because
-  `max_ram_bytes` is currently not enforced.
+- Expected behavior after RAM admission control lands: precompute queues or
+  refuses because the effective worker count derived from RAM is zero or lower
+  than the configured `workers`.
+- Until RAM admission control lands, this test should be marked
+  `expected_fail` or documented as pending because `max_ram_bytes` is currently
+  not enforced.
 
 ### Reveal Benchmarks
 
@@ -220,8 +221,44 @@ Current implementation status:
   reported by status/config, but it is not used to reserve memory or refuse
   precompute. This is the main resource-control gap for 100-channel testing.
 
-Before treating the daemon as resource-safe under large channel counts, add RAM
-reservation:
+Before treating the daemon as resource-safe under large channel counts, RAM
+must reduce worker concurrency. The daemon already has a measured or configured
+peak RAM cost per active one-H worker, so the first implementation should turn
+RAM into a worker cap and then reuse the existing worker-budget machinery.
+
+Compute locally:
+
+```text
+ram_available_for_jobs =
+    max_ram_bytes -
+    baseline_daemon_rss -
+    live_idle_sessions * idle_session_rss_estimate
+
+ram_limited_workers =
+    floor(max(ram_available_for_jobs, 0) / one_h_worker_peak_rss_estimate)
+
+effective_local_workers = min(configured_workers, ram_limited_workers)
+```
+
+Then use:
+
+```text
+effective_shared_workers =
+    min(local_effective_workers, peer_advertised_effective_workers)
+```
+
+Outgoing precompute must start only if `active_jobs < effective_shared_workers`.
+Incoming JobStream work must start only if
+`active_jobs < effective_local_workers`. If either value is zero, work queues or
+is refused with a resource-limit error; it must not start and hope the host has
+enough memory.
+
+The peer config exchange should advertise both the configured `workers` and the
+derived `effective_workers`, plus the RAM inputs used to derive it. The
+scheduler should make decisions from `effective_workers`; configured `workers`
+is retained as the user-requested CPU/concurrency ceiling.
+
+The RAM estimate should reserve for active jobs and account for live sessions:
 
 ```text
 estimated_job_rss = configured_or_measured_one_h_rss
@@ -231,13 +268,15 @@ reserved_ram =
     live_idle_sessions * estimated_idle_session_rss
 ```
 
-Precompute should start only when:
+The worker cap above is the main admission check. As a defensive backstop, a job
+should also refuse to start when:
 
 ```text
-reserved_ram + estimated_job_rss <= min(local_max_ram, peer_max_ram)
+reserved_ram + estimated_job_rss > local_max_ram
 ```
 
-The first implementation can be conservative and static, for example:
+The first implementation can be conservative and static. Initial values should
+come from the measured one-H peak with a safety margin, for example:
 
 ```text
 one_h_rss_estimate_mb = 32
@@ -245,8 +284,16 @@ idle_session_rss_estimate_mb = 1
 ```
 
 Then the benchmark should replace guesses with observed p95/peak values. The
-daemon should expose reserved RAM and observed peak RSS in `status` or a metrics
-endpoint before the benchmark becomes a regression gate.
+daemon should expose `effective_workers`, reserved RAM, and observed peak RSS in
+`status` or a metrics endpoint before the benchmark becomes a regression gate.
+
+The policy should not normally tear down idle per-channel sessions just to admit
+more work. Idle sessions are the optimization that prevents re-deriving the
+trunk while both daemons remain alive, and their expected footprint is small.
+The RAM cap should primarily reduce active worker count. If a deployment sets
+`max_ram_bytes` too low to hold idle sessions plus one worker, the daemon should
+surface the condition explicitly instead of silently dropping reusable session
+state.
 
 ## Restart And Liveness Tests
 

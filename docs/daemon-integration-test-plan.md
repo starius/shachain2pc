@@ -21,6 +21,7 @@ The current `daemon_pair` integration suite already covers:
 - target-only durable frontier persistence;
 - live in-memory session reuse for adjacent targets (`2 -> 3`);
 - peer mTLS JobStream happy path;
+- peer mTLS cached reveal happy path;
 - one peer DB loss followed by joint frontier recompute;
 - background precompute to the shared target;
 - two concurrent channels over JobStream;
@@ -30,8 +31,8 @@ The current `daemon_pair` integration suite already covers:
 - panic-safe daemon child cleanup through `Drop`;
 - RAM-derived `effective_workers`, low-RAM warning, and precompute admission;
 - disable behavior that refuses active precompute and frees live session state;
-- an ignored 100-channel benchmark that reports throughput, cached reveal
-  latency, and per-node peak RSS.
+- an ignored 100-channel benchmark that uses persistent local control gRPC
+  clients and reports throughput, cached reveal latency, and per-node peak RSS.
 
 The additions below should preserve that structure and keep tests serialized
 with the existing daemon-pair lock/port allocation style.
@@ -124,8 +125,9 @@ peak can hide asymmetric behavior, especially during reveal/fallback.
 4. Enable 100 channels on both peers.
 5. Set a precompute target, initially `1` for all channels.
 6. Wait for all 100 target leaves to be committed on both peers.
-7. Reveal all 100 precomputed secrets sequentially, using the required
-   `expected_next_index` value for each channel.
+7. Reveal all 100 precomputed secrets sequentially through persistent local
+   control gRPC clients, using the required `expected_next_index` value for
+   each channel.
 8. Restart both daemons.
 9. Reveal the same or locally derivable older secrets again, proving durable
    known-secret/cache behavior.
@@ -336,34 +338,34 @@ frontier remain RAM-only and must be fresh-session state.
 
 Priority: high for throughput, medium for RAM.
 
-Status: implemented for persisted cached leaves. The daemon cached-reveal path
-now performs a lightweight two-party MAC-open over persisted
-`lambda + wire_bundle` material and the re-derived fixed channel Delta. It keeps
-the existing two-sided reveal rendezvous and IT-MAC correct-or-abort check, but
-skips base OT, SoftSpoken bootstrap, COT, and garbling setup.
+Status: implemented for nonzero persisted cached leaves. The daemon
+cached-reveal path now uses peer gRPC `RevealCached`, a lightweight two-party
+MAC-open over persisted `lambda + wire_bundle` material and the re-derived fixed
+channel Delta. Alice sends her local share; Bob's peer handler waits for Bob's
+matching local reveal authorization, verifies Alice's share, returns Bob's
+share, and both daemons store the same opened value. This keeps the two-sided
+reveal rendezvous and IT-MAC correct-or-abort check, but skips base OT,
+SoftSpoken bootstrap, COT, and garbling setup.
 
-The current cached reveal benchmark is setup-bound: about 474 ms per reveal on
-the measured 100-channel run, mostly because reveal opens a fresh AG2PC/EMP
-session. The actual cached reveal is a MAC/open check and should be much
-cheaper when a live channel session already exists.
+The explicit `I=0` seed-reveal path and the full-derivation fallback remain on
+the legacy one-shot transport. The persisted `lambda` plus `wire_bundle`
+MAC/key material is still required DB material for restart reveal;
+`strip_labels_for_reveal` must continue to remove only session-local labels.
 
-Implementation plan:
+The latest 100-channel good-case release runs show that setup was not the only
+remaining latency source. With peer gRPC cached reveal, persistent local control
+clients, and revealed-node DB compaction, sequential cached reveals still landed
+in the same broad range as the earlier CLI/EMP path once background refill and
+DB writes were included. The final drained run averaged 443.52 ms (p50 429 ms,
+p95 691 ms, p99 794 ms). Treat this as a mixed consume/refill measurement, not
+as isolated reveal latency.
 
-- add a reveal command on the existing per-channel JobStream/live session for
-  targets whose labeled live node is still resident;
-- for exact persisted target leaves after restart, consider a lightweight
-  daemon-gRPC MAC-open path that uses the fixed channel Delta but does not run
-  base OT or SoftSpoken setup;
-- state and test that this path consumes the persisted `lambda` plus
-  `wire_bundle` MAC/key shares with the re-derived fixed channel Delta.
-  `strip_labels_for_reveal` must continue to remove only session-local labels,
-  not the authenticated MAC material required for restart reveal;
-- keep the legacy EMP/TCP reveal/full-derivation path for compatibility and
-  fallback until the daemon path is fully tested;
-- add benchmarks for sequential cached reveal, parallel cached reveal, and
-  fallback reveal;
-- confirm whether the legacy base `mpc_port` path serializes concurrent
-  reveals, then retire that cap for daemon-to-daemon cached reveal.
+Remaining work:
+
+- add an isolated reveal-only benchmark that disables background refill after
+  the initial fill;
+- add a parallel cached-reveal benchmark across channels;
+- add a fallback reveal benchmark for comparison.
 
 This is a latency/throughput optimization, not a new crypto protocol. It must
 not reveal a value without the same IT-MAC correct-or-abort check already used
@@ -373,10 +375,26 @@ by public reveal.
 
 Priority: required before treating benchmarks as capacity numbers.
 
-Status: pending empirical run. The ignored benchmark harnesses now report
-steady `VmRSS` as well as `VmHWM`, so calibration can separate fill-time peak
-from idle floor. Defaults remain conservative until those measurements are run
-and reviewed.
+Status: partially measured. The ignored benchmark harnesses report steady
+`VmRSS` as well as `VmHWM`, so calibration can separate fill-time peak from
+idle floor. Defaults remain conservative until the full calibration sequence is
+run and reviewed.
+
+The latest drained 100-channel good-case release run with 4 configured workers
+and a 1 GiB RAM cap reported:
+
+```text
+precompute: 27.474 s total, 274.74 ms/secret
+cached reveal with refill: avg 443.52 ms, p50 429 ms, p95 691 ms, p99 794 ms
+Alice RSS: idle-after-precompute 425 MB, peak 482 MB
+Bob RSS:   idle-after-precompute 456 MB, peak 528 MB
+pair peak sum: 1011 MB
+effective workers at end: Alice 4, Bob 2
+```
+
+The benchmark leaves precompute target enabled during reveal, so it measures a
+mixed consume/refill path. Run the isolated reveal-only benchmark before using
+these reveal numbers as a capacity limit.
 
 After the circuit sharing and any idle-buffer trimming land, rerun the
 calibration sequence in this document and update the configured estimates:

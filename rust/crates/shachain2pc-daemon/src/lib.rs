@@ -10,14 +10,17 @@ use pb::peer_service_server::{PeerService, PeerServiceServer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{generate_from_seed, sha256_compress_gadget, Circuit};
-use shachain2pc_emp_compat::{normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires};
+use shachain2pc_emp_compat::{
+    normalize_ag2pc_delta, AShareBundle, Ag2pcSecureWires, HASH_DIGEST_BYTES,
+};
 use shachain2pc_emp_wire::{Ag2pcStreams, Block, ByteIo, ChannelByteStream, BLOCK_BYTES};
 use shachain2pc_mpc_runner::{
     run_session_handshake, ByteFrameTransport, RunnerSessionParams, TransportPair,
 };
 use shachain2pc_party::{
-    reveal_node_fast_job, run_party, run_seed_root_job_with_circuit, Args as PartyArgs, IndexSpec,
-    MpcTcpEndpoint, PartyOutput, PrecomputeSession,
+    reveal_node_fast_job, reveal_node_from_peer_share, reveal_node_local_share, run_party,
+    run_seed_root_job_with_circuit, Args as PartyArgs, IndexSpec, MpcTcpEndpoint, PartyOutput,
+    PrecomputeSession,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
 use std::collections::{BTreeMap, HashMap};
@@ -26,9 +29,9 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::task::AbortHandle;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{
     Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
@@ -50,6 +53,7 @@ const JOBSTREAM_SESSION_BINDING_DOMAIN: &[u8] = b"shachain2pc daemon JobStream p
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES: u64 = 192 * MIB;
 const DEFAULT_IDLE_SESSION_RSS_BYTES: u64 = MIB;
+const PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -167,6 +171,8 @@ impl DaemonHandle {
 pub struct DaemonState {
     inner: Arc<Mutex<Inner>>,
     grpc_jobs: Arc<Mutex<BTreeMap<String, PendingGrpcJob>>>,
+    pending_reveals: Arc<Mutex<BTreeMap<RevealRequestKey, PendingReveal>>>,
+    pending_reveal_notify: Arc<Notify>,
     precompute_sessions: Arc<Mutex<BTreeMap<u64, PrecomputeSessionHandle>>>,
     incoming_precompute_sessions: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
     peer_channel: Option<Channel>,
@@ -274,6 +280,18 @@ struct IncomingPrecomputeSession {
     delta: Block,
     ssp: usize,
     share: Value32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RevealRequestKey {
+    channel_index: u64,
+    requested_index: u64,
+    expected_next_index: u64,
+    allow_seed_reveal: bool,
+}
+
+struct PendingReveal {
+    response: oneshot::Sender<Result<Value32>>,
 }
 
 enum PrecomputeStart {
@@ -455,6 +473,8 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             baseline_daemon_rss_bytes,
         })),
         grpc_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        pending_reveals: Arc::new(Mutex::new(BTreeMap::new())),
+        pending_reveal_notify: Arc::new(Notify::new()),
         precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         incoming_precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         peer_channel,
@@ -773,6 +793,18 @@ impl PeerService for PeerApi {
             .register_incoming_job_stream(descriptor, channel, stream)
             .await?;
         Ok(Response::new(response))
+    }
+
+    async fn reveal_cached(
+        &self,
+        request: Request<pb::RevealCachedRequest>,
+    ) -> std::result::Result<Response<pb::RevealCachedResponse>, Status> {
+        let out = self
+            .state
+            .handle_peer_cached_reveal(request.into_inner())
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(out))
     }
 }
 
@@ -1137,7 +1169,13 @@ impl DaemonState {
         self.reconcile_with_peer(channel_index).await?;
         if let Some(node) = self.load_node(channel_index, index.get()).await? {
             let secret = self
-                .reveal_persisted_node(channel_index, index, &node)
+                .reveal_cached_node(
+                    channel_index,
+                    index,
+                    expected_next_index,
+                    allow_seed_reveal,
+                    &node,
+                )
                 .await?;
             self.store_known_secret(channel_index, index, expected_next_index, secret)
                 .await?;
@@ -1151,7 +1189,13 @@ impl DaemonState {
         if index.get() == 0 {
             let node = self.ensure_root(channel_index).await?;
             let secret = self
-                .reveal_persisted_node(channel_index, index, &node)
+                .reveal_cached_node(
+                    channel_index,
+                    index,
+                    expected_next_index,
+                    allow_seed_reveal,
+                    &node,
+                )
                 .await?;
             self.store_known_secret(channel_index, index, expected_next_index, secret)
                 .await?;
@@ -1486,6 +1530,233 @@ impl DaemonState {
         })
     }
 
+    async fn reveal_cached_node(
+        &self,
+        channel_index: u64,
+        index: Index48,
+        expected_next_index: u64,
+        allow_seed_reveal: bool,
+        node: &Ag2pcSecureWires,
+    ) -> Result<Value32> {
+        if index.get() == 0 {
+            return self.reveal_persisted_node(channel_index, index, node).await;
+        }
+        match (self.role().await, self.peer_channel.is_some()) {
+            (Role::Alice, true) => {
+                self.reveal_cached_node_via_peer(
+                    channel_index,
+                    index,
+                    expected_next_index,
+                    allow_seed_reveal,
+                    node,
+                )
+                .await
+            }
+            (Role::Bob, true) => {
+                self.await_incoming_cached_reveal(
+                    channel_index,
+                    index,
+                    expected_next_index,
+                    allow_seed_reveal,
+                    node,
+                )
+                .await
+            }
+            _ => self.reveal_persisted_node(channel_index, index, node).await,
+        }
+    }
+
+    async fn reveal_cached_node_via_peer(
+        &self,
+        channel_index: u64,
+        index: Index48,
+        expected_next_index: u64,
+        allow_seed_reveal: bool,
+        node: &Ag2pcSecureWires,
+    ) -> Result<Value32> {
+        let (delta, ssp_target, cap, public_binding_hex) =
+            self.reveal_node_context(channel_index, index.get()).await?;
+        let local = reveal_node_local_share(node)?;
+        let peer_channel = self
+            .peer_channel
+            .clone()
+            .ok_or_else(|| DaemonError::Refused("peer URL is not configured".to_owned()))?;
+        let mut client = pb::peer_service_client::PeerServiceClient::new(peer_channel);
+        let response = client
+            .reveal_cached(pb::RevealCachedRequest {
+                channel_index,
+                requested_index: index.get(),
+                expected_next_index,
+                allow_seed_reveal,
+                share_bits: local.share_bits,
+                mac_digest: local.mac_digest.to_vec(),
+                ssp_target,
+                delta_lifetime_checked_units_cap: cap,
+                public_binding_hex,
+            })
+            .await?
+            .into_inner();
+        let peer_digest = parse_mac_digest(response.mac_digest, "RevealCached response")?;
+        let opened = reveal_node_from_peer_share(node, delta, &response.share_bits, peer_digest)?;
+        Ok(opened.value)
+    }
+
+    async fn await_incoming_cached_reveal(
+        &self,
+        channel_index: u64,
+        index: Index48,
+        expected_next_index: u64,
+        allow_seed_reveal: bool,
+        node: &Ag2pcSecureWires,
+    ) -> Result<Value32> {
+        reveal_node_local_share(node)?;
+        let key = RevealRequestKey {
+            channel_index,
+            requested_index: index.get(),
+            expected_next_index,
+            allow_seed_reveal,
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_reveals.lock().await;
+            if pending
+                .insert(key, PendingReveal { response: tx })
+                .is_some()
+            {
+                return Err(DaemonError::Refused(
+                    "cached reveal is already pending".to_owned(),
+                ));
+            }
+        }
+        self.pending_reveal_notify.notify_waiters();
+        match timeout(PEER_REVEAL_WAIT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(DaemonError::Refused(
+                "cached reveal peer handler stopped".to_owned(),
+            )),
+            Err(_) => {
+                self.pending_reveals.lock().await.remove(&key);
+                Err(DaemonError::Refused(
+                    "timed out waiting for peer cached reveal".to_owned(),
+                ))
+            }
+        }
+    }
+
+    async fn handle_peer_cached_reveal(
+        &self,
+        req: pb::RevealCachedRequest,
+    ) -> Result<pb::RevealCachedResponse> {
+        let key = RevealRequestKey {
+            channel_index: req.channel_index,
+            requested_index: req.requested_index,
+            expected_next_index: req.expected_next_index,
+            allow_seed_reveal: req.allow_seed_reveal,
+        };
+        let pending = self.take_pending_reveal(key).await?;
+        match self.complete_peer_cached_reveal(req).await {
+            Ok((response, value)) => {
+                let _ = pending.response.send(Ok(value));
+                Ok(response)
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let _ = pending.response.send(Err(DaemonError::Refused(msg)));
+                Err(err)
+            }
+        }
+    }
+
+    async fn take_pending_reveal(&self, key: RevealRequestKey) -> Result<PendingReveal> {
+        timeout(PEER_REVEAL_WAIT, async {
+            loop {
+                let notified = self.pending_reveal_notify.notified();
+                if let Some(pending) = self.pending_reveals.lock().await.remove(&key) {
+                    return pending;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            DaemonError::Refused("cached reveal needs matching local authorization".to_owned())
+        })
+    }
+
+    async fn complete_peer_cached_reveal(
+        &self,
+        req: pb::RevealCachedRequest,
+    ) -> Result<(pb::RevealCachedResponse, Value32)> {
+        let index =
+            Index48::new(req.requested_index).map_err(|e| DaemonError::Parse(e.to_string()))?;
+        if index.get() == 0 && !req.allow_seed_reveal {
+            return Err(DaemonError::Refused(
+                "I=0 reveals the seed; pass allow_seed_reveal to proceed".to_owned(),
+            ));
+        }
+        if req.requested_index != req.expected_next_index {
+            return Err(DaemonError::Refused(
+                "requested index must match expected_next_index".to_owned(),
+            ));
+        }
+        let peer_digest = parse_mac_digest(req.mac_digest, "RevealCached request")?;
+        let node = self
+            .load_node(req.channel_index, index.get())
+            .await?
+            .ok_or_else(|| DaemonError::NotFound("cached reveal node is not stored".to_owned()))?;
+        let (delta, ssp_target, cap, public_binding_hex) = self
+            .reveal_node_context(req.channel_index, index.get())
+            .await?;
+        if req.ssp_target != ssp_target
+            || req.delta_lifetime_checked_units_cap != cap
+            || req.public_binding_hex != public_binding_hex
+        {
+            return Err(DaemonError::Refused(
+                "cached reveal binding does not match local channel".to_owned(),
+            ));
+        }
+        let local = reveal_node_local_share(&node)?;
+        let opened = reveal_node_from_peer_share(&node, delta, &req.share_bits, peer_digest)?;
+        self.store_known_secret(
+            req.channel_index,
+            index,
+            req.expected_next_index,
+            opened.value,
+        )
+        .await?;
+        Ok((
+            pb::RevealCachedResponse {
+                share_bits: local.share_bits,
+                mac_digest: local.mac_digest.to_vec(),
+            },
+            opened.value,
+        ))
+    }
+
+    async fn reveal_node_context(
+        &self,
+        channel_index: u64,
+        mask: u64,
+    ) -> Result<(Block, u32, u64, String)> {
+        let inner = self.inner.lock().await;
+        let channel = inner
+            .db
+            .channels
+            .get(&channel_key(channel_index))
+            .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
+        if !channel.enabled {
+            return Err(DaemonError::Refused("channel is disabled".to_owned()));
+        }
+        let delta = channel_delta(&inner.master_secret.0, channel_index, inner.cfg.role);
+        let (public, _) = binding_pair(&inner, channel_index, mask);
+        Ok((
+            delta,
+            channel.ssp_target,
+            channel.delta_lifetime_checked_units_cap,
+            to_hex(&public),
+        ))
+    }
+
     async fn reveal_persisted_node(
         &self,
         channel_index: u64,
@@ -1544,6 +1815,7 @@ impl DaemonState {
                 .known_secrets
                 .insert(index.get().to_string(), secret.to_hex());
         }
+        channel.frontier_nodes.remove(&node_key(index.get()));
         channel.last_observed_next_reveal_index = Some(expected_next_index.saturating_sub(1));
         inner.save()
     }
@@ -2144,6 +2416,17 @@ fn to_status(err: DaemonError) -> Status {
         }
         other => Status::internal(other.to_string()),
     }
+}
+
+fn parse_mac_digest(bytes: Vec<u8>, context: &str) -> Result<[u8; HASH_DIGEST_BYTES]> {
+    if bytes.len() != HASH_DIGEST_BYTES {
+        return Err(DaemonError::Parse(format!(
+            "{context} MAC digest must be {HASH_DIGEST_BYTES} bytes"
+        )));
+    }
+    let mut out = [0u8; HASH_DIGEST_BYTES];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 fn binding_pair(inner: &Inner, channel_index: u64, mask: u64) -> ([u8; 32], [u8; 32]) {

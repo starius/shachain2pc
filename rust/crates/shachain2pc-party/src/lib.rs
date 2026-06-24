@@ -575,18 +575,59 @@ pub async fn reveal_node_fast_job(
     reveal_node_fast_over_streams(&mut streams, endpoint.role, &reveal, delta).await
 }
 
+#[derive(Clone, Debug)]
+pub struct RevealNodeShare {
+    pub share_bits: Vec<u8>,
+    pub mac_digest: [u8; HASH_DIGEST_BYTES],
+}
+
+#[derive(Clone, Debug)]
+pub struct RevealNodeOpen {
+    pub bits: Vec<u8>,
+    pub value: Value32,
+}
+
+pub fn reveal_node_local_share(node: &Ag2pcSecureWires) -> Result<RevealNodeShare, PartyError> {
+    if node.wire_bundle.len() != node.len() {
+        return Err(CompatError::BadAg2pcInputShape.into());
+    }
+    let local = reveal_local_share(&node.wire_bundle);
+    Ok(RevealNodeShare {
+        share_bits: local.share_bits,
+        mac_digest: local.mac_digest,
+    })
+}
+
+pub fn reveal_node_from_peer_share(
+    node: &Ag2pcSecureWires,
+    delta: Block,
+    peer_share_bits: &[u8],
+    peer_mac_digest: [u8; HASH_DIGEST_BYTES],
+) -> Result<RevealNodeOpen, PartyError> {
+    if node.wire_bundle.len() != node.len() {
+        return Err(CompatError::BadAg2pcInputShape.into());
+    }
+    let bits = reveal_recipient_bits(
+        &node.lambda,
+        &node.wire_bundle,
+        peer_share_bits,
+        peer_mac_digest,
+        delta,
+    )
+    .map_err(map_reveal_error_for_party)?;
+    let value = value_from_bits(&bits)?;
+    Ok(RevealNodeOpen { bits, value })
+}
+
 async fn reveal_node_fast_over_streams<S: TranscriptIo>(
     streams: &mut Ag2pcStreams<S>,
     role: Role,
     wires: &Ag2pcSecureWires,
     delta: Block,
 ) -> Result<Value32, PartyError> {
-    if wires.wire_bundle.len() != wires.len() {
-        return Err(CompatError::BadAg2pcInputShape.into());
-    }
     match role {
         Role::Alice => {
-            let local = reveal_local_share(&wires.wire_bundle);
+            let local = reveal_node_local_share(wires)?;
             streams.main.send_data(&local.share_bits).await?;
             streams.main.send_data(&local.mac_digest).await?;
             streams.main.flush().await?;
@@ -607,17 +648,10 @@ async fn reveal_node_fast_over_streams<S: TranscriptIo>(
                 .await?
                 .try_into()
                 .expect("digest length");
-            let bits = reveal_recipient_bits(
-                &wires.lambda,
-                &wires.wire_bundle,
-                &peer_share,
-                peer_digest,
-                delta,
-            )
-            .map_err(map_reveal_error_for_party)?;
-            streams.main.send_data(&bits).await?;
+            let opened = reveal_node_from_peer_share(wires, delta, &peer_share, peer_digest)?;
+            streams.main.send_data(&opened.bits).await?;
             streams.main.flush().await?;
-            value_from_bits(&bits)
+            Ok(opened.value)
         }
     }
 }

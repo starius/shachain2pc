@@ -644,16 +644,20 @@ frames.
     persistence, and safe idle COT-leftover trimming are implemented;
   - update daemon RAM constants from the benchmark calibration sequence.
 - Cached reveal latency:
-  - persisted daemon cached reveals now use a lightweight fixed-Delta MAC-open
-    path instead of fresh AG2PC setup;
+  - nonzero persisted daemon cached reveals now use peer gRPC `RevealCached`
+    with two-sided local authorization and fixed-Delta MAC-open shares instead
+    of fresh AG2PC setup;
   - persisted `lambda` and MAC/key bundles remain required DB material for
     restart reveal;
-  - keep EMP/TCP reveal fallback for compatibility until daemon reveal is fully
-    tested.
+  - `I=0` seed reveal and full-derivation fallback remain on the legacy
+    one-shot transport;
+  - revealed frontier nodes are removed after their clear secret is stored.
 - Integration and benchmark expansion:
   - malicious/tamper daemon-boundary tests;
   - peer restart/reconnect tests;
-  - run and record the ignored 100-channel and 1000-channel benchmark harnesses.
+  - run and record the ignored 1000-channel benchmark harness;
+  - add isolated reveal-only and parallel reveal benchmarks, because the current
+    100-channel good-case benchmark includes scheduler refill contention.
 - Production hardening:
   - schema migrations;
   - metrics endpoint;

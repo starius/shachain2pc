@@ -1,4 +1,6 @@
-use shachain2pc_daemon::{channel_seed_share, reference_for_channel};
+use shachain2pc_daemon::pb::control_service_client::ControlServiceClient;
+use shachain2pc_daemon::pb::{RevealRequest, RevealResponse};
+use shachain2pc_daemon::{channel_seed_share, read_control_file, reference_for_channel};
 use shachain2pc_types::Index48;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -8,6 +10,9 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
+use tonic::Request;
 
 const MASTER_A: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const MASTER_B: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
@@ -50,21 +55,22 @@ async fn daemon_bench_100_channels_good_case() {
     let alice_idle_after_precompute = pair.alice.vm_rss_bytes().unwrap_or(0);
     let bob_idle_after_precompute = pair.bob.vm_rss_bytes().unwrap_or(0);
 
+    let mut alice_control = ControlHarnessClient::connect(&pair.alice_control).await;
+    let mut bob_control = ControlHarnessClient::connect(&pair.bob_control).await;
     let mut reveal_latencies = Vec::with_capacity(channels.len());
     for channel in &channels {
-        let channel_s = channel.to_string();
         let reveal_start = Instant::now();
-        let alice_args = ["reveal", channel_s.as_str(), "1", "1"];
-        let bob_args = ["reveal", channel_s.as_str(), "1", "1"];
         let (alice, bob) = tokio::join!(
-            pair.cli(&pair.alice_control, &alice_args),
-            pair.cli(&pair.bob_control, &bob_args)
+            alice_control.reveal(*channel, 1, 1, false),
+            bob_control.reveal(*channel, 1, 1, false)
         );
-        assert_eq!(parse_result(&alice), parse_result(&bob));
-        assert_eq!(parse_cache(&alice), Some(true));
-        assert_eq!(parse_cache(&bob), Some(true));
+        assert_eq!(alice.secret_hex, bob.secret_hex);
+        assert!(alice.from_cache);
+        assert!(bob.from_cache);
         reveal_latencies.push(reveal_start.elapsed().as_millis() as u64);
     }
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
     let alice_idle_after_reveals = pair.alice.vm_rss_bytes().unwrap_or(0);
     let bob_idle_after_reveals = pair.bob.vm_rss_bytes().unwrap_or(0);
 
@@ -476,6 +482,17 @@ async fn daemon_pair_peer_mtls_precompute_jobstream() {
         .await;
     assert!(out.contains("nodes=1"), "{out}");
     assert!(out.contains("checked=1"), "{out}");
+
+    let expected =
+        reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 24, Index48::new(1).unwrap());
+    let (alice, bob) = tokio::join!(
+        pair.cli(&pair.alice_control, &["reveal", "24", "1", "1"]),
+        pair.cli(&pair.bob_control, &["reveal", "24", "1", "1"])
+    );
+    assert_eq!(parse_result(&alice), expected.to_hex());
+    assert_eq!(parse_result(&bob), expected.to_hex());
+    assert_eq!(parse_cache(&alice), Some(true));
+    assert_eq!(parse_cache(&bob), Some(true));
     pair.stop().await;
 }
 
@@ -745,6 +762,41 @@ struct DaemonPair {
     alice_control: PathBuf,
     bob_control: PathBuf,
     ports: Ports,
+}
+
+struct ControlHarnessClient {
+    client: ControlServiceClient<Channel>,
+    cookie: String,
+}
+
+impl ControlHarnessClient {
+    async fn connect(control: &Path) -> Self {
+        let (addr, cookie) = read_control_file(control).unwrap();
+        let client = ControlServiceClient::connect(addr).await.unwrap();
+        Self { client, cookie }
+    }
+
+    async fn reveal(
+        &mut self,
+        channel_index: u64,
+        requested_index: u64,
+        expected_next_index: u64,
+        allow_seed_reveal: bool,
+    ) -> RevealResponse {
+        self.client
+            .reveal(with_cookie(
+                RevealRequest {
+                    channel_index,
+                    requested_index,
+                    expected_next_index,
+                    allow_seed_reveal,
+                },
+                &self.cookie,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+    }
 }
 
 struct ChildGuard {
@@ -1132,6 +1184,13 @@ fn parse_cache(output: &str) -> Option<bool> {
         "CACHE false" => Some(false),
         _ => None,
     })
+}
+
+fn with_cookie<T>(message: T, cookie: &str) -> Request<T> {
+    let mut req = Request::new(message);
+    let value = MetadataValue::try_from(cookie).unwrap();
+    req.metadata_mut().insert("x-shachain-cookie", value);
+    req
 }
 
 fn status_field(output: &str, key: &str) -> Option<u64> {

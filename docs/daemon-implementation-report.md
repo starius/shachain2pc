@@ -52,7 +52,7 @@ with the real CLI. It verifies:
   intermediate authenticated nodes are not written as durable frontier state.
 - live-session reuse across adjacent targets (`2` then `3`), proving the second
   target costs one H rather than re-deriving the two-H path.
-- peer mTLS JobStream precompute.
+- peer mTLS JobStream precompute and cached reveal.
 
 ## Frontier State
 
@@ -82,10 +82,19 @@ A later daemon process can reveal an exact persisted node because public reveal
 checks only the MAC/lambda authenticated value and does not need session-local
 labels.
 
-Cached daemon reveal now uses a lightweight fixed-Delta MAC-open over the
-persisted `lambda + wire_bundle` material. This keeps the existing two-sided
-reveal rendezvous and IT-MAC correct-or-abort check, but skips the fresh AG2PC
-session setup that dominated cached-reveal latency.
+Cached daemon reveal for nonzero persisted leaves now uses a peer gRPC
+`RevealCached` RPC. Alice sends her local MAC-open share; Bob's peer handler
+waits for Bob's matching local reveal authorization, verifies Alice's share
+against Bob's persisted `lambda + wire_bundle` material and fixed channel
+Delta, returns Bob's MAC-open share, and both daemons store the same opened
+secret. This keeps the two-sided reveal rendezvous and makes both parties
+verify the persisted authenticated material. The explicit `I=0` seed-reveal
+path remains on the legacy one-shot reveal transport.
+
+After a secret is revealed and inserted into the durable shachain store, the
+exact persisted frontier node for that index is removed. The authenticated node
+is no longer needed once its clear secret is known, and dropping it keeps the DB
+and future encrypted rewrites compact.
 
 Precompute reserves checked-unit budget before starting MPC. A request that
 would exceed the configured fixed-Delta lifetime cap is refused before the
@@ -152,7 +161,7 @@ mismatched authenticated value ever reaches reveal.
   immutable job context at the runner layer, then returns the same byte streams
   to the existing AG2PC implementation.
 - The daemon no longer uses `mpc_port + 1 + n` worker ports. The configured
-  `mpc_port` remains for the existing one-shot reveal/full-derivation paths and
-  for the legacy C++-compatible `party` transport.
+  `mpc_port` remains for the explicit seed reveal path, full-derivation
+  fallback, and the legacy C++-compatible `party` transport.
 - The local API currently uses loopback TCP plus a cookie. Peer API mTLS is
   available for daemon-to-daemon gRPC and is covered by integration tests.

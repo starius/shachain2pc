@@ -405,6 +405,7 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
                 .session
                 .run_program(&mut self.streams, &root_program, &self.seed_inputs)
                 .await?;
+            self.session.trim_idle_allocations();
             root.strip_labels_for_reveal();
             return Ok(root);
         }
@@ -443,6 +444,7 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
             }
         }
         prune_cache_for_target(&mut self.cache, target);
+        self.session.trim_idle_allocations();
 
         let mut persisted = carried;
         persisted.strip_labels_for_reveal();

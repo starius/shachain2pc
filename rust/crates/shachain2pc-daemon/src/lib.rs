@@ -16,7 +16,7 @@ use shachain2pc_mpc_runner::{
     run_session_handshake, ByteFrameTransport, RunnerSessionParams, TransportPair,
 };
 use shachain2pc_party::{
-    reveal_node_job, run_party, run_seed_root_job_with_circuit, Args as PartyArgs, IndexSpec,
+    reveal_node_fast_job, run_party, run_seed_root_job_with_circuit, Args as PartyArgs, IndexSpec,
     MpcTcpEndpoint, PartyOutput, PrecomputeSession,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
@@ -1500,7 +1500,7 @@ impl DaemonState {
             index.get(),
             ssp as u32,
         );
-        reveal_node_job(endpoint, node, delta, digest, ssp)
+        reveal_node_fast_job(endpoint, node, delta, digest)
             .await
             .map_err(Into::into)
     }

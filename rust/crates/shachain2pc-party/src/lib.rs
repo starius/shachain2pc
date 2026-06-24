@@ -4,8 +4,11 @@ use shachain2pc_circuit::{
     sha256_compress_gadget, split_chain_bits, tree_digest, Circuit, GateType, CACHE_TILE_HEIGHT,
     CACHE_TILE_LEAVES,
 };
-use shachain2pc_emp_compat::{Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError};
-use shachain2pc_emp_wire::{Ag2pcStreams, EmpStream, TranscriptIo, WireError};
+use shachain2pc_emp_compat::{
+    Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError, HASH_DIGEST_BYTES,
+};
+use shachain2pc_emp_wire::{Ag2pcStreams, Block, EmpStream, TranscriptIo, WireError};
+use shachain2pc_mpc_core::{reveal_local_share, reveal_recipient_bits, RevealError};
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -538,7 +541,7 @@ pub async fn run_precompute_path_with_streams_and_circuit<S: TranscriptIo>(
 pub async fn reveal_node_job(
     endpoint: MpcTcpEndpoint,
     node: &Ag2pcSecureWires,
-    delta: shachain2pc_emp_wire::Block,
+    delta: Block,
     digest: [u8; 32],
     ssp: usize,
 ) -> Result<Value32, PartyError> {
@@ -554,6 +557,76 @@ pub async fn reveal_node_job(
     session.end(&mut streams).await?;
     streams.main.flush().await?;
     value_from_bits(&bits)
+}
+
+pub async fn reveal_node_fast_job(
+    endpoint: MpcTcpEndpoint,
+    node: &Ag2pcSecureWires,
+    delta: Block,
+    digest: [u8; 32],
+) -> Result<Value32, PartyError> {
+    let mut streams =
+        open_ag2pc_streams_after_digest(endpoint.role, endpoint.port, endpoint.peer_ip, digest)
+            .await?;
+    let mut reveal = node.clone();
+    reveal.strip_labels_for_reveal();
+    reveal_node_fast_over_streams(&mut streams, endpoint.role, &reveal, delta).await
+}
+
+async fn reveal_node_fast_over_streams<S: TranscriptIo>(
+    streams: &mut Ag2pcStreams<S>,
+    role: Role,
+    wires: &Ag2pcSecureWires,
+    delta: Block,
+) -> Result<Value32, PartyError> {
+    if wires.wire_bundle.len() != wires.len() {
+        return Err(CompatError::BadAg2pcInputShape.into());
+    }
+    match role {
+        Role::Alice => {
+            let local = reveal_local_share(&wires.wire_bundle);
+            streams.main.send_data(&local.share_bits).await?;
+            streams.main.send_data(&local.mac_digest).await?;
+            streams.main.flush().await?;
+            let bits = streams
+                .main
+                .recv_data(wires.len())
+                .await?
+                .into_iter()
+                .map(|bit| bit & 1)
+                .collect::<Vec<_>>();
+            value_from_bits(&bits)
+        }
+        Role::Bob => {
+            let peer_share = streams.main.recv_data(wires.len()).await?;
+            let peer_digest: [u8; HASH_DIGEST_BYTES] = streams
+                .main
+                .recv_data(HASH_DIGEST_BYTES)
+                .await?
+                .try_into()
+                .expect("digest length");
+            let bits = reveal_recipient_bits(
+                &wires.lambda,
+                &wires.wire_bundle,
+                &peer_share,
+                peer_digest,
+                delta,
+            )
+            .map_err(map_reveal_error_for_party)?;
+            streams.main.send_data(&bits).await?;
+            streams.main.flush().await?;
+            value_from_bits(&bits)
+        }
+    }
+}
+
+fn map_reveal_error_for_party(error: RevealError) -> PartyError {
+    match error {
+        RevealError::MacDigestMismatch => CompatError::FeqMismatch.into(),
+        RevealError::BadWireShape { .. } | RevealError::PeerShareLength { .. } => {
+            CompatError::BadAg2pcInputShape.into()
+        }
+    }
 }
 
 async fn run_derivation_batch(

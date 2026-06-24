@@ -9,6 +9,7 @@ publish.workspace = true
 shachain2pc-circuit = { path = "../shachain2pc-circuit" }
 shachain2pc-emp-compat = { path = "../shachain2pc-emp-compat" }
 shachain2pc-emp-wire = { path = "../shachain2pc-emp-wire" }
+shachain2pc-mpc-core = { path = "../shachain2pc-mpc-core" }
 shachain2pc-types = { path = "../shachain2pc-types" }
 tokio = { workspace = true, features = [
     "macros",

@@ -1217,6 +1217,7 @@ dependencies = [
  "shachain2pc-circuit",
  "shachain2pc-emp-compat",
  "shachain2pc-emp-wire",
+ "shachain2pc-mpc-core",
  "shachain2pc-types",
  "tokio",
  "zeroize",

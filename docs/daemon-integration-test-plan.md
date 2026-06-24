@@ -54,6 +54,200 @@ Fault hooks must be explicit, single-purpose, and disabled in normal builds.
 They should produce deterministic aborts and must never emit a `RESULT` or
 commit a forged frontier node.
 
+## Benchmark Harness
+
+Add a separate daemon benchmark harness, not a default unit test. It should be
+easy to run in CI or by hand, but it must not make normal `cargo test`
+unpredictable. Prefer one of:
+
+- an ignored integration test:
+  `cargo test -p shachain2pc-daemon --test daemon_bench -- --ignored`;
+- or a small benchmark binary:
+  `cargo run -p shachain2pc-daemon --bin daemon-bench -- ...`.
+
+The benchmark should emit machine-readable JSON plus a concise text summary.
+Do not hardcode pass/fail timing thresholds unless an environment variable asks
+for regression gating.
+
+### Metrics
+
+Record per daemon and for the pair:
+
+- wall-clock setup time;
+- precompute fill time;
+- good-case throughput:
+  `precompute_wall_seconds / committed_secret_count`;
+- reveal latency for cached persisted leaves:
+  p50, p95, p99, max, and per-secret average;
+- reveal latency after restart, proving durable leaves are still fast;
+- fallback reveal latency for one non-precomputed secret;
+- peak RSS per node using `/proc/<pid>/status` `VmHWM` where available;
+- sampled current RSS over time using `/proc/<pid>/status` `VmRSS`;
+- optional process CPU time from `/proc/<pid>/stat`, reported separately from
+  wall time;
+- number of active jobs, live sessions, frontier nodes, known secrets, and
+  checked units at the start and end.
+
+Memory reporting should include:
+
+```text
+idle_rss_mb
+peak_rss_mb
+peak_minus_idle_mb
+peak_per_active_worker_mb = (peak - idle) / max(observed_active_jobs, 1)
+peak_per_live_channel_mb = (peak - idle) / enabled_channel_count
+```
+
+The benchmark must sample both daemons and report the max and sum. A one-node
+peak can hide asymmetric behavior, especially during reveal/fallback.
+
+### Main 100-Channel Scenario
+
+`daemon_bench_100_channels_good_case`:
+
+1. Start two real daemons in release mode.
+2. Configure peer mTLS.
+3. Set a chosen worker count, for example `workers=4`.
+4. Enable 100 channels on both peers.
+5. Set a precompute target, initially `1` for all channels.
+6. Wait for all 100 target leaves to be committed on both peers.
+7. Reveal all 100 precomputed secrets sequentially, using the required
+   `expected_next_index` value for each channel.
+8. Restart both daemons.
+9. Reveal the same or locally derivable older secrets again, proving durable
+   known-secret/cache behavior.
+10. Print JSON and text summary.
+
+Primary headline numbers:
+
+```text
+precompute_seconds_per_secret
+cached_reveal_latency_p50_ms
+cached_reveal_latency_p95_ms
+cached_reveal_latency_p99_ms
+peak_rss_mb_per_node
+peak_rss_mb_pair_sum
+```
+
+The first target on each channel pays session setup and seed authentication. A
+second benchmark should precompute `I=2` then `I=3` across the same 100
+channels to measure warm in-session incremental throughput separately:
+
+```text
+cold_precompute_seconds_per_secret = I=2 fill / 100
+warm_precompute_seconds_per_secret = I=3 fill / 100
+```
+
+The warm number is the one that best reflects the current live-session
+optimization.
+
+### Budget Stress Scenarios
+
+`daemon_bench_100_channels_workers_1`:
+
+- Same as the main scenario with `workers=1`.
+- Confirms bounded concurrency and establishes the low-memory baseline.
+
+`daemon_bench_100_channels_workers_8`:
+
+- Same as the main scenario with higher workers.
+- Shows scaling, RSS growth, and whether gRPC/CPU becomes the bottleneck.
+
+`daemon_bench_100_channels_low_ram_refusal`:
+
+- Configure `max_ram_mb` below the estimated need.
+- Expected future behavior: precompute refuses or queues rather than exceeding
+  the configured RAM budget.
+- Current expected behavior: this test should be marked `expected_fail` or
+  documented as pending until RAM reservation is implemented, because
+  `max_ram_bytes` is currently not enforced.
+
+### Reveal Benchmarks
+
+`daemon_bench_reveal_cached_vs_fallback`:
+
+- Precompute and reveal one cached target.
+- Reveal one non-precomputed target through the full fallback.
+- Report both latencies separately.
+
+Cached reveal should be the operational fast path. Fallback reveal remains
+correct but is not the expected steady-state path.
+
+### Output Format
+
+Example JSON shape:
+
+```json
+{
+  "channels": 100,
+  "workers": 4,
+  "precompute_target": 1,
+  "precompute": {
+    "committed": 100,
+    "wall_ms": 12345,
+    "ms_per_secret": 123.45
+  },
+  "cached_reveal": {
+    "count": 100,
+    "p50_ms": 12.3,
+    "p95_ms": 18.9,
+    "p99_ms": 21.0,
+    "max_ms": 22.4
+  },
+  "rss": {
+    "alice_peak_mb": 0,
+    "bob_peak_mb": 0,
+    "pair_peak_sum_mb": 0
+  }
+}
+```
+
+## Resource Budget Status
+
+Current implementation status:
+
+- Worker budget: implemented for precompute. Outgoing jobs use
+  `min(local_workers, peer_workers)`, incoming jobs enforce the receiver's local
+  `workers`, and active jobs are tracked so concurrent precompute cannot exceed
+  the shared worker limit.
+- Delta lifetime checked-unit cap: implemented for precompute reservation and
+  accounting.
+- Precompute target budget: implemented as `min(local channel target, local
+  daemon target, peer daemon target)`.
+- CPU budget: approximated only by the `workers` concurrency limit. There is no
+  OS-level CPU quota or CPU-time admission control.
+- RAM budget: not implemented yet. `max_ram_bytes` is parsed, configurable, and
+  reported by status/config, but it is not used to reserve memory or refuse
+  precompute. This is the main resource-control gap for 100-channel testing.
+
+Before treating the daemon as resource-safe under large channel counts, add RAM
+reservation:
+
+```text
+estimated_job_rss = configured_or_measured_one_h_rss
+estimated_idle_session_rss = configured_or_measured_live_session_rss
+reserved_ram =
+    active_jobs * estimated_job_rss +
+    live_idle_sessions * estimated_idle_session_rss
+```
+
+Precompute should start only when:
+
+```text
+reserved_ram + estimated_job_rss <= min(local_max_ram, peer_max_ram)
+```
+
+The first implementation can be conservative and static, for example:
+
+```text
+one_h_rss_estimate_mb = 32
+idle_session_rss_estimate_mb = 1
+```
+
+Then the benchmark should replace guesses with observed p95/peak values. The
+daemon should expose reserved RAM and observed peak RSS in `status` or a metrics
+endpoint before the benchmark becomes a regression gate.
+
 ## Restart And Liveness Tests
 
 ### `daemon_pair_peer_restart_reconnects_shared_channel`

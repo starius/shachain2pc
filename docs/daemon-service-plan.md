@@ -1,9 +1,10 @@
 # Daemon Service Plan
 
-Status: planning document for the next large implementation phase. This plan is
-for review before coding. The goal is to turn the optimized Rust implementation
-into a long-running two-party service with local control APIs, durable cache
-state, background precomputation, and sequential reveal.
+Status: implemented design record. This document began as the daemon plan; the
+daemon, CLI, peer gRPC/JobStream transport, mTLS, live per-channel sessions,
+durable reveal leaves, and RAM-aware worker gate have since landed. Remaining
+benchmark and RAM-optimization work is tracked in
+`docs/daemon-integration-test-plan.md`.
 
 This document intentionally starts from the current optimized Rust/AG2PC code and
 does not include the abandoned experimental windowing work.
@@ -194,16 +195,18 @@ to:
 - security parameter and lifetime cap.
 
 On restart, the daemon re-derives the local Delta from the master secret and can
-resume from persisted authenticated nodes whose bindings still match. If either
-party lacks a node, or if the bindings disagree, both parties discard that node
-and its descendants and jointly recompute from the deepest common authenticated
-ancestor. If no authenticated ancestor is common, they recompute from the channel
-seed share.
+reveal exact persisted nodes whose bindings still match on both peers. It does
+not use those persisted nodes as parents for further H computation, because
+session-local labels and one-time preprocessing are deliberately not persisted.
+Extending the frontier after restart starts a fresh live session and re-warms
+from the channel seed share. If either party lacks an exact target leaf, or if
+the bindings disagree, both parties discard that leaf and recompute it jointly.
 
-Persisting the frontier is also good for the Delta lifetime budget: a normal
-restart resumes existing authenticated nodes and does not spend new checked
-units. Only DB loss, DB rollback, binding mismatch, or peer asymmetry forces
-rewarm work that consumes more checked units under the same Delta.
+Persisting exact target leaves is still good for the Delta lifetime budget: a
+normal restart can reveal existing precomputed leaves without spending new
+checked units. DB loss, DB rollback, binding mismatch, peer asymmetry, or
+post-restart extension forces rewarm work that consumes more checked units under
+the same Delta.
 
 Both parties must agree on the public security parameters for a channel,
 including `ssp_target`, `ssp_effective`, and
@@ -276,11 +279,13 @@ Known secrets can answer older derivable reveals in their own subtree, but they
 cannot rebuild the upstream trunk or authenticated frontier because shachain `H`
 is one-way.
 
-`frontier_nodes` stores unrevealed authenticated nodes encrypted under `db_key`.
-The plaintext is never a clear shachain secret; it is the local authenticated
-MPC representation required to continue computing from that node under the fixed
-per-channel Delta. Every node carries a binding digest. Binding mismatch means
-drop and recompute, not best-effort repair.
+`frontier_nodes` stores exact requested unrevealed target leaves encrypted under
+`db_key`. The plaintext is never a clear shachain secret; it is the local
+authenticated MPC representation needed to reveal that exact target later under
+the fixed per-channel Delta. Persisted nodes are not used as computation parents
+after restart because they do not contain session-local labels. Every node
+carries a binding digest. Binding mismatch means drop and recompute, not
+best-effort repair.
 
 `delta_budget_monitor` is a best-effort operational counter. It helps detect
 abnormal repeated recomputation under the same channel Delta, but it is not
@@ -293,8 +298,8 @@ or from the channel seed share.
 
 ## Refactor Prerequisite: Embeddable MPC Jobs
 
-The current `party` binary is a command-oriented protocol runner. The daemon
-needs an embeddable library with explicit job boundaries.
+The original `party` binary was a command-oriented protocol runner. The daemon
+now uses embeddable library APIs with explicit job boundaries.
 
 Refactor targets:
 
@@ -306,7 +311,7 @@ shachain2pc-mpc
   AG2PC session API, input authentication, run one H application, reveal API
 
 shachain2pc-transport
-  transport trait implemented by TCP today and gRPC streams later
+  transport traits implemented by EMP/TCP and daemon gRPC JobStream
 
 shachain2pc-daemon
   scheduler, DB, local gRPC, peer gRPC, channel lifecycle
@@ -315,7 +320,7 @@ shachain2pc-cli
   local control client
 ```
 
-The first embeddable API should be narrow:
+The embeddable API remains intentionally narrow:
 
 ```rust
 trait MpcTransport {
@@ -343,13 +348,13 @@ async fn run_one_hash(
 ```
 
 The job is serializable at the boundary: before it starts and after it commits.
-Mid-MPC pause/resume is explicitly deferred. Eviction cancels only the currently
-running `H`; already committed unrevealed parents remain in the encrypted
-frontier, and revealed parents remain in the DB.
+Mid-MPC pause/resume remains explicitly deferred. Eviction cancels only the
+currently running `H`; committed unrevealed target leaves remain in the
+encrypted frontier, and revealed secrets remain in the DB.
 
 This satisfies the user-facing requirement of pausable/resumable work at the
 cache level without pretending that the internal AG2PC transcript can be safely
-snapshotted yet.
+snapshotted.
 
 ## gRPC Surfaces
 
@@ -501,11 +506,11 @@ Eviction rules:
   leaves remain persisted in the encrypted frontier. Session-local
   trunk/intermediate nodes stay in RAM only.
 - Cancelled jobs are safe to reschedule.
-- If local and peer authenticated frontier state disagrees, both parties choose
-  the deepest common authenticated ancestor with matching bindings and jointly
-  recompute from there. If no authenticated ancestor is common, they recompute
-  from the channel seed share. Revealed leaves are still useful for local older
-  reveals, but they generally do not reconstruct upstream frontier state.
+- If local and peer durable target-leaf state disagrees, both parties drop the
+  asymmetric leaf before recomputing it jointly. After restart or session
+  teardown, recomputation starts from the channel seed share rather than from a
+  persisted authenticated parent. Revealed leaves are still useful for local
+  older reveals, but they generally do not reconstruct upstream frontier state.
 
 Planning loop:
 
@@ -520,18 +525,27 @@ Planning loop:
    commit any revealed outputs transactionally to DB.
 8. Re-plan after each commit, cancel, config update, or reveal request.
 
-RAM accounting starts conservative:
+RAM accounting is implemented as an idle-session-aware worker gate:
 
 ```text
-one_hash_ram_estimate = measured_peak_for_one_H + safety_margin
-job_ram = daemon_baseline_rss + active_workers * one_hash_ram_estimate
+admission_floor =
+    max(modeled_baseline_plus_idle_sessions,
+        current_rss_minus_active_worker_estimate)
+
+worker_budget = max_ram_bytes - admission_floor
+effective_workers =
+    min(configured_workers,
+        max(floor(worker_budget / one_h_worker_peak_estimate), 1))
 ```
 
-Initial sizing should use the current measurements as a starting point:
-approximately 10 MB live heap and 26 MB RSS per concurrent one-H job, plus daemon
-baseline RSS and a safety margin. Then refine with measured per-job telemetry.
-The daemon should expose current RSS, estimated reserved RAM, and peak observed
-RAM.
+If the raw RAM-derived count is zero, the daemon still exposes one effective
+worker and reports an overcommit warning. This keeps urgent work live while
+making the configured RAM violation visible.
+
+The current constants are intentionally conservative daemon-level estimates.
+They must be recalibrated from daemon benchmarks, not library-only party runs.
+`docs/daemon-integration-test-plan.md` records the active calibration and RAM
+optimization plan, including the known per-channel duplicate-circuit issue.
 
 ## Cache Algorithm, Version 1
 
@@ -599,115 +613,46 @@ Expose:
 Logs must never include secrets, DB keys, authenticated wire values, or raw MPC
 frames.
 
-## Implementation Phases
+## Implemented Milestones
 
-### Phase 0: Freeze The Embedding Boundary
+- Reusable party library and embeddable one-H/reveal helpers.
+- Peer and local gRPC APIs plus CLI.
+- Cookie-authenticated local loopback control.
+- Peer gRPC with optional mutual TLS.
+- One shared tonic peer channel, with per-job `main` and `sibling` JobStreams.
+- Live per-channel precompute sessions that reuse labeled in-memory frontier
+  nodes while both daemons stay up.
+- Target-only durable frontier persistence. Trunk/intermediate labels stay in
+  RAM and are discarded on restart.
+- Mandatory `expected_next_index` reveal gate.
+- Background precompute, manual precompute, and sequential reveal.
+- Fixed per-channel Delta, checked-unit cap, and monitoring counters.
+- RAM-aware effective worker gate.
+- Disable handling that frees live channel state.
+- Integration coverage for restart, rollback repair, mTLS happy path, live
+  session reuse, RAM warnings, and target-only persistence.
 
-- Move reusable party logic out of `shachain2pc-party` into library crates.
-- Define `MpcTransport`.
-- Keep the existing CLI behavior working through the new library API.
-- Add tests proving current single, chunked, tree/cache modes still match
-  `ref_cli`.
+## Remaining Work
 
-Review gate: no daemon yet; only refactor and unchanged behavior.
-
-### Phase 1: One-H Job API
-
-- Implement `run_one_hash` over the existing AG2PC session.
-- Represent authenticated values as serializable owned structs.
-- Make the local Delta an explicit session input so the same channel Delta can
-  be reused after daemon restart while all other MPC randomness stays fresh.
-- Add deterministic job descriptors and transcript digests.
-- Add cancellation at job boundaries.
-- Add tests for one-H correctness, abort, and recomputation from parent.
-
-Review gate: one-H jobs are embeddable and serializable at boundaries, and a
-persisted authenticated parent can be loaded into a fresh session with the same
-local Delta and fresh preprocessing randomness.
-
-### Phase 2: Encrypted DB And Shachain Store
-
-- Add encrypted DB setup and key derivation.
-- Add channel records.
-- Add known-secret shachain insertion/derivation.
-- Add fixed-Delta derivation and security-budget sizing.
-- Add authenticated frontier node serialization, encryption, and binding
-  validation.
-- Add exact checked-unit accounting for the configured
-  `delta_lifetime_checked_units_cap`.
-- Add crash/reopen tests.
-- Add DB deletion/rollback recomputation tests.
-
-Review gate: DB is droppable for correctness, encrypted frontier survives normal
-restart, revealed-secret storage is consistent with shachain rules, and reveal
-APIs require caller-supplied expected indices.
-
-### Phase 3: Local Daemon And CLI API
-
-- Add `shachain-daemon` process with local gRPC.
-- Add `shachain-cli`.
-- Add local loopback TLS certificate generation and cookie authentication.
-- Implement status, config set, channel enable/disable, list channels/jobs.
-- Keep peer/MPC mocked or in-process for this phase.
-
-Review gate: local control plane is stable before peer networking.
-
-### Phase 4: Peer gRPC And Budget Exchange
-
-- Add peer identity/configuration.
-- Add peer `Hello`, config stream, and job stream.
-- Use mTLS or pinned certificates on both client and server sides.
-- Negotiate min RAM, workers, and precompute target.
-- Agree on public channel security parameters, including `ssp_target` and
-  `delta_lifetime_checked_units_cap`.
-- Add disconnect/reconnect behavior.
-
-Review gate: two daemons can agree on config and reject mismatched job
-descriptors.
-
-### Phase 5: Scheduler And Background Precompute
-
-- Implement priority queue.
-- Implement RAM/worker budget reservation.
-- Implement eviction/cancellation of background jobs.
-- Implement cache-aware planning from the live session cache and the common
-  durable target-leaf subset.
-- Implement fixed-Delta checked-unit monitoring and alerts.
-- Start background precompute after both parties enable a channel.
-
-Review gate: background jobs fill cache under budgets and survive cancellation.
-
-### Phase 6: Sequential Reveal
-
-- Implement foreground reveal.
-- Enforce sequential reveal with expected index.
-- Use local derivation for older secrets derivable from known later secrets.
-- Persist revealed secrets with shachain rules.
-- Add tests for both parties printing the same secret.
-
-Review gate: reveal correctness and no-output-on-abort.
-
-### Phase 7: Integration And Fault Tests
-
-- Two-daemon end-to-end tests.
-- DB delete/rollback tests.
-- Peer restart tests.
-- Budget shrink/grow tests.
-- Disable/re-enable tests.
-- Evict-under-load tests.
-- Reveal-while-background-precompute tests.
-- Tamper/abort tests for foreground and background jobs.
-
-Review gate: daemon is usable as a PoC service.
-
-### Phase 8: Hardening
-
-- Stronger local API hardening beyond the v1 loopback certificate and cookie.
-- Production-quality secret input and memory handling.
-- Schema migrations.
-- Metrics endpoint.
-- Backup/restore guidance.
-- Human security review.
+- RAM optimization and calibration:
+  - share one parsed SHA circuit across live sessions;
+  - prune any non-reusable live cache entries;
+  - trim safe idle AG2PC buffers after measuring;
+  - update daemon RAM constants from the benchmark calibration sequence.
+- Cached reveal latency:
+  - avoid fresh AG2PC setup for daemon cached reveals when a live session or a
+    lightweight MAC-open path can serve the request;
+  - keep EMP/TCP reveal fallback for compatibility until daemon reveal is fully
+    tested.
+- Integration and benchmark expansion:
+  - malicious/tamper daemon-boundary tests;
+  - peer restart/reconnect tests;
+  - 100-channel and 1000-channel RAM/throughput benchmarks.
+- Production hardening:
+  - schema migrations;
+  - metrics endpoint;
+  - backup/restore guidance;
+  - human daemon/security review before funds-facing use.
 
 ## Main Risks
 
@@ -737,15 +682,3 @@ Review gate: daemon is usable as a PoC service.
 9. **Peer-budget griefing.** A peer can reduce liveness by advertising tiny
    RAM, worker, or precompute budgets. This should produce clear status and
    alerts, not silent stalls.
-
-## First Concrete Step After Review
-
-Start with Phase 0 and Phase 1 together:
-
-1. Extract current party derivation logic into library APIs.
-2. Define the transport trait.
-3. Implement one-H authenticated job execution over the existing TCP transport.
-4. Keep the current `party` binary as a thin compatibility wrapper.
-
-This gives the daemon project a stable embeddable core before adding DB, gRPC,
-or scheduling complexity.

@@ -50,6 +50,14 @@ Add reusable harness helpers before adding many scenarios:
   - corrupt next persisted frontier record before save;
   - close the process after accepting a JobStream but before committing output.
 
+The harness must be panic-safe. `DaemonPair` and every per-side process handle
+must own child processes through a `Drop` guard that kills and reaps them on any
+exit path, including failed assertions and test panics. Restart helpers should
+replace the guarded child handle atomically only after the old child is dead.
+This is required before adding restart, rollback, benchmark, or fault-injection
+tests: leaked daemons consume ports, skew CPU/RSS measurements, and make later
+tests nondeterministic.
+
 Fault hooks must be explicit, single-purpose, and disabled in normal builds.
 They should produce deterministic aborts and must never emit a `RESULT` or
 commit a forged frontier node.
@@ -356,6 +364,19 @@ The RAM cap should primarily reduce active worker count. If a deployment sets
 surface the condition explicitly instead of silently dropping reusable session
 state.
 
+This is a deliberate "all enabled sessions resident" policy:
+
+```text
+ram_floor ~= baseline_daemon_rss +
+             enabled_live_channels * idle_session_rss_estimate
+```
+
+Operators must size `max_ram_bytes` for the enabled-channel set, not only for
+currently active jobs. A future LRU policy could evict enabled-but-idle sessions
+and re-warm them on use, but that is not the current target because it trades
+predictable low-latency extension for extra re-warm churn. The explicit operator
+control for freeing this RAM is `channel disable`.
+
 Disabled channels are different: they must consume no live RAM. Disabling a
 channel must:
 
@@ -413,6 +434,10 @@ Suggested calibration sequence:
    - Enable no channels.
    - Wait for steady state.
    - Record `baseline_daemon_rss = max(VmRSS_alice, VmRSS_bob)`.
+   - The daemon should also self-measure its own `VmRSS` after startup
+     initialization and expose it as the default runtime
+     `baseline_daemon_rss`. Benchmarks then validate the self-measured value
+     instead of hardcoding a stale baseline across builds or deployments.
 
 2. **Channel metadata RSS**
    - Enable 100, then 1000 channels, but set precompute target to zero.

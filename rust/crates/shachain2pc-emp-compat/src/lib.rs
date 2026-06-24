@@ -753,6 +753,14 @@ impl SoftSpoken4 {
         self.recv_chunk_finish(transcript_seed, &out, &u_canonical, bs);
         Ok(out)
     }
+
+    pub fn trim_idle_allocations(&mut self) {
+        self.leftover.zeroize();
+        self.leftover.clear();
+        self.leftover.shrink_to_fit();
+        self.leftover_pos = 0;
+        self.leftover_count = 0;
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1502,6 +1510,10 @@ impl Ag2pcSession {
             .await
     }
 
+    pub fn trim_idle_allocations(&mut self) {
+        self.protocol.trim_idle_allocations();
+    }
+
     pub async fn end<S: TranscriptIo>(&mut self, streams: &mut Ag2pcStreams<S>) -> Result<()> {
         self.protocol.end(streams).await
     }
@@ -2002,6 +2014,10 @@ impl Ag2pcProtocol {
         self.process_input_calls
     }
 
+    pub fn trim_idle_allocations(&mut self) {
+        self.triple_pool.trim_idle_allocations();
+    }
+
     pub async fn flush_cot_check<S: TranscriptIo>(
         &mut self,
         streams: &mut Ag2pcStreams<S>,
@@ -2333,6 +2349,11 @@ impl Ag2pcTriplePool {
         };
         out.begin_abits(streams).await?;
         Ok(out)
+    }
+
+    pub fn trim_idle_allocations(&mut self) {
+        self.abit1.trim_idle_allocations();
+        self.abit2.trim_idle_allocations();
     }
 
     pub fn party(&self) -> Role {
@@ -3722,6 +3743,32 @@ mod tests {
         .await
         .unwrap();
         assert_softspoken_relation(&receiver, delta, &sender);
+    }
+
+    #[test]
+    fn softspoken_trim_drops_leftover_without_resetting_setup() {
+        let mut soft = SoftSpoken4::new(Role::Bob, true).unwrap();
+        soft.setup_done = true;
+        soft.session = 17;
+        soft.cur_send_session = 5;
+        soft.cur_recv_session = 6;
+        soft.leaves_send = vec![Block::make(1, 2); 4];
+        soft.leaves_recv = vec![Block::make(3, 4); 4];
+        soft.leftover = vec![Block::make(5, 6); 8];
+        soft.leftover_pos = 2;
+        soft.leftover_count = 6;
+
+        soft.trim_idle_allocations();
+
+        assert!(soft.leftover.is_empty());
+        assert_eq!(soft.leftover_pos, 0);
+        assert_eq!(soft.leftover_count, 0);
+        assert!(soft.setup_done);
+        assert_eq!(soft.session, 17);
+        assert_eq!(soft.cur_send_session, 5);
+        assert_eq!(soft.cur_recv_session, 6);
+        assert_eq!(soft.leaves_send, vec![Block::make(1, 2); 4]);
+        assert_eq!(soft.leaves_recv, vec![Block::make(3, 4); 4]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

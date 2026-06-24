@@ -1,9 +1,9 @@
 # Daemon Integration Test Plan
 
-This document plans the next daemon integration-test expansion. The tests are
-meant to exercise the daemon as a two-party service: real daemon processes, real
-CLI control, real encrypted DBs, real peer gRPC/JobStream, and the existing
-AG2PC implementation.
+This document tracks remaining daemon integration tests, benchmarks, and RAM
+optimization work. The tests exercise the daemon as a two-party service: real
+daemon processes, real CLI control, real encrypted DBs, real peer
+gRPC/JobStream, and the existing AG2PC implementation.
 
 The plan intentionally does not introduce new protocol features. Where a test
 needs malicious behavior, use either a direct gRPC client that sends invalid
@@ -27,6 +27,11 @@ The current `daemon_pair` integration suite already covers:
 - Delta lifetime cap refusal;
 - failed security-parameter negotiation monitoring;
 - expected-index reveal refusal.
+- panic-safe daemon child cleanup through `Drop`;
+- RAM-derived `effective_workers`, low-RAM warning, and precompute admission;
+- disable behavior that refuses active precompute and frees live session state;
+- an ignored 100-channel benchmark that reports throughput, cached reveal
+  latency, and per-node peak RSS.
 
 The additions below should preserve that structure and keep tests serialized
 with the existing daemon-pair lock/port allocation style.
@@ -185,17 +190,179 @@ enabled live sessions consume RAM independently of active worker count.
 `daemon_bench_100_channels_low_ram_refusal`:
 
 - Configure `max_ram_mb` below the estimated need.
-- Expected behavior after RAM admission control lands: precompute queues or
-  runs with only the RAM-derived effective worker count.
-- Until RAM admission control lands, this test should be marked
-  `expected_fail` or documented as pending because `max_ram_bytes` is currently
-  not enforced.
+- Expected behavior: precompute queues or runs with only the RAM-derived
+  effective worker count.
+- If the RAM formula leaves no room for a worker, the daemon still allows one
+  worker and reports `ram_overcommit_warning`.
 
 If the idle-session-aware formula leaves room for zero workers, the daemon
 should still expose one effective worker and print/return a clear warning that
 the configured RAM budget is too low and may be exceeded. This preserves
 liveness for emergency reveal/precompute paths while making the operator-facing
 over-budget condition explicit.
+
+## RAM Optimization Findings And Plan
+
+Recent 100-channel daemon measurements showed two separate memory numbers:
+
+- a fill-time peak around 720-776 MB per daemon;
+- a lower steady idle floor after precompute finishes.
+
+The peak includes active one-H workers, AG2PC working buffers, gRPC/TLS state,
+and allocator high-water effects. The largest avoidable idle-session cost found
+in review is simpler: every live `PrecomputeSession` owns a fresh parsed copy of
+the SHA-256 compression circuit.
+
+The embedded SHA circuit has about 116k gates and occupies roughly 1.77 MiB as
+a `Circuit`. With 100 live channels, the current owned field duplicates about
+177 MiB of immutable gate data. With 1000 live channels, that would grow to
+about 1.77 GiB. This is not inherent to the protocol; it is a data-layout bug.
+The circuit should be a singleton.
+
+### 1. Share The SHA Circuit
+
+Priority: high. This is the largest confirmed retained-RAM win and does not
+change protocol bytes or cryptography.
+
+Implementation plan:
+
+- parse `sha256_compress_gadget()` once when the daemon initializes;
+- store it in daemon shared state as `Arc<Circuit>`;
+- pass `Arc::clone` into every live `PrecomputeSession`;
+- update precompute, reveal, and fallback helpers to take `&Circuit` or
+  `Arc<Circuit>` instead of reparsing or owning a `Circuit`;
+- preserve the existing circuit digest and C++/Rust compatibility tests;
+- add a daemon unit/integration assertion that two live precompute sessions
+  share the same circuit allocation, for example with `Arc::ptr_eq` behind a
+  test-only accessor;
+- update RAM calibration after the change.
+
+Expected result:
+
+```text
+current circuit RAM  ~= 1.77 MiB * live_channel_count
+target circuit RAM   ~= 1.77 MiB total
+```
+
+The worker-count benefit is indirect. Removing duplicate circuits lowers the
+idle RSS floor, which leaves more `max_ram` headroom for active one-H workers.
+The circuit itself must not be counted as a per-worker cost after this change.
+
+### 2. Prune Live Session Cache Retention
+
+Priority: medium. The current cache is bounded, so this is not the hundred-MB
+issue, but it is the next cleanup.
+
+The live session should keep at most one labeled node per shachain layer, and
+only nodes that can still be selected as a future parent by the shachain
+derivability rules. Nodes that are inside a known non-reusable truncation/prefix
+region should be dropped rather than cloned into the cache.
+
+Implementation plan:
+
+- make the parent-selection and retention rule one shared helper;
+- test it against the reference shachain derivability rules;
+- after every target commit, prune cached labeled nodes not reachable from any
+  planned future target;
+- keep the durable DB policy unchanged: only exact requested revealable target
+  leaves are persisted.
+
+Expected result: kilobytes per channel rather than hundreds of MiB, but fewer
+clones and clearer invariants.
+
+### 3. Trim Idle AG2PC Buffers
+
+Priority: medium after measuring.
+
+Review found retained SoftSpoken/triple-pool buffers on the order of hundreds
+of KiB per live channel. Some state is required for a live session, but large
+spent COT/PPRF buffers and compute temporaries should not remain resident when
+the channel is idle.
+
+Implementation plan:
+
+- instrument `Ag2pcSession` and `Ag2pcTriplePool` idle sizes after one target;
+- add an explicit `trim_idle_allocations()` method if buffers can be safely
+  cleared without changing protocol state or reusing one-time material;
+- call it after a target commit when no H is active for that channel;
+- prove a later in-session precompute still reuses the labeled shachain parent
+  and only regenerates safe fresh preprocessing as needed;
+- benchmark idle RSS and warm precompute latency before and after.
+
+Do not clear data merely to save RAM if that causes a protocol restart or
+requires deterministic reuse of one-time material. Labels for the current live
+frontier remain RAM-only and must be fresh-session state.
+
+### 4. Avoid Fresh Setup For Cached Reveal
+
+Priority: high for throughput, medium for RAM.
+
+The current cached reveal benchmark is setup-bound: about 474 ms per reveal on
+the measured 100-channel run, mostly because reveal opens a fresh AG2PC/EMP
+session. The actual cached reveal is a MAC/open check and should be much
+cheaper when a live channel session already exists.
+
+Implementation plan:
+
+- add a reveal command on the existing per-channel JobStream/live session for
+  targets whose labeled live node is still resident;
+- for exact persisted target leaves after restart, consider a lightweight
+  daemon-gRPC MAC-open path that uses the fixed channel Delta but does not run
+  base OT or SoftSpoken setup;
+- keep the legacy EMP/TCP reveal/full-derivation path for compatibility and
+  fallback until the daemon path is fully tested;
+- add benchmarks for sequential cached reveal, parallel cached reveal, and
+  fallback reveal;
+- confirm whether the legacy base `mpc_port` path serializes concurrent
+  reveals, then retire that cap for daemon-to-daemon cached reveal.
+
+This is a latency/throughput optimization, not a new crypto protocol. It must
+not reveal a value without the same IT-MAC correct-or-abort check already used
+by public reveal.
+
+### 5. Recalibrate RAM Constants After Fixes
+
+Priority: required before treating benchmarks as capacity numbers.
+
+After the circuit sharing and any idle-buffer trimming land, rerun the
+calibration sequence in this document and update the configured estimates:
+
+- baseline daemon RSS;
+- channel metadata RSS;
+- idle live-session RSS;
+- one-H worker peak RSS;
+- fill-time peak versus steady idle floor;
+- 100-channel and 1000-channel scaling;
+- disabled-channel RSS drop.
+
+The current `one_h_worker_peak_rss_estimate` is deliberately conservative. If
+the measured p95 daemon worker peak is materially below the configured value,
+lower the default only after the slope check across `workers=1/2/4` confirms
+that peak RSS grows linearly with active jobs.
+
+### 6. Benchmark The Real Steady State
+
+The current 100-channel benchmark measured serial cached reveal and cold-ish
+precompute behavior. Add follow-up benchmark modes:
+
+- parallel cached reveals across channels;
+- warm incremental precompute loop, for example fill `I=2` then `I=3`;
+- mixed steady state that consumes one cached reveal and refills one future
+  target per channel;
+- optional 50 ms RTT run for remote-cosigner sensitivity.
+
+Report:
+
+```text
+cached_reveal_ms_per_secret
+warm_precompute_ms_per_secret
+steady_update_ms_per_secret
+steady_updates_per_second
+idle_rss_mb
+peak_rss_mb
+effective_workers
+ram_overcommit_warning
+```
 
 ### Reveal Benchmarks
 

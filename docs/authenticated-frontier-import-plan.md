@@ -1,9 +1,11 @@
 # Authenticated Frontier Import / Relabel Plan
 
-This document specifies the next cryptographic step for the daemon frontier.
-It is not implemented yet. The goal is to turn a persisted authenticated node
-into a fresh-session AG2PC input so the daemon can extend an existing frontier
-after restart without recomputing from the seed.
+This document records an optional future cryptographic optimization for the
+daemon frontier. It is not implemented and is no longer on the daemon critical
+path. Live per-channel sessions already provide incremental precompute while
+both daemons stay up. Import/relabel would only let a daemon turn a persisted
+authenticated node into a fresh-session AG2PC input after restart or session
+teardown, avoiding re-warm from the seed.
 
 ## Current State
 
@@ -19,8 +21,11 @@ public reveal only needs the authenticated value, but they are not usable as
 inputs to a new garbled computation.
 
 Current precompute starts from the seed in one live AG2PC session, carries
-labels in memory, and stores label-stripped outputs. This is correct but
-recomputes shared prefixes on later precompute calls.
+labels in memory, and stores label-stripped exact target leaves. While that live
+session remains up, later precompute calls reuse the labeled in-memory frontier
+and do not rederive shared prefixes. After restart or session teardown, the
+daemon starts a fresh session and re-warms from the seed rather than importing a
+persisted node as a computation parent.
 
 ## Desired Primitive
 
@@ -127,5 +132,7 @@ value. A direct exchange of MAC LSB shares would also reveal the value.
 
 This protocol is cryptographic, not plumbing. It should not be implemented for
 the funds path until the import MAC-consistency argument is reviewed by a human
-MPC cryptographer. Until then, the daemon may persist nodes for fast reveal and
-may re-warm from the seed for further precompute.
+MPC cryptographer. The current daemon design does not need it for correctness
+or ordinary incremental precompute: it persists exact target leaves for fast
+reveal, keeps live labels in RAM while the session is up, and re-warms from the
+seed after restart.

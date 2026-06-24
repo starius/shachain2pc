@@ -255,20 +255,26 @@ issue, but it is the next cleanup.
 
 The live session should keep at most one labeled node per shachain layer, and
 only nodes that can still be selected as a future parent by the shachain
-derivability rules. Nodes that are inside a known non-reusable truncation/prefix
-region should be dropped rather than cloned into the cache.
+derivability rules. It must not cache in-trunc intermediates: the sequential
+trunk/truncation path used only to reach the current batch/target region is
+one-shot work and is known not to be selected as a later parent. Those nodes
+should flow through the current computation and then be dropped instead of being
+cloned into the live cache.
 
 Implementation plan:
 
 - make the parent-selection and retention rule one shared helper;
-- test it against the reference shachain derivability rules;
+- test it against the reference shachain derivability rules, including a case
+  where trunk/trunc intermediates are produced but are not retained;
 - after every target commit, prune cached labeled nodes not reachable from any
   planned future target;
+- assert that a deep target leaves only reusable frontier/cache parents in RAM,
+  not every intermediate H along the path;
 - keep the durable DB policy unchanged: only exact requested revealable target
   leaves are persisted.
 
-Expected result: kilobytes per channel rather than hundreds of MiB, but fewer
-clones and clearer invariants.
+Expected result: kilobytes per channel rather than hundreds of MiB, fewer
+clones, no retained one-shot trunk material, and clearer invariants.
 
 ### 3. Trim Idle AG2PC Buffers
 
@@ -881,6 +887,28 @@ Scenario:
 Expected:
 
 - The checked-unit count shows the older same-layer node was not retained.
+- Reveals still match the reference.
+
+### `daemon_pair_live_cache_drops_in_trunc_intermediates`
+
+Goal: prove one-shot trunk/trunc intermediates are not retained in the live
+session cache.
+
+Scenario:
+
+1. Precompute a deep target with several sequential H applications before the
+   reusable branch point.
+2. Inspect test-only live-cache metadata after the target commits.
+3. Request a nearby target that should reuse only the retained frontier parent,
+   not any in-trunc intermediate.
+
+Expected:
+
+- Live cache metadata contains only reusable shachain parents, at most one per
+  level.
+- In-trunc intermediate masks are absent.
+- Checked-unit counts show the nearby target reuses the intended frontier
+  parent and does not depend on a hidden retained trunk node.
 - Reveals still match the reference.
 
 ### `daemon_pair_disable_channel_stops_background_fill`

@@ -554,8 +554,13 @@ Start with the simple per-edge cache:
 - The root is the authenticated channel seed share combination.
 - Each shachain edge is one MPC `H` application.
 - A node is identified by `(channel_index, shachain_index_or_prefix, depth)`.
-- The encrypted frontier stores unrevealed authenticated intermediate nodes.
-- The DB stores revealed secrets, authenticated frontier nodes, and metadata.
+- The live session cache stores only reusable labeled frontier parents, at most
+  one per shachain layer.
+- One-shot trunk/truncation intermediates are not retained after they are used
+  to reach the current target region.
+- The encrypted DB frontier stores exact requested unrevealed target leaves,
+  not trunk/intermediate computation nodes.
+- The DB stores revealed secrets, exact target leaves, and metadata.
 - A disabled channel keeps DB state but does not schedule background work.
 - Re-enabling uses existing nodes if both sides can agree on them; otherwise
   they are dropped and recomputed.

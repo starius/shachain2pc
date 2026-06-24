@@ -228,13 +228,19 @@ Implementation plan:
 
 - parse `sha256_compress_gadget()` once when the daemon initializes;
 - store it in daemon shared state as `Arc<Circuit>`;
-- pass `Arc::clone` into every live `PrecomputeSession`;
+- pass `Arc::clone` into `PrecomputeSession::setup_with_streams`, so outgoing
+  and incoming live session maps both share the same allocation;
 - update precompute, reveal, and fallback helpers to take `&Circuit` or
   `Arc<Circuit>` instead of reparsing or owning a `Circuit`;
+- convert standalone per-operation helpers, including
+  `run_precompute_path_with_streams` and reveal/fallback paths, so they do not
+  parse a fresh circuit per call;
 - preserve the existing circuit digest and C++/Rust compatibility tests;
 - add a daemon unit/integration assertion that two live precompute sessions
   share the same circuit allocation, for example with `Arc::ptr_eq` behind a
   test-only accessor;
+- add a grep guard or unit test that rejects `sha256_compress_gadget()` call
+  sites outside one-time initialization and tests;
 - update RAM calibration after the change.
 
 Expected result:
@@ -247,6 +253,8 @@ target circuit RAM   ~= 1.77 MiB total
 The worker-count benefit is indirect. Removing duplicate circuits lowers the
 idle RSS floor, which leaves more `max_ram` headroom for active one-H workers.
 The circuit itself must not be counted as a per-worker cost after this change.
+`Circuit` is immutable plain gate data and can be shared as `Arc<Circuit>`
+across tokio tasks without a lock or gate-data clone.
 
 ### 2. Prune Live Session Cache Retention
 
@@ -255,7 +263,12 @@ issue, but it is the next cleanup.
 
 The live session should keep at most one labeled node per shachain layer, and
 only nodes that can still be selected as a future parent by the shachain
-derivability rules. It must not cache in-trunc intermediates: the sequential
+derivability rules. "Future parent" means the full shachain-storage closure for
+the remaining count-down sequence, not only the immediate next target. The live
+cache should be sufficient to keep several consecutive future targets warm while
+still bounded to at most one node per trailing-zero bucket.
+
+The live session must not cache in-trunc intermediates: the sequential
 trunk/truncation path used only to reach the current batch/target region is
 one-shot work and is known not to be selected as a later parent. Those nodes
 should flow through the current computation and then be dropped instead of being
@@ -264,12 +277,16 @@ cloned into the live cache.
 Implementation plan:
 
 - make the parent-selection and retention rule one shared helper;
-- test it against the reference shachain derivability rules, including a case
+- define that helper in terms of the shachain-storage closure needed to derive
+  all remaining lower future indices, not only the next target;
+- test it against the reference shachain derivability rules, including cases
   where trunk/trunc intermediates are produced but are not retained;
-- after every target commit, prune cached labeled nodes not reachable from any
-  planned future target;
+- after every target commit, prune cached labeled nodes not in that closure;
 - assert that a deep target leaves only reusable frontier/cache parents in RAM,
   not every intermediate H along the path;
+- assert that warm reuse survives several consecutive count-down targets, for
+  example 5-10 steps with roughly one checked unit per step where the shachain
+  closure predicts reuse;
 - keep the durable DB policy unchanged: only exact requested revealable target
   leaves are persisted.
 
@@ -315,6 +332,10 @@ Implementation plan:
 - for exact persisted target leaves after restart, consider a lightweight
   daemon-gRPC MAC-open path that uses the fixed channel Delta but does not run
   base OT or SoftSpoken setup;
+- state and test that this path consumes the persisted `lambda` plus
+  `wire_bundle` MAC/key shares with the re-derived fixed channel Delta.
+  `strip_labels_for_reveal` must continue to remove only session-local labels,
+  not the authenticated MAC material required for restart reveal;
 - keep the legacy EMP/TCP reveal/full-derivation path for compatibility and
   fallback until the daemon path is fully tested;
 - add benchmarks for sequential cached reveal, parallel cached reveal, and
@@ -338,6 +359,9 @@ calibration sequence in this document and update the configured estimates:
 - idle live-session RSS;
 - one-H worker peak RSS;
 - fill-time peak versus steady idle floor;
+- before/after 100-channel idle RSS for the `Arc<Circuit>` change, with the
+  expected direction roughly from the old duplicated-circuit floor toward the
+  singleton-circuit floor;
 - 100-channel and 1000-channel scaling;
 - disabled-channel RSS drop.
 

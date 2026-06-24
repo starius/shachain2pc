@@ -47,6 +47,8 @@ async fn daemon_bench_100_channels_good_case() {
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
     let precompute_ms = precompute_start.elapsed().as_millis() as u64;
+    let alice_idle_after_precompute = pair.alice.vm_rss_bytes().unwrap_or(0);
+    let bob_idle_after_precompute = pair.bob.vm_rss_bytes().unwrap_or(0);
 
     let mut reveal_latencies = Vec::with_capacity(channels.len());
     for channel in &channels {
@@ -63,6 +65,8 @@ async fn daemon_bench_100_channels_good_case() {
         assert_eq!(parse_cache(&bob), Some(true));
         reveal_latencies.push(reveal_start.elapsed().as_millis() as u64);
     }
+    let alice_idle_after_reveals = pair.alice.vm_rss_bytes().unwrap_or(0);
+    let bob_idle_after_reveals = pair.bob.vm_rss_bytes().unwrap_or(0);
 
     let alice_hwm = pair.alice.vm_hwm_bytes().unwrap_or(0);
     let bob_hwm = pair.bob.vm_hwm_bytes().unwrap_or(0);
@@ -85,6 +89,179 @@ async fn daemon_bench_100_channels_good_case() {
                 / reveal_latencies.len().max(1) as f64
         },
         "rss": {
+            "alice_idle_after_precompute_mb": alice_idle_after_precompute / (1024 * 1024),
+            "bob_idle_after_precompute_mb": bob_idle_after_precompute / (1024 * 1024),
+            "pair_idle_after_precompute_sum_mb": (alice_idle_after_precompute
+                + bob_idle_after_precompute) / (1024 * 1024),
+            "alice_idle_after_reveals_mb": alice_idle_after_reveals / (1024 * 1024),
+            "bob_idle_after_reveals_mb": bob_idle_after_reveals / (1024 * 1024),
+            "pair_idle_after_reveals_sum_mb": (alice_idle_after_reveals
+                + bob_idle_after_reveals) / (1024 * 1024),
+            "alice_peak_mb": alice_hwm / (1024 * 1024),
+            "bob_peak_mb": bob_hwm / (1024 * 1024),
+            "pair_peak_sum_mb": (alice_hwm + bob_hwm) / (1024 * 1024)
+        },
+        "alice_status": pair.cli(&pair.alice_control, &["status"]).await.trim(),
+        "bob_status": pair.cli(&pair.bob_control, &["status"]).await.trim()
+    });
+    println!("{summary}");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark harness; run explicitly"]
+async fn daemon_bench_100_channels_warm_refill() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start_mtls().await;
+    pair.cli(&pair.alice_control, &["config", "workers", "4"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "workers", "4"])
+        .await;
+
+    let channels: Vec<u64> = (2000..2100).collect();
+    for channel in &channels {
+        let channel_s = channel.to_string();
+        pair.cli(&pair.alice_control, &["channel", "enable", &channel_s])
+            .await;
+        pair.cli(&pair.bob_control, &["channel", "enable", &channel_s])
+            .await;
+    }
+
+    pair.cli(&pair.alice_control, &["config", "precompute", "2"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "2"])
+        .await;
+    let cold_start = Instant::now();
+    pair.wait_frontier_total(&pair.alice_control, channels.len(), 2)
+        .await;
+    pair.wait_frontier_total(&pair.bob_control, channels.len(), 2)
+        .await;
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
+    let cold_ms = cold_start.elapsed().as_millis() as u64;
+    let alice_idle_after_cold = pair.alice.vm_rss_bytes().unwrap_or(0);
+    let bob_idle_after_cold = pair.bob.vm_rss_bytes().unwrap_or(0);
+
+    pair.cli(&pair.alice_control, &["config", "precompute", "3"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "3"])
+        .await;
+    let warm_start = Instant::now();
+    pair.wait_frontier_total(&pair.alice_control, channels.len(), 3)
+        .await;
+    pair.wait_frontier_total(&pair.bob_control, channels.len(), 3)
+        .await;
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
+    let warm_ms = warm_start.elapsed().as_millis() as u64;
+    let alice_idle_after_warm = pair.alice.vm_rss_bytes().unwrap_or(0);
+    let bob_idle_after_warm = pair.bob.vm_rss_bytes().unwrap_or(0);
+
+    let alice_hwm = pair.alice.vm_hwm_bytes().unwrap_or(0);
+    let bob_hwm = pair.bob.vm_hwm_bytes().unwrap_or(0);
+    let summary = serde_json::json!({
+        "channels": channels.len(),
+        "workers": 4,
+        "cold_fill": {
+            "target": 2,
+            "wall_ms": cold_ms,
+            "ms_per_secret": cold_ms as f64 / channels.len() as f64
+        },
+        "warm_refill": {
+            "target": 3,
+            "wall_ms": warm_ms,
+            "ms_per_secret": warm_ms as f64 / channels.len() as f64
+        },
+        "rss": {
+            "alice_idle_after_cold_mb": alice_idle_after_cold / (1024 * 1024),
+            "bob_idle_after_cold_mb": bob_idle_after_cold / (1024 * 1024),
+            "pair_idle_after_cold_sum_mb": (alice_idle_after_cold
+                + bob_idle_after_cold) / (1024 * 1024),
+            "alice_idle_after_warm_mb": alice_idle_after_warm / (1024 * 1024),
+            "bob_idle_after_warm_mb": bob_idle_after_warm / (1024 * 1024),
+            "pair_idle_after_warm_sum_mb": (alice_idle_after_warm
+                + bob_idle_after_warm) / (1024 * 1024),
+            "alice_peak_mb": alice_hwm / (1024 * 1024),
+            "bob_peak_mb": bob_hwm / (1024 * 1024),
+            "pair_peak_sum_mb": (alice_hwm + bob_hwm) / (1024 * 1024)
+        },
+        "alice_status": pair.cli(&pair.alice_control, &["status"]).await.trim(),
+        "bob_status": pair.cli(&pair.bob_control, &["status"]).await.trim()
+    });
+    println!("{summary}");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark harness; run explicitly"]
+async fn daemon_bench_1000_channels_idle_floor() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start_mtls().await;
+    pair.cli(&pair.alice_control, &["config", "workers", "4"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "workers", "4"])
+        .await;
+
+    let channels: Vec<u64> = (10_000..11_000).collect();
+    let enable_start = Instant::now();
+    for channel in &channels {
+        let channel_s = channel.to_string();
+        pair.cli(&pair.alice_control, &["channel", "enable", &channel_s])
+            .await;
+        pair.cli(&pair.bob_control, &["channel", "enable", &channel_s])
+            .await;
+    }
+    let enable_ms = enable_start.elapsed().as_millis() as u64;
+
+    pair.cli(&pair.alice_control, &["config", "precompute", "1"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "1"])
+        .await;
+    let fill_start = Instant::now();
+    pair.wait_frontier_total(&pair.alice_control, channels.len(), 1)
+        .await;
+    pair.wait_frontier_total(&pair.bob_control, channels.len(), 1)
+        .await;
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
+    let fill_ms = fill_start.elapsed().as_millis() as u64;
+    let alice_idle_after_fill = pair.alice.vm_rss_bytes().unwrap_or(0);
+    let bob_idle_after_fill = pair.bob.vm_rss_bytes().unwrap_or(0);
+
+    let disable_start = Instant::now();
+    for channel in &channels {
+        let channel_s = channel.to_string();
+        pair.cli(&pair.alice_control, &["channel", "disable", &channel_s])
+            .await;
+        pair.cli(&pair.bob_control, &["channel", "disable", &channel_s])
+            .await;
+    }
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
+    let disable_ms = disable_start.elapsed().as_millis() as u64;
+    let alice_idle_after_disable = pair.alice.vm_rss_bytes().unwrap_or(0);
+    let bob_idle_after_disable = pair.bob.vm_rss_bytes().unwrap_or(0);
+
+    let alice_hwm = pair.alice.vm_hwm_bytes().unwrap_or(0);
+    let bob_hwm = pair.bob.vm_hwm_bytes().unwrap_or(0);
+    let summary = serde_json::json!({
+        "channels": channels.len(),
+        "workers": 4,
+        "enable_ms": enable_ms,
+        "fill": {
+            "wall_ms": fill_ms,
+            "ms_per_secret": fill_ms as f64 / channels.len() as f64
+        },
+        "disable_ms": disable_ms,
+        "rss": {
+            "alice_idle_after_fill_mb": alice_idle_after_fill / (1024 * 1024),
+            "bob_idle_after_fill_mb": bob_idle_after_fill / (1024 * 1024),
+            "pair_idle_after_fill_sum_mb": (alice_idle_after_fill
+                + bob_idle_after_fill) / (1024 * 1024),
+            "alice_idle_after_disable_mb": alice_idle_after_disable / (1024 * 1024),
+            "bob_idle_after_disable_mb": bob_idle_after_disable / (1024 * 1024),
+            "pair_idle_after_disable_sum_mb": (alice_idle_after_disable
+                + bob_idle_after_disable) / (1024 * 1024),
             "alice_peak_mb": alice_hwm / (1024 * 1024),
             "bob_peak_mb": bob_hwm / (1024 * 1024),
             "pair_peak_sum_mb": (alice_hwm + bob_hwm) / (1024 * 1024)
@@ -585,6 +762,10 @@ impl ChildGuard {
 
     fn vm_hwm_bytes(&self) -> Option<u64> {
         proc_status_kib(self.id()?, "VmHWM:").map(|kib| kib.saturating_mul(1024))
+    }
+
+    fn vm_rss_bytes(&self) -> Option<u64> {
+        proc_status_kib(self.id()?, "VmRSS:").map(|kib| kib.saturating_mul(1024))
     }
 
     async fn kill_and_wait(&mut self) {

@@ -153,15 +153,41 @@ optimization.
 - Same as the main scenario with higher workers.
 - Shows scaling, RSS growth, and whether gRPC/CPU becomes the bottleneck.
 
+`daemon_bench_1000_channels_idle_floor`:
+
+- Enable 1000 channels.
+- Precompute one target per channel with a small worker count.
+- Wait until all active jobs are idle and the live per-channel sessions are
+  resident.
+- Report the idle-session RSS floor:
+  `idle_sessions_rss / live_session_count`.
+- Disable half the channels and prove live-session count and RSS drop
+  accordingly.
+
+This benchmark exposes the scaling floor that a 100-channel run may hide:
+enabled live sessions consume RAM independently of active worker count.
+
+`daemon_bench_deep_target_peak`:
+
+- Precompute a StartIndex-region target with many set bits.
+- Confirm peak RSS remains approximately one active H worker plus the live
+  session cache, because H applications are sequential within the session.
+- Report wall time separately from shallow I=2/I=3 cases.
+
 `daemon_bench_100_channels_low_ram_refusal`:
 
 - Configure `max_ram_mb` below the estimated need.
 - Expected behavior after RAM admission control lands: precompute queues or
-  refuses because the effective worker count derived from RAM is zero or lower
-  than the configured `workers`.
+  runs with only the RAM-derived effective worker count.
 - Until RAM admission control lands, this test should be marked
   `expected_fail` or documented as pending because `max_ram_bytes` is currently
   not enforced.
+
+If the idle-session-aware formula leaves room for zero workers, the daemon
+should still expose one effective worker and print/return a clear warning that
+the configured RAM budget is too low and may be exceeded. This preserves
+liveness for emergency reveal/precompute paths while making the operator-facing
+over-budget condition explicit.
 
 ### Reveal Benchmarks
 
@@ -226,7 +252,38 @@ must reduce worker concurrency. The daemon already has a measured or configured
 peak RAM cost per active one-H worker, so the first implementation should turn
 RAM into a worker cap and then reuse the existing worker-budget machinery.
 
-Compute locally:
+The model is intentionally idle-session aware:
+
+```text
+rss_floor =
+    baseline_daemon_rss +
+    live_idle_sessions * idle_session_rss_estimate
+
+worker_ram_budget = max(max_ram_bytes - rss_floor, 0)
+
+ram_limited_workers_raw =
+    floor(worker_ram_budget / one_h_worker_peak_rss_estimate)
+
+ram_limited_workers = max(ram_limited_workers_raw, 1)
+
+ram_overcommit_warning =
+    ram_limited_workers_raw == 0
+```
+
+Then compute locally:
+
+```text
+effective_local_workers = min(configured_workers, ram_limited_workers)
+```
+
+If `ram_overcommit_warning` is true, the daemon should still allow one worker
+but must make the over-budget condition visible in logs, status, and benchmark
+output. This is a deliberate liveness choice: a badly undersized RAM budget
+should not make the daemon permanently unable to run the one job needed to catch
+up or serve an urgent operation, but the operator must be told that the host may
+exceed `max_ram_bytes`.
+
+The equivalent expanded formula is:
 
 ```text
 ram_available_for_jobs =
@@ -235,7 +292,7 @@ ram_available_for_jobs =
     live_idle_sessions * idle_session_rss_estimate
 
 ram_limited_workers =
-    floor(max(ram_available_for_jobs, 0) / one_h_worker_peak_rss_estimate)
+    max(floor(max(ram_available_for_jobs, 0) / one_h_worker_peak_rss_estimate), 1)
 
 effective_local_workers = min(configured_workers, ram_limited_workers)
 ```
@@ -249,9 +306,9 @@ effective_shared_workers =
 
 Outgoing precompute must start only if `active_jobs < effective_shared_workers`.
 Incoming JobStream work must start only if
-`active_jobs < effective_local_workers`. If either value is zero, work queues or
-is refused with a resource-limit error; it must not start and hope the host has
-enough memory.
+`active_jobs < effective_local_workers`. If the effective worker count was
+forced to one from a raw zero, the job may run but must carry the warning
+described above.
 
 The peer config exchange should advertise both the configured `workers` and the
 derived `effective_workers`, plus the RAM inputs used to derive it. The
@@ -269,11 +326,15 @@ reserved_ram =
 ```
 
 The worker cap above is the main admission check. As a defensive backstop, a job
-should also refuse to start when:
+should also warn when:
 
 ```text
 reserved_ram + estimated_job_rss > local_max_ram
 ```
+
+That backstop should not refuse the last effective worker unless an explicit
+strict mode is later added. The default policy is fail-loud and warn-loud, not
+deadlock on an undersized RAM setting.
 
 The first implementation can be conservative and static. Initial values should
 come from the measured one-H peak with a safety margin, for example:
@@ -294,6 +355,136 @@ The RAM cap should primarily reduce active worker count. If a deployment sets
 `max_ram_bytes` too low to hold idle sessions plus one worker, the daemon should
 surface the condition explicitly instead of silently dropping reusable session
 state.
+
+Disabled channels are different: they must consume no live RAM. Disabling a
+channel must:
+
+- stop scheduling new work for the channel;
+- cancel or finish-and-drop any active precompute job for that channel according
+  to the chosen cancellation semantics;
+- drop the live `PrecomputeSession` handle and its in-memory one-node-per-layer
+  cache;
+- remove the channel from live-session accounting immediately;
+- keep only durable DB state needed for later re-enable and revealed-secret
+  lookup.
+
+Re-enabling a channel creates a fresh live session on demand and re-warms from
+the seed as needed. This is safe because no session-local labels or COT state
+are persisted.
+
+The strict resource invariant is no disabled-channel live RAM: no active job,
+no session task, no gRPC streams, no labeled cache, and no scheduler entry. A
+disabled channel may still have encrypted durable state on disk. If future
+measurements show that loading disabled `ChannelRecord`s into the daemon's
+in-memory DB is material at large scale, split enabled-channel state from
+disabled durable records or lazy-load disabled records so disabled channels have
+no meaningful per-channel resident footprint.
+
+## Empirical RAM Calibration
+
+The RAM constants must come from real daemon runs, not from library-only party
+benchmarks. The daemon has extra fixed costs from tokio, tonic, rustls,
+encrypted DB state, local control service, peer service, mTLS certificates, and
+the live-session maps. The benchmark harness should provide a repeatable command
+that emits the calibrated numbers and the raw samples used to derive them.
+
+Use release builds and the same feature set as production measurements. Sample
+both daemon PIDs periodically from `/proc/<pid>/status`:
+
+```text
+VmRSS  = current resident set
+VmHWM  = high-water resident set
+```
+
+Optional profiler runs should use heap tools only as diagnostics, not as the
+primary benchmark output. Useful commands include:
+
+```text
+/usr/bin/time -v <daemon-or-benchmark-command>
+heaptrack <daemon-or-benchmark-command>
+valgrind --tool=massif <daemon-or-benchmark-command>
+```
+
+Suggested calibration sequence:
+
+1. **Baseline daemon RSS**
+   - Start both daemons with mTLS, DB, local control, and peer services
+     initialized.
+   - Enable no channels.
+   - Wait for steady state.
+   - Record `baseline_daemon_rss = max(VmRSS_alice, VmRSS_bob)`.
+
+2. **Channel metadata RSS**
+   - Enable 100, then 1000 channels, but set precompute target to zero.
+   - Record RSS deltas.
+   - This catches DB/channel-record overhead that is not part of the live
+     precompute session.
+
+3. **Idle live-session RSS**
+   - Enable N channels.
+   - Precompute one target per channel with a small worker count.
+   - Wait until `active_jobs == 0`.
+   - Record:
+
+     ```text
+     idle_session_rss_estimate =
+         (steady_rss_after_precompute -
+          baseline_daemon_rss -
+          channel_metadata_rss) / live_session_count
+     ```
+
+   - Repeat after disabling half the channels. Disabled channels must disappear
+     from `live_session_count`, and RSS should drop by roughly the corresponding
+     idle-session amount after allocator noise is accounted for.
+
+4. **One-H worker peak RSS**
+   - Run with `workers=1`, one enabled channel, and one precompute target that
+     performs exactly one H beyond the cached parent.
+   - Sample RSS during the job and record `VmHWM`.
+   - Compute:
+
+     ```text
+     one_h_worker_peak_rss_estimate =
+         peak_rss_during_job -
+         steady_rss_before_job
+     ```
+
+   - Repeat with `workers=2`, `workers=4`, and enough channels to keep workers
+     busy. The slope of peak RSS against observed active jobs should match the
+     one-worker estimate. If it does not, record the higher p95/peak value and
+     use that for admission control.
+
+5. **Deep target peak check**
+   - Run a StartIndex-region target with many set bits.
+   - Peak RSS should stay near one active H worker plus idle session state. If
+     it grows with depth, investigate retained per-H temporaries before trusting
+     the RAM formula.
+
+6. **Other-consumer audit**
+   - Compare the formula-predicted RSS against observed RSS for 100 and 1000
+     channels.
+   - Any persistent unexplained delta should be broken down before enabling the
+     RAM gate. Candidates include gRPC buffers, HTTP/2 flow-control windows,
+     DB serialization buffers, TLS state, pending fault-test channels, and
+     retained known-secret/frontier vectors.
+
+The benchmark JSON should include both configured estimates and measured values:
+
+```json
+{
+  "memory_model": {
+    "baseline_daemon_rss_mb": 0,
+    "channel_metadata_rss_mb": 0,
+    "idle_session_rss_estimate_mb": 0,
+    "one_h_worker_peak_rss_estimate_mb": 0,
+    "configured_max_ram_mb": 0,
+    "configured_workers": 0,
+    "ram_limited_workers_raw": 0,
+    "effective_workers": 0,
+    "ram_overcommit_warning": false
+  }
+}
+```
 
 ## Restart And Liveness Tests
 
@@ -489,15 +680,22 @@ Scenario:
 
 1. Configure nonzero background precompute.
 2. Enable a channel and wait for at least one target.
-3. Disable the channel.
-4. Wait and verify no additional frontier growth.
-5. Re-enable and verify precompute resumes.
+3. Confirm the channel has a live session or active precompute state.
+4. Disable the channel.
+5. Wait and verify no additional frontier growth.
+6. Verify live-session count and active-job count for the channel drop to zero.
+7. Re-enable and verify precompute resumes through a fresh session.
 
 Expected:
 
 - Disabled channel does not start new jobs.
+- Disabled channel holds no live `PrecomputeSession`, in-memory
+  one-node-per-layer cache, gRPC JobStream task, or active job reservation.
 - Re-enabled channel resumes from the durable common subset and live-session
   state is re-created if needed.
+- Any active job that was in flight at disable time is cancelled or allowed to
+  finish only if the disable RPC does not return until the live state is gone.
+  After disable returns, the channel must consume no live RAM.
 
 ### `daemon_pair_worker_budget_limits_live_sessions`
 
@@ -515,6 +713,45 @@ Expected:
   scheduler policy.
 - The peer also enforces its own worker budget.
 - No over-cap active jobs appear in `jobs`.
+
+### `daemon_pair_ram_budget_derives_effective_workers`
+
+Goal: prove `max_ram_bytes` reduces active worker concurrency using the
+idle-session-aware formula.
+
+Scenario:
+
+1. Configure `workers=8`.
+2. Configure static test estimates for baseline RSS, idle-session RSS, and
+   one-H worker peak RSS.
+3. Enable enough channels to create live idle sessions.
+4. Set `max_ram_bytes` so the formula yields `ram_limited_workers_raw=2`.
+5. Start several manual or background precomputes.
+
+Expected:
+
+- Status reports `configured_workers=8`, `effective_workers=2`, and no
+  overcommit warning.
+- At most two active precompute jobs run locally.
+- The peer sees and uses the advertised effective worker count.
+
+### `daemon_pair_ram_budget_warns_but_allows_one_worker`
+
+Goal: preserve liveness when RAM is configured below the idle-session floor.
+
+Scenario:
+
+1. Configure `workers=4`.
+2. Create enough live idle sessions that
+   `max_ram_bytes - rss_floor < one_h_worker_peak_rss_estimate`.
+3. Request one precompute.
+
+Expected:
+
+- Status reports `ram_limited_workers_raw=0`, `effective_workers=1`, and a
+  RAM overcommit warning.
+- Exactly one precompute may run.
+- No second concurrent precompute starts while the warning condition remains.
 
 ### `daemon_pair_peer_budget_shrink_stops_new_background_work`
 

@@ -144,7 +144,9 @@ recovery cache updated by a single background writer task. Operational hot paths
 mutate RAM first, enqueue logical deltas, and return without reserializing or
 rewriting the whole database. Rare registry changes such as channel
 enable/disable request an immediate flush; reveal and precompute updates use
-lazy durability because a crash can safely lose the most recent cache tail.
+lazy durability because a crash can safely lose the most recent cache tail. A
+periodic immediate checkpoint bounds the power-loss window, and clean shutdown
+drains and flushes queued mutations before the process exits.
 
 The redb table has one opaque name and opaque keys:
 
@@ -180,6 +182,11 @@ per-record AEAD failures, or parse failures abort startup with a clear error.
 redb transactions make committed snapshots crash-consistent; tail loss from
 lazy durability is acceptable because every value is recomputable or gated by
 the externally supplied expected reveal index.
+
+Legacy encrypted JSON blob migration writes a durable temporary redb first,
+moves the legacy file to `*.migrated`, and then installs the redb at the
+configured path. Startup recovers an interrupted migration by installing the
+temporary redb instead of creating an empty store.
 
 ## Fixed Delta And Authenticated Frontier State
 

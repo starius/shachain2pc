@@ -100,8 +100,10 @@ uses redb transactions for crash-consistent snapshots.
 Lazy durability is intentional for reveal/precompute cache updates: losing the
 most recent tail after a crash costs recomputation, not an unsafe reveal.
 Channel enable/disable uses immediate flush because registry changes are rare.
-Legacy encrypted JSON blobs are migrated once into redb and renamed to
-`*.migrated`.
+The writer periodically checkpoints dirty eventual commits and clean shutdown
+drains and flushes the writer. Legacy encrypted JSON blobs are migrated once
+through a durable temporary redb and renamed to `*.migrated`; startup recovers
+an interrupted migration before opening the store.
 
 ### Metrics
 

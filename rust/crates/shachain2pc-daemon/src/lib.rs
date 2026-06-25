@@ -30,9 +30,9 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tokio::task::AbortHandle;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, timeout, Duration, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{
     Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
@@ -61,6 +61,7 @@ const MIB: u64 = 1024 * 1024;
 const DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES: u64 = 192 * MIB;
 const DEFAULT_IDLE_SESSION_RSS_BYTES: u64 = MIB;
 const DEFAULT_PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
+const DEFAULT_DB_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -413,16 +414,18 @@ impl DbStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        recover_incomplete_migration(&path)?;
         if is_legacy_db_file(&path)? {
             let legacy = read_legacy_db(&path, master_secret)?;
-            let migrated = path.with_extension(format!(
-                "{}.migrated",
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or("db")
-            ));
-            fs::rename(&path, migrated)?;
-            migrate_legacy_db(&path, master_secret, &legacy)?;
+            let migrated = migrated_legacy_path(&path);
+            let temp = migration_temp_path(&path);
+            let _ = fs::remove_file(&temp);
+            migrate_legacy_db(&temp, master_secret, &legacy)?;
+            let _ = fs::remove_file(&migrated);
+            fs::rename(&path, &migrated)?;
+            sync_parent_dir(&path)?;
+            fs::rename(&temp, &path)?;
+            sync_parent_dir(&path)?;
             return Self::open(path, master_secret);
         }
 
@@ -437,6 +440,48 @@ impl DbStore {
         let writer = spawn_db_writer(database, subkeys);
         Ok((db, writer))
     }
+}
+
+fn migrated_legacy_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}.migrated",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("db")
+    ))
+}
+
+fn migration_temp_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}.migrating",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("db")
+    ))
+}
+
+fn recover_incomplete_migration(path: &Path) -> Result<()> {
+    let temp = migration_temp_path(path);
+    if path.exists() {
+        if temp.exists() {
+            let _ = fs::remove_file(temp);
+        }
+        return Ok(());
+    }
+    if temp.exists() {
+        fs::rename(&temp, path)?;
+        sync_parent_dir(path)?;
+    }
+    Ok(())
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if let Ok(file) = fs::File::open(parent) {
+            file.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -499,43 +544,102 @@ impl DbWriter {
 }
 
 fn spawn_db_writer(database: Database, subkeys: DbSubkeys) -> DbWriter {
+    spawn_db_writer_with_checkpoint_interval(database, subkeys, DEFAULT_DB_CHECKPOINT_INTERVAL)
+}
+
+fn spawn_db_writer_with_checkpoint_interval(
+    database: Database,
+    subkeys: DbSubkeys,
+    checkpoint_interval: Duration,
+) -> DbWriter {
     let (tx, mut rx) = mpsc::channel(16_384);
     let database = Arc::new(database);
     tokio::spawn(async move {
-        while let Some(first) = rx.recv().await {
-            let mut mutations = Vec::new();
-            let mut acks = Vec::new();
-            let mut durability = DbDurability::Eventual;
-            collect_write_op(first, &mut mutations, &mut acks, &mut durability);
-            while let Ok(op) = rx.try_recv() {
-                collect_write_op(op, &mut mutations, &mut acks, &mut durability);
-            }
-            let result = if mutations.is_empty() && acks.is_empty() {
-                Ok(())
-            } else {
-                let database = Arc::clone(&database);
-                let subkeys = subkeys.clone();
-                tokio::task::spawn_blocking(move || {
-                    apply_mutations(&database, &subkeys, mutations, durability)
-                })
-                .await
-                .map_err(|e| DaemonError::Crypto(format!("DB writer task failed: {e}")))
-                .and_then(|inner| inner)
-            };
-            if let Err(err) = result {
-                let msg = err.to_string();
-                for ack in acks {
-                    let _ = ack.send(Err(DaemonError::Crypto(msg.clone())));
+        let mut dirty = false;
+        let mut checkpoint = tokio::time::interval(checkpoint_interval);
+        checkpoint.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                maybe_first = rx.recv() => {
+                    let Some(first) = maybe_first else {
+                        if dirty {
+                            if let Err(err) = run_db_checkpoint(&database, &subkeys).await {
+                                eprintln!("WARNING: final DB checkpoint failed: {err}");
+                            }
+                        }
+                        break;
+                    };
+                    let durable = process_db_writer_batch(
+                        &database,
+                        &subkeys,
+                        first,
+                        &mut rx,
+                    )
+                    .await;
+                    match durable {
+                        Ok(true) => dirty = false,
+                        Ok(false) => dirty = true,
+                        Err(()) => {}
+                    }
                 }
-                eprintln!("WARNING: DB writer failed: {err}");
-            } else {
-                for ack in acks {
-                    let _ = ack.send(Ok(()));
+                _ = checkpoint.tick(), if dirty => {
+                    match run_db_checkpoint(&database, &subkeys).await {
+                        Ok(()) => dirty = false,
+                        Err(err) => eprintln!("WARNING: periodic DB checkpoint failed: {err}"),
+                    }
                 }
             }
         }
     });
     DbWriter { tx }
+}
+
+async fn process_db_writer_batch(
+    database: &Arc<Database>,
+    subkeys: &DbSubkeys,
+    first: WriteOp,
+    rx: &mut mpsc::Receiver<WriteOp>,
+) -> std::result::Result<bool, ()> {
+    let mut mutations = Vec::new();
+    let mut acks = Vec::new();
+    let mut durability = DbDurability::Eventual;
+    collect_write_op(first, &mut mutations, &mut acks, &mut durability);
+    while let Ok(op) = rx.try_recv() {
+        collect_write_op(op, &mut mutations, &mut acks, &mut durability);
+    }
+    let result = if mutations.is_empty() && acks.is_empty() {
+        Ok(())
+    } else {
+        let database = Arc::clone(database);
+        let subkeys = subkeys.clone();
+        tokio::task::spawn_blocking(move || {
+            apply_mutations(&database, &subkeys, mutations, durability)
+        })
+        .await
+        .map_err(|e| DaemonError::Crypto(format!("DB writer task failed: {e}")))
+        .and_then(|inner| inner)
+    };
+    if let Err(err) = result {
+        let msg = err.to_string();
+        for ack in acks {
+            let _ = ack.send(Err(DaemonError::Crypto(msg.clone())));
+        }
+        eprintln!("WARNING: DB writer failed: {err}");
+        Err(())
+    } else {
+        for ack in acks {
+            let _ = ack.send(Ok(()));
+        }
+        Ok(durability == DbDurability::Immediate)
+    }
+}
+
+async fn run_db_checkpoint(database: &Arc<Database>, subkeys: &DbSubkeys) -> Result<()> {
+    let database = Arc::clone(database);
+    let subkeys = subkeys.clone();
+    tokio::task::spawn_blocking(move || checkpoint_database(&database, &subkeys))
+        .await
+        .map_err(|e| DaemonError::Crypto(format!("DB checkpoint task failed: {e}")))?
 }
 
 fn collect_write_op(
@@ -591,6 +695,25 @@ fn apply_mutations(
         }
     }
     write.commit().map_err(redb_error)
+}
+
+fn checkpoint_database(database: &Database, subkeys: &DbSubkeys) -> Result<()> {
+    apply_mutations(
+        database,
+        subkeys,
+        vec![Mutation::Upsert {
+            key: LogicalKey::meta(),
+            record: StoredRecord {
+                record_type: RECORD_META,
+                channel_index: 0,
+                sub_id: 0,
+                payload: StoredPayload::Meta {
+                    verifier_hex: to_hex(REDB_META_VERIFIER),
+                },
+            },
+        }],
+        DbDurability::Immediate,
+    )
 }
 
 fn ensure_meta_record(database: &Database, subkeys: &DbSubkeys) -> Result<()> {
@@ -981,7 +1104,7 @@ fn plain_db_mutations(db: &PlainDb) -> Vec<Mutation> {
 
 pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()> {
     let state = init_daemon_state(cfg, master_secret)?;
-    tokio::spawn(scheduler_loop(state.clone()));
+    let scheduler = tokio::spawn(scheduler_loop(state.clone()));
     let control = ControlApi {
         state: state.clone(),
     };
@@ -999,9 +1122,11 @@ pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()>
         let inner = state.inner.lock().await;
         inner.cfg.peer_addr
     };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_task = tokio::spawn(wait_for_shutdown_signal(shutdown_tx));
     let control_server = Server::builder()
         .add_service(ControlServiceServer::new(control))
-        .serve(bind);
+        .serve_with_shutdown(bind, wait_for_shutdown(shutdown_rx.clone()));
     let peer_server = {
         let inner = state.inner.lock().await;
         let mut builder = Server::builder();
@@ -1010,10 +1135,47 @@ pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()>
         }
         builder
             .add_service(PeerServiceServer::new(peer))
-            .serve(peer_addr)
+            .serve_with_shutdown(peer_addr, wait_for_shutdown(shutdown_rx))
     };
-    tokio::try_join!(control_server, peer_server)?;
+    let server_result = tokio::try_join!(control_server, peer_server);
+    scheduler.abort();
+    shutdown_task.abort();
+    let flush_result = state.db_writer.flush().await;
+    server_result?;
+    flush_result?;
     Ok(())
+}
+
+async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            break;
+        }
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal(tx: watch::Sender<bool>) {
+    wait_for_process_shutdown().await;
+    let _ = tx.send(true);
+}
+
+async fn wait_for_process_shutdown() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn scheduler_loop(state: DaemonState) {
@@ -3717,7 +3879,37 @@ mod tests {
             .known_secrets
             .contains_key("7"));
         assert!(path.exists());
-        assert!(dir.path().join("db.enc.migrated").exists());
+        assert!(migrated_legacy_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_recovers_after_legacy_was_moved() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db.enc");
+        let master = vec![5u8; 32];
+        let mut db = PlainDb::default();
+        let mut channel = empty_channel_record();
+        channel.enabled = true;
+        channel
+            .known_secrets
+            .insert("9".to_owned(), "33".repeat(32));
+        db.channels.insert("4".to_owned(), channel);
+        write_legacy_db_for_test(&path, &master, &db);
+
+        let legacy = read_legacy_db(&path, &master).unwrap();
+        let temp = migration_temp_path(&path);
+        migrate_legacy_db(&temp, &master, &legacy).unwrap();
+        fs::rename(&path, migrated_legacy_path(&path)).unwrap();
+
+        let (loaded, writer) = DbStore::open(path.clone(), &master).unwrap();
+        close_writer_for_test(writer).await;
+        assert!(path.exists());
+        assert!(loaded
+            .channels
+            .get("4")
+            .unwrap()
+            .known_secrets
+            .contains_key("9"));
     }
 
     #[test]

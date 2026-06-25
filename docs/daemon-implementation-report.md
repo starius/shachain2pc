@@ -78,11 +78,13 @@ or per-record parse failures abort startup instead of silently wiping state.
 
 Writes are logical deltas sent to one background writer. Reveals and precompute
 enqueue eventual-durability batches; channel enable/disable requests use an
-immediate flush because they are rare registry changes. A crash may lose the
-latest unflushed cache tail, but redb preserves an older consistent snapshot,
-and the daemon can recompute lost cache state through MPC. The externally
-supplied `expected_next_index` remains the authority for reveal safety; the DB
-is never trusted as the channel-state frontier.
+immediate flush because they are rare registry changes. The writer also issues
+a periodic immediate checkpoint when eventual writes are dirty, and clean
+process shutdown drains and flushes the writer before exit. A power loss may
+still lose the latest uncheckpointed cache tail, but redb preserves an older
+consistent snapshot, and the daemon can recompute lost cache state through MPC.
+The externally supplied `expected_next_index` remains the authority for reveal
+safety; the DB is never trusted as the channel-state frontier.
 
 ## Frontier State
 

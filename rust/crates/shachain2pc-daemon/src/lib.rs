@@ -57,9 +57,6 @@ const DEFAULT_SSP_TARGET: u32 = 40;
 const DEFAULT_DELTA_CAP: u64 = 1u64 << 32;
 const PROTOCOL_VERSION: u32 = 1;
 const JOBSTREAM_SESSION_BINDING_DOMAIN: &[u8] = b"shachain2pc daemon JobStream precompute v1";
-const MIB: u64 = 1024 * 1024;
-const DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES: u64 = 192 * MIB;
-const DEFAULT_IDLE_SESSION_RSS_BYTES: u64 = MIB;
 const DEFAULT_PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_DB_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -195,7 +192,6 @@ struct Inner {
     db: PlainDb,
     active_jobs: BTreeMap<String, JobRecord>,
     next_job_id: u64,
-    baseline_daemon_rss_bytes: u64,
 }
 
 struct SecretBytes(Vec<u8>);
@@ -283,8 +279,6 @@ struct PeerFrontierConfig {
     precompute: u64,
     workers: u32,
     effective_workers: u32,
-    ram_limited_workers_raw: u32,
-    ram_overcommit_warning: bool,
     ssp_target: u32,
     delta_lifetime_checked_units_cap: u64,
 }
@@ -1194,7 +1188,6 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
     let (db, db_writer) = DbStore::open(cfg.db_path.clone(), &master_secret)?;
     let cookie = load_or_create_cookie(&cfg)?;
     let peer_channel = peer_channel_from_url(&cfg.peer_url, cfg.peer_tls.as_ref())?;
-    let baseline_daemon_rss_bytes = current_rss_bytes().unwrap_or(0);
     let sha = Arc::new(
         sha256_compress_gadget()
             .map_err(|e| DaemonError::Crypto(format!("failed to load SHA circuit: {e}")))?,
@@ -1207,7 +1200,6 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             db,
             active_jobs: BTreeMap::new(),
             next_job_id: 0,
-            baseline_daemon_rss_bytes,
         })),
         db_writer,
         grpc_jobs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2729,13 +2721,6 @@ impl DaemonState {
                 "all shared precompute workers are busy".to_owned(),
             ));
         }
-        if resources.ram_overcommit_warning || peer.ram_overcommit_warning {
-            eprintln!(
-                "WARNING: RAM budget is below the modeled idle-session plus one-worker floor; precompute may exceed max_ram_bytes (local_raw_workers={}, peer_raw_workers={})",
-                resources.ram_limited_workers_raw,
-                peer.ram_limited_workers_raw
-            );
-        }
         let reserved: u64 = inner
             .active_jobs
             .values()
@@ -2895,11 +2880,6 @@ impl DaemonState {
             return Err(DaemonError::Refused(
                 "all local precompute workers are busy".to_owned(),
             ));
-        }
-        if resources.ram_overcommit_warning {
-            eprintln!(
-                "WARNING: RAM budget is below the modeled idle-session plus one-worker floor; incoming precompute may exceed max_ram_bytes"
-            );
         }
         if inner
             .active_jobs
@@ -3092,8 +3072,6 @@ impl DaemonState {
             precompute: response.precompute,
             workers: response.workers,
             effective_workers: response.effective_workers.max(1),
-            ram_limited_workers_raw: response.ram_limited_workers_raw,
-            ram_overcommit_warning: response.ram_overcommit_warning,
             ssp_target: response.ssp_target,
             delta_lifetime_checked_units_cap: response.delta_lifetime_checked_units_cap,
         };
@@ -3533,57 +3511,19 @@ fn ssp_effective(ssp_target: u32, cap: u64) -> usize {
 }
 
 fn resource_model(inner: &Inner, live_session_count: u64) -> ResourceModel {
-    let current = current_rss_bytes().unwrap_or(0);
-    resource_model_with_current_rss(inner, live_session_count, current)
-}
-
-fn resource_model_with_current_rss(
-    inner: &Inner,
-    live_session_count: u64,
-    current: u64,
-) -> ResourceModel {
-    let baseline = inner.baseline_daemon_rss_bytes;
-    let idle_sessions = live_session_count.saturating_mul(DEFAULT_IDLE_SESSION_RSS_BYTES);
-    let modeled_floor = baseline.saturating_add(idle_sessions);
-    let active_jobs = inner.active_jobs.len() as u64;
-    let observed_floor =
-        current.saturating_sub(active_jobs.saturating_mul(DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES));
-    let rss_floor = modeled_floor.max(observed_floor);
-    let worker_budget = inner.cfg.max_ram_bytes.saturating_sub(rss_floor);
-    let raw = worker_budget / DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES;
-    let ram_limited_workers_raw = raw.min(u32::MAX as u64) as u32;
-    let ram_limited_workers = ram_limited_workers_raw.max(1);
-    let effective_workers = inner.cfg.workers.min(ram_limited_workers).max(1);
-    let modeled_reserved =
-        rss_floor.saturating_add(active_jobs.saturating_mul(DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES));
-    let active_reserved = active_jobs
-        .saturating_mul(DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES)
-        .saturating_add(idle_sessions);
-    let reserved_ram_bytes = modeled_reserved.max(current).max(active_reserved);
+    let configured_workers = inner.cfg.workers.max(1);
     ResourceModel {
-        configured_workers: inner.cfg.workers,
-        effective_workers,
-        ram_limited_workers_raw,
-        ram_overcommit_warning: ram_limited_workers_raw == 0,
-        baseline_daemon_rss_bytes: baseline,
-        current_rss_bytes: current,
-        idle_session_rss_estimate_bytes: DEFAULT_IDLE_SESSION_RSS_BYTES,
-        one_h_worker_peak_rss_estimate_bytes: DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES,
+        configured_workers,
+        effective_workers: configured_workers,
+        ram_limited_workers_raw: configured_workers,
+        ram_overcommit_warning: false,
+        baseline_daemon_rss_bytes: 0,
+        current_rss_bytes: 0,
+        idle_session_rss_estimate_bytes: 0,
+        one_h_worker_peak_rss_estimate_bytes: 0,
         live_session_count,
-        reserved_ram_bytes,
+        reserved_ram_bytes: 0,
     }
-}
-
-fn current_rss_bytes() -> Option<u64> {
-    let status = fs::read_to_string("/proc/self/status").ok()?;
-    parse_proc_status_kib(&status, "VmRSS:").map(|kib| kib.saturating_mul(1024))
-}
-
-fn parse_proc_status_kib(status: &str, field: &str) -> Option<u64> {
-    let line = status.lines().find(|line| line.starts_with(field))?;
-    let mut parts = line.split_whitespace();
-    let _name = parts.next()?;
-    parts.next()?.parse().ok()
 }
 
 fn set_bits_desc(value: u64) -> Vec<usize> {
@@ -3987,14 +3927,8 @@ mod tests {
     }
 
     #[test]
-    fn ram_model_derives_effective_workers_after_idle_sessions() {
-        let mut inner = test_inner(
-            100 * MIB
-                + 3 * DEFAULT_IDLE_SESSION_RSS_BYTES
-                + 2 * DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES,
-            8,
-            100 * MIB,
-        );
+    fn resource_model_uses_configured_workers_directly() {
+        let mut inner = test_inner(1, 8);
         inner.active_jobs.insert(
             "job".to_owned(),
             JobRecord {
@@ -4004,40 +3938,18 @@ mod tests {
                 planned_checked_units: 1,
             },
         );
-        let model = resource_model_with_current_rss(&inner, 3, 0);
+        let model = resource_model(&inner, 3);
         assert_eq!(model.configured_workers, 8);
-        assert_eq!(model.ram_limited_workers_raw, 2);
-        assert_eq!(model.effective_workers, 2);
+        assert_eq!(model.ram_limited_workers_raw, 8);
+        assert_eq!(model.effective_workers, 8);
         assert!(!model.ram_overcommit_warning);
-        assert_eq!(
-            model.reserved_ram_bytes,
-            100 * MIB + DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES + 3 * DEFAULT_IDLE_SESSION_RSS_BYTES
-        );
+        assert_eq!(model.baseline_daemon_rss_bytes, 0);
+        assert_eq!(model.current_rss_bytes, 0);
+        assert_eq!(model.reserved_ram_bytes, 0);
+        assert_eq!(model.live_session_count, 3);
     }
 
-    #[test]
-    fn ram_model_warns_but_keeps_one_effective_worker() {
-        let inner = test_inner(
-            100 * MIB + 3 * DEFAULT_IDLE_SESSION_RSS_BYTES - 1,
-            4,
-            100 * MIB,
-        );
-        let model = resource_model_with_current_rss(&inner, 3, 0);
-        assert_eq!(model.ram_limited_workers_raw, 0);
-        assert_eq!(model.effective_workers, 1);
-        assert!(model.ram_overcommit_warning);
-    }
-
-    #[test]
-    fn ram_model_accounts_for_observed_rss_floor() {
-        let inner = test_inner(1024 * MIB, 8, 100 * MIB);
-        let model = resource_model_with_current_rss(&inner, 0, 800 * MIB);
-        assert_eq!(model.ram_limited_workers_raw, 1);
-        assert_eq!(model.effective_workers, 1);
-        assert_eq!(model.reserved_ram_bytes, 800 * MIB);
-    }
-
-    fn test_inner(max_ram_bytes: u64, workers: u32, baseline_daemon_rss_bytes: u64) -> Inner {
+    fn test_inner(max_ram_bytes: u64, workers: u32) -> Inner {
         let dir = tempdir().unwrap();
         let master = vec![1u8; 32];
         Inner {
@@ -4060,7 +3972,6 @@ mod tests {
             db: PlainDb::default(),
             active_jobs: BTreeMap::new(),
             next_job_id: 0,
-            baseline_daemon_rss_bytes,
         }
     }
 

@@ -648,7 +648,7 @@ async fn daemon_pair_disable_channel_drops_live_sessions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn daemon_pair_low_ram_warns_but_allows_one_worker() {
+async fn daemon_pair_max_ram_does_not_limit_workers() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
     pair.cli(&pair.alice_control, &["config", "workers", "4"])
@@ -664,10 +664,10 @@ async fn daemon_pair_low_ram_warns_but_allows_one_worker() {
     let bob_status = pair.cli(&pair.bob_control, &["status"]).await;
     assert_eq!(status_field(&alice_status, "workers"), Some(4));
     assert_eq!(status_field(&bob_status, "workers"), Some(4));
-    assert_eq!(status_field(&alice_status, "effective_workers"), Some(1));
-    assert_eq!(status_field(&bob_status, "effective_workers"), Some(1));
-    assert!(alice_status.contains("ram_warning=true"), "{alice_status}");
-    assert!(bob_status.contains("ram_warning=true"), "{bob_status}");
+    assert_eq!(status_field(&alice_status, "effective_workers"), Some(4));
+    assert_eq!(status_field(&bob_status, "effective_workers"), Some(4));
+    assert!(alice_status.contains("ram_warning=false"), "{alice_status}");
+    assert!(bob_status.contains("ram_warning=false"), "{bob_status}");
 
     pair.cli(&pair.alice_control, &["channel", "enable", "27"])
         .await;

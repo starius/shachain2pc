@@ -438,10 +438,9 @@ service PeerService {
 
 `Hello` negotiates protocol versions, daemon identity, and supported features.
 
-`ConfigStream` exchanges live budgets and precompute settings:
+`ConfigStream` exchanges live worker budgets and precompute settings:
 
 ```text
-ram_budget_bytes
 worker_budget
 precompute_target
 ssp_target
@@ -528,19 +527,22 @@ metadata. The cookie file must be owner-readable only.
 
 ## Scheduler
 
-The scheduler has two resource budgets:
+The scheduler has two operator-provided budgets:
 
 ```text
-effective_ram_bytes = min(local_ram_bytes, peer_ram_bytes)
 effective_workers   = min(local_workers, peer_workers)
 effective_precompute = min(local_precompute, peer_precompute)
 ```
 
-Budgets are exchanged on the peer `ConfigStream`. If peer config is missing,
-background precompute is paused. Foreground reveal may still start if a fresh
-peer config can be obtained during reveal setup. A peer can grief liveness by
-advertising tiny budgets or `precompute=0`; this is not a confidentiality break,
-but it must be visible in status and logs.
+The daemon does not derive worker admission from RSS or a configured RAM cap.
+RAM sizing belongs to operations: set `workers` low enough for the host, and
+use the benchmark output to choose that value. `max_ram_bytes` is retained only
+as a legacy/informational configuration field. Budgets are exchanged on the peer
+`ConfigStream`. If peer config is missing, background precompute is paused.
+Foreground reveal may still start if a fresh peer config can be obtained during
+reveal setup. A peer can grief liveness by advertising tiny budgets or
+`precompute=0`; this is not a confidentiality break, but it must be visible in
+status and logs.
 
 Job classes:
 
@@ -569,37 +571,19 @@ Eviction rules:
 Planning loop:
 
 1. Read local config and last peer config.
-2. Compute effective budgets.
+2. Compute effective worker/precompute budgets from local and peer settings.
 3. For each enabled channel, compute desired frontier up to
    `effective_precompute`.
 4. Generate candidate one-H jobs from missing cache edges.
-5. Reserve RAM/workers for the highest-priority feasible target.
+5. Reserve a worker for the highest-priority feasible target.
 6. Start or reuse the channel's live precompute session through `JobStream`.
 7. Commit unrevealed outputs transactionally to the encrypted frontier, and
    commit any revealed outputs transactionally to DB.
 8. Re-plan after each commit, cancel, config update, or reveal request.
 
-RAM accounting is implemented as an idle-session-aware worker gate:
-
-```text
-admission_floor =
-    max(modeled_baseline_plus_idle_sessions,
-        current_rss_minus_active_worker_estimate)
-
-worker_budget = max_ram_bytes - admission_floor
-effective_workers =
-    min(configured_workers,
-        max(floor(worker_budget / one_h_worker_peak_estimate), 1))
-```
-
-If the raw RAM-derived count is zero, the daemon still exposes one effective
-worker and reports an overcommit warning. This keeps urgent work live while
-making the configured RAM violation visible.
-
-The current constants are intentionally conservative daemon-level estimates.
-They must be recalibrated from daemon benchmarks, not library-only party runs.
-`docs/daemon-integration-test-plan.md` records the active calibration and RAM
-optimization plan, including the known per-channel duplicate-circuit issue.
+Memory telemetry is measured by benchmarks and external process inspection, not
+used for daemon admission. Disabled channels must still drop all live session
+state so operators have a deterministic lever for freeing RAM.
 
 ## Cache Algorithm, Version 1
 
@@ -736,13 +720,14 @@ frames.
 5. **DB rollback vs external channel state.** A droppable DB is fine for cache
    state but dangerous for reveal sequence. The local API requires expected-index
    checks from day one.
-6. **RAM budget accounting.** Conservative estimates are safe but may underutilize
-   memory; aggressive estimates risk OOM. Start conservative and measure.
+6. **RAM sizing.** The daemon does not enforce a RAM budget. Operators choose
+   worker counts from benchmark RSS and host capacity; too many workers can OOM
+   the process.
 7. **Peer asymmetry.** Both sides may have different cache state. The protocol
    must routinely fall back to joint recomputation from a common authenticated
    ancestor or a revealed shachain ancestor.
 8. **Operational security.** The master secret unlocks both DB and future
    channel shares. CLI input, logs, core dumps, and process memory all matter.
 9. **Peer-budget griefing.** A peer can reduce liveness by advertising tiny
-   RAM, worker, or precompute budgets. This should produce clear status and
-   alerts, not silent stalls.
+   worker or precompute budgets. This should produce clear status and alerts,
+   not silent stalls.

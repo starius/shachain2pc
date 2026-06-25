@@ -31,7 +31,8 @@ The current `daemon_pair` integration suite already covers:
 - failed security-parameter negotiation monitoring;
 - expected-index reveal refusal.
 - panic-safe daemon child cleanup through `Drop`;
-- RAM-derived `effective_workers`, low-RAM warning, and precompute admission;
+- direct worker-count admission, with `max_ram_bytes` retained as an
+  informational field only;
 - disable behavior that refuses active precompute and frees live session state;
 - an ignored 100-channel benchmark that uses persistent local control gRPC
   clients and reports throughput, cached reveal latency, and per-node peak RSS.
@@ -211,19 +212,14 @@ enabled live sessions consume RAM independently of active worker count.
   session cache, because H applications are sequential within the session.
 - Report wall time separately from shallow I=2/I=3 cases.
 
-`daemon_bench_100_channels_low_ram_refusal`:
+`daemon_bench_one_channel_workers_100`:
 
-- Configure `max_ram_mb` below the estimated need.
-- Expected behavior: precompute queues or runs with only the RAM-derived
-  effective worker count.
-- If the RAM formula leaves no room for a worker, the daemon still allows one
-  worker and reports `ram_overcommit_warning`.
-
-If the idle-session-aware formula leaves room for zero workers, the daemon
-should still expose one effective worker and print/return a clear warning that
-the configured RAM budget is too low and may be exceeded. This preserves
-liveness for emergency reveal/precompute paths while making the operator-facing
-over-budget condition explicit.
+- Enable one channel, set both daemons to `workers=100`, and precompute a range
+  of consecutive targets.
+- Report fill throughput and active-job counts.
+- This answers whether a single channel can use many workers. The expected
+  result for the current design is no: one live per-channel session serializes
+  that channel's work, and only different channels run concurrently.
 
 ## RAM Optimization Findings And Plan
 
@@ -271,7 +267,7 @@ Implementation plan:
   test-only accessor;
 - add a grep guard or unit test that rejects `sha256_compress_gadget()` call
   sites outside one-time initialization and tests;
-- update RAM calibration after the change.
+- update daemon RSS measurements after the change.
 
 Expected result:
 
@@ -280,11 +276,11 @@ current circuit RAM  ~= 1.77 MiB * live_channel_count
 target circuit RAM   ~= 1.77 MiB total
 ```
 
-The worker-count benefit is indirect. Removing duplicate circuits lowers the
-idle RSS floor, which leaves more `max_ram` headroom for active one-H workers.
-The circuit itself must not be counted as a per-worker cost after this change.
-`Circuit` is immutable plain gate data and can be shared as `Arc<Circuit>`
-across tokio tasks without a lock or gate-data clone.
+Removing duplicate circuits lowers the idle RSS floor and lets operators choose
+a higher worker count for the same host. The circuit itself must not be counted
+as a per-worker cost after this change. `Circuit` is immutable plain gate data
+and can be shared as `Arc<Circuit>` across tokio tasks without a lock or
+gate-data clone.
 
 ### 2. Prune Live Session Cache Retention
 
@@ -464,7 +460,6 @@ steady_updates_per_second
 idle_rss_mb
 peak_rss_mb
 effective_workers
-ram_overcommit_warning
 ```
 
 ### Reveal Benchmarks
@@ -521,138 +516,29 @@ Current implementation status:
   daemon target, peer daemon target)`.
 - CPU budget: approximated only by the `workers` concurrency limit. There is no
   OS-level CPU quota or CPU-time admission control.
-- RAM budget: implemented for precompute admission. `max_ram_bytes` is parsed,
-  configurable, reported by status/config, and converted into
-  `effective_workers` using the idle-session-aware/current-RSS-aware formula
-  below. If the raw RAM-derived worker count is zero, the daemon still exposes
-  one effective worker and reports a RAM warning.
+- RAM budget: intentionally not implemented for admission. `max_ram_bytes` is
+  parsed, configurable, and reported for compatibility, but it does not reduce
+  `effective_workers`. Operations owns RAM sizing by choosing `workers` and by
+  watching benchmark/process RSS.
 
-The daemon has a measured or configured peak RAM cost per active one-H worker.
-It turns RAM into a worker cap and reuses the existing worker-budget machinery.
-
-The model is intentionally idle-session aware:
+The local worker admission rule is:
 
 ```text
-rss_floor =
-    baseline_daemon_rss +
-    live_idle_sessions * idle_session_rss_estimate
-
-observed_floor =
-    max(current_rss_bytes -
-        active_jobs * one_h_worker_peak_rss_estimate, 0)
-
-admission_floor = max(rss_floor, observed_floor)
-
-worker_ram_budget = max(max_ram_bytes - admission_floor, 0)
-
-ram_limited_workers_raw =
-    floor(worker_ram_budget / one_h_worker_peak_rss_estimate)
-
-ram_limited_workers = max(ram_limited_workers_raw, 1)
-
-ram_overcommit_warning =
-    ram_limited_workers_raw == 0
+effective_local_workers = configured_workers
+effective_shared_workers = min(local_effective_workers, peer_effective_workers)
 ```
 
-`admission_floor` uses the greater of the modeled floor and observed current RSS
-after subtracting currently active worker reservations. This catches memory
-consumers the simple formula missed, including allocator
-retention after previous H jobs, gRPC/HTTP2 buffers, TLS state, and DB buffers.
-The 100-channel benchmark showed this matters: after precompute completed, RSS
-remained much higher than the small live-session estimate alone.
-
-Then compute locally:
-
-```text
-effective_local_workers = min(configured_workers, ram_limited_workers)
-```
-
-If `ram_overcommit_warning` is true, the daemon should still allow one worker
-but must make the over-budget condition visible in logs, status, and benchmark
-output. This is a deliberate liveness choice: a badly undersized RAM budget
-should not make the daemon permanently unable to run the one job needed to catch
-up or serve an urgent operation, but the operator must be told that the host may
-exceed `max_ram_bytes`.
-
-The equivalent expanded formula is:
-
-```text
-ram_available_for_jobs =
-    max_ram_bytes -
-    baseline_daemon_rss -
-    live_idle_sessions * idle_session_rss_estimate
-
-ram_limited_workers =
-    max(floor(max(ram_available_for_jobs, 0) / one_h_worker_peak_rss_estimate), 1)
-
-effective_local_workers = min(configured_workers, ram_limited_workers)
-```
-
-Then use:
-
-```text
-effective_shared_workers =
-    min(local_effective_workers, peer_advertised_effective_workers)
-```
-
-Outgoing precompute must start only if `active_jobs < effective_shared_workers`.
-Incoming JobStream work must start only if
-`active_jobs < effective_local_workers`. If the effective worker count was
-forced to one from a raw zero, the job may run but must carry the warning
-described above.
-
-The peer config exchange should advertise both the configured `workers` and the
-derived `effective_workers`, plus the RAM inputs used to derive it. The
-scheduler should make decisions from `effective_workers`; configured `workers`
-is retained as the user-requested CPU/concurrency ceiling.
-
-The RAM estimate should reserve for active jobs and account for live sessions:
-
-```text
-estimated_job_rss = configured_or_measured_one_h_rss
-estimated_idle_session_rss = configured_or_measured_live_session_rss
-reserved_ram =
-    active_jobs * estimated_job_rss +
-    live_idle_sessions * estimated_idle_session_rss
-```
-
-The worker cap above is the main admission check. As a defensive backstop, a job
-should also warn when:
-
-```text
-reserved_ram + estimated_job_rss > local_max_ram
-```
-
-That backstop should not refuse the last effective worker unless an explicit
-strict mode is later added. The default policy is fail-loud and warn-loud, not
-deadlock on an undersized RAM setting.
-
-The first implementation can be conservative and static. Initial values should
-come from the measured one-H peak with a safety margin, for example:
-
-```text
-one_h_rss_estimate_mb = 192
-idle_session_rss_estimate_mb = 1
-```
-
-The initial worker estimate is intentionally conservative for the daemon, not
-the library-only party path. A 100-channel daemon benchmark with 4 workers
-observed per-node peak RSS in the 718-760 MB range, which includes tonic/tokio,
-mTLS, live sessions, worker allocation, and allocator-retained memory. The RAM
-gate should therefore treat the real daemon as the calibration source and
-continue refining this value from benchmark p95/peak data.
-
-Then the benchmark should replace guesses with observed p95/peak values. The
-daemon should expose `effective_workers`, reserved RAM, and observed peak RSS in
-`status` or a metrics endpoint before the benchmark becomes a regression gate.
+Outgoing precompute starts only if `active_jobs < effective_shared_workers`.
+Incoming JobStream work starts only if `active_jobs < effective_local_workers`.
+The peer config exchange still advertises `workers` and `effective_workers`;
+both are currently the same value. The legacy RAM telemetry fields are
+zeroed/inert.
 
 The policy should not normally tear down idle per-channel sessions just to admit
 more work. Idle sessions are the optimization that prevents re-deriving the
-trunk while both daemons remain alive, and their expected footprint is small.
-The RAM cap should primarily reduce active worker count. If a deployment sets
-`max_ram_bytes` too low to hold idle sessions plus one worker, the daemon should
-surface the condition explicitly instead of silently dropping reusable session
-state.
+trunk while both daemons remain alive. Operators must choose a worker count and
+enabled-channel set that fits the host. Benchmark RSS output remains the source
+of truth for that sizing.
 
 This is a deliberate "all enabled sessions resident" policy:
 
@@ -661,11 +547,11 @@ ram_floor ~= baseline_daemon_rss +
              enabled_live_channels * idle_session_rss_estimate
 ```
 
-Operators must size `max_ram_bytes` for the enabled-channel set, not only for
-currently active jobs. A future LRU policy could evict enabled-but-idle sessions
-and re-warm them on use, but that is not the current target because it trades
-predictable low-latency extension for extra re-warm churn. The explicit operator
-control for freeing this RAM is `channel disable`.
+Operators must size host RAM for the enabled-channel set and selected worker
+count. A future LRU policy could evict enabled-but-idle sessions and re-warm
+them on use, but that is not the current target because it trades predictable
+low-latency extension for extra re-warm churn. The explicit operator control
+for freeing this RAM is `channel disable`.
 
 Disabled channels are different: they must consume no live RAM. Disabling a
 channel must:
@@ -691,13 +577,14 @@ in-memory DB is material at large scale, split enabled-channel state from
 disabled durable records or lazy-load disabled records so disabled channels have
 no meaningful per-channel resident footprint.
 
-## Empirical RAM Calibration
+## Empirical RAM Measurement
 
-The RAM constants must come from real daemon runs, not from library-only party
-benchmarks. The daemon has extra fixed costs from tokio, tonic, rustls,
-encrypted DB state, local control service, peer service, mTLS certificates, and
-the live-session maps. The benchmark harness should provide a repeatable command
-that emits the calibrated numbers and the raw samples used to derive them.
+The daemon does not use RAM measurements for admission. Measurements still
+matter for operator sizing and for finding allocator or buffer retention. The
+daemon has extra fixed costs from tokio, tonic, rustls, encrypted DB state,
+local control service, peer service, mTLS certificates, and the live-session
+maps. The benchmark harness should provide a repeatable command that emits the
+raw samples used to choose an operational worker count.
 
 Use release builds and the same feature set as production measurements. Sample
 both daemon PIDs periodically from `/proc/<pid>/status`:
@@ -724,10 +611,6 @@ Suggested calibration sequence:
    - Enable no channels.
    - Wait for steady state.
    - Record `baseline_daemon_rss = max(VmRSS_alice, VmRSS_bob)`.
-   - The daemon should also self-measure its own `VmRSS` after startup
-     initialization and expose it as the default runtime
-     `baseline_daemon_rss`. Benchmarks then validate the self-measured value
-     instead of hardcoding a stale baseline across builds or deployments.
 
 2. **Channel metadata RSS**
    - Enable 100, then 1000 channels, but set precompute target to zero.
@@ -766,24 +649,22 @@ Suggested calibration sequence:
 
    - Repeat with `workers=2`, `workers=4`, and enough channels to keep workers
      busy. The slope of peak RSS against observed active jobs should match the
-     one-worker estimate. If it does not, record the higher p95/peak value and
-     use that for admission control.
+     one-worker estimate. If it does not, record the higher p95/peak value for
+     operator sizing.
 
 5. **Deep target peak check**
    - Run a StartIndex-region target with many set bits.
    - Peak RSS should stay near one active H worker plus idle session state. If
-     it grows with depth, investigate retained per-H temporaries before trusting
-     the RAM formula.
+     it grows with depth, investigate retained per-H temporaries.
 
 6. **Other-consumer audit**
-   - Compare the formula-predicted RSS against observed RSS for 100 and 1000
-     channels.
-   - Any persistent unexplained delta should be broken down before enabling the
-     RAM gate. Candidates include gRPC buffers, HTTP/2 flow-control windows,
-     DB serialization buffers, TLS state, pending fault-test channels, and
-     retained known-secret/frontier vectors.
+   - Compare expected RSS terms against observed RSS for 100 and 1000 channels.
+   - Any persistent unexplained delta should be broken down before trusting
+     operator-sizing guidance. Candidates include glibc arena retention, gRPC
+     buffers, HTTP/2 flow-control windows, DB serialization buffers, TLS state,
+     pending fault-test channels, and retained known-secret/frontier vectors.
 
-The benchmark JSON should include both configured estimates and measured values:
+The benchmark JSON should include configured knobs and measured values:
 
 ```json
 {
@@ -794,9 +675,7 @@ The benchmark JSON should include both configured estimates and measured values:
     "one_h_worker_peak_rss_estimate_mb": 0,
     "configured_max_ram_mb": 0,
     "configured_workers": 0,
-    "ram_limited_workers_raw": 0,
-    "effective_workers": 0,
-    "ram_overcommit_warning": false
+    "effective_workers": 0
   }
 }
 ```
@@ -1051,44 +930,21 @@ Expected:
 - The peer also enforces its own worker budget.
 - No over-cap active jobs appear in `jobs`.
 
-### `daemon_pair_ram_budget_derives_effective_workers`
+### `daemon_pair_max_ram_does_not_limit_workers`
 
-Goal: prove `max_ram_bytes` reduces active worker concurrency using the
-idle-session-aware formula.
-
-Scenario:
-
-1. Configure `workers=8`.
-2. Configure static test estimates for baseline RSS, idle-session RSS, and
-   one-H worker peak RSS.
-3. Enable enough channels to create live idle sessions.
-4. Set `max_ram_bytes` so the formula yields `ram_limited_workers_raw=2`.
-5. Start several manual or background precomputes.
-
-Expected:
-
-- Status reports `configured_workers=8`, `effective_workers=2`, and no
-  overcommit warning.
-- At most two active precompute jobs run locally.
-- The peer sees and uses the advertised effective worker count.
-
-### `daemon_pair_ram_budget_warns_but_allows_one_worker`
-
-Goal: preserve liveness when RAM is configured below the idle-session floor.
+Goal: prove RAM configuration is informational and worker admission is direct.
 
 Scenario:
 
 1. Configure `workers=4`.
-2. Create enough live idle sessions that
-   `max_ram_bytes - rss_floor < one_h_worker_peak_rss_estimate`.
+2. Configure `max_ram_bytes` to an unrealistically low value.
 3. Request one precompute.
 
 Expected:
 
-- Status reports `ram_limited_workers_raw=0`, `effective_workers=1`, and a
-  RAM overcommit warning.
-- Exactly one precompute may run.
-- No second concurrent precompute starts while the warning condition remains.
+- Status reports `workers=4` and `effective_workers=4`.
+- No RAM warning is reported.
+- Precompute admission is controlled by worker count, not RAM.
 
 ### `daemon_pair_peer_budget_shrink_stops_new_background_work`
 

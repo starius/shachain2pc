@@ -53,7 +53,7 @@ const JOBSTREAM_SESSION_BINDING_DOMAIN: &[u8] = b"shachain2pc daemon JobStream p
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_ONE_H_WORKER_PEAK_RSS_BYTES: u64 = 192 * MIB;
 const DEFAULT_IDLE_SESSION_RSS_BYTES: u64 = MIB;
-const PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
+const DEFAULT_PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -1629,7 +1629,7 @@ impl DaemonState {
             }
         }
         self.pending_reveal_notify.notify_waiters();
-        match timeout(PEER_REVEAL_WAIT, rx).await {
+        match timeout(peer_reveal_wait(), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(DaemonError::Refused(
                 "cached reveal peer handler stopped".to_owned(),
@@ -1668,7 +1668,7 @@ impl DaemonState {
     }
 
     async fn take_pending_reveal(&self, key: RevealRequestKey) -> Result<PendingReveal> {
-        timeout(PEER_REVEAL_WAIT, async {
+        timeout(peer_reveal_wait(), async {
             loop {
                 let notified = self.pending_reveal_notify.notified();
                 if let Some(pending) = self.pending_reveals.lock().await.remove(&key) {
@@ -2427,6 +2427,14 @@ fn parse_mac_digest(bytes: Vec<u8>, context: &str) -> Result<[u8; HASH_DIGEST_BY
     let mut out = [0u8; HASH_DIGEST_BYTES];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+fn peer_reveal_wait() -> Duration {
+    std::env::var("SHACHAIN2PC_PEER_REVEAL_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_PEER_REVEAL_WAIT)
 }
 
 fn binding_pair(inner: &Inner, channel_index: u64, mask: u64) -> ([u8; 32], [u8; 32]) {

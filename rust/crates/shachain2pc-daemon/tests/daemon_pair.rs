@@ -283,6 +283,87 @@ async fn daemon_bench_1000_channels_idle_floor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark harness; run explicitly"]
+async fn daemon_bench_one_channel_workers_100() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start_mtls().await;
+    pair.cli(&pair.alice_control, &["config", "workers", "100"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "workers", "100"])
+        .await;
+    pair.cli(&pair.alice_control, &["config", "precompute", "25"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "25"])
+        .await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "9000"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "9000"])
+        .await;
+
+    let precompute_start = Instant::now();
+    let mut max_alice_jobs = 0;
+    let mut max_bob_jobs = 0;
+    let mut samples = 0u64;
+    timeout(Duration::from_secs(600), async {
+        loop {
+            let alice_status = pair.cli(&pair.alice_control, &["status"]).await;
+            let bob_status = pair.cli(&pair.bob_control, &["status"]).await;
+            max_alice_jobs = max_alice_jobs.max(status_field(&alice_status, "jobs").unwrap_or(0));
+            max_bob_jobs = max_bob_jobs.max(status_field(&bob_status, "jobs").unwrap_or(0));
+            samples = samples.saturating_add(1);
+            let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+            let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
+            if alice_channels.contains("channel=9000 ")
+                && alice_channels.contains("frontier=25")
+                && bob_channels.contains("channel=9000 ")
+                && bob_channels.contains("frontier=25")
+            {
+                return;
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .unwrap();
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
+
+    let precompute_ms = precompute_start.elapsed().as_millis() as u64;
+    let alice_idle = pair.alice.vm_rss_bytes().unwrap_or(0);
+    let bob_idle = pair.bob.vm_rss_bytes().unwrap_or(0);
+    let alice_hwm = pair.alice.vm_hwm_bytes().unwrap_or(0);
+    let bob_hwm = pair.bob.vm_hwm_bytes().unwrap_or(0);
+    let summary = serde_json::json!({
+        "channels": 1,
+        "workers": 100,
+        "target_frontier": 25,
+        "precompute": {
+            "committed": 25,
+            "wall_ms": precompute_ms,
+            "ms_per_secret": precompute_ms as f64 / 25.0,
+            "secrets_per_second": 25_000.0 / precompute_ms.max(1) as f64
+        },
+        "observed_active_jobs": {
+            "samples": samples,
+            "alice_max": max_alice_jobs,
+            "bob_max": max_bob_jobs
+        },
+        "rss": {
+            "alice_idle_mb": alice_idle / (1024 * 1024),
+            "bob_idle_mb": bob_idle / (1024 * 1024),
+            "pair_idle_sum_mb": (alice_idle + bob_idle) / (1024 * 1024),
+            "alice_peak_mb": alice_hwm / (1024 * 1024),
+            "bob_peak_mb": bob_hwm / (1024 * 1024),
+            "pair_peak_sum_mb": (alice_hwm + bob_hwm) / (1024 * 1024)
+        },
+        "alice_status": pair.cli(&pair.alice_control, &["status"]).await.trim(),
+        "bob_status": pair.cli(&pair.bob_control, &["status"]).await.trim()
+    });
+    println!("{summary}");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_pair_seed_reveal_restart_and_local_cache() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;

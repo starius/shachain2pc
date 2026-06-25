@@ -13,7 +13,8 @@ This report records the implementation state of the daemon and CLI work.
   - a local gRPC control API and `shachain-cli`;
   - a peer gRPC API for hello/config/frontier discovery;
   - cookie-authenticated local control over loopback TCP;
-  - encrypted JSON state using a key derived from the daemon master secret;
+  - encrypted redb persistence using subkeys derived from the daemon master
+    secret;
   - deterministic per-channel seed shares and fixed per-channel Delta;
   - enable/disable, status/config, list, and reveal commands;
   - mandatory `expected_next_index` gating for non-local reveals;
@@ -29,6 +30,9 @@ This report records the implementation state of the daemon and CLI work.
   as authenticated in-band JobStream commands, so adjacent precomputes reuse the
   labeled in-memory shachain frontier instead of re-authenticating the seed and
   re-deriving shared prefixes while both parties remain up.
+- RAM-authoritative persistence: daemon state is reconstructed into memory at
+  startup, and later mutations enqueue logical redb deltas through one
+  background writer instead of rewriting a full encrypted JSON blob.
 
 ## Integration Coverage
 
@@ -53,6 +57,32 @@ with the real CLI. It verifies:
 - live-session reuse across adjacent targets (`2` then `3`), proving the second
   target costs one H rather than re-deriving the two-H path.
 - peer mTLS JobStream precompute and cached reveal.
+- cached reveal rejection for missing local authorization, binding mismatch, and
+  tampered peer shares.
+- encrypted redb round-trip, wrong-master rejection, tamper rejection, key
+  opacity/addressability, and one-time migration from the legacy encrypted JSON
+  blob.
+
+## Persistence
+
+The daemon persists state in one redb table with opaque HMAC-SHA256 keys and
+AEAD-encrypted values. The HMAC key subkey and value-AEAD subkey are derived
+from the daemon master secret with separate HKDF labels. Values use fresh
+AES-256-GCM nonces and bind the ciphertext to the opaque stored key as AAD, so
+records cannot be relocated between logical keys.
+
+Each encrypted value includes its logical record type, channel index, sub-id,
+and payload. Startup verifies the encrypted meta record, scans every value, and
+reconstructs the in-memory channel map. Wrong master secrets, value tampering,
+or per-record parse failures abort startup instead of silently wiping state.
+
+Writes are logical deltas sent to one background writer. Reveals and precompute
+enqueue eventual-durability batches; channel enable/disable requests use an
+immediate flush because they are rare registry changes. A crash may lose the
+latest unflushed cache tail, but redb preserves an older consistent snapshot,
+and the daemon can recompute lost cache state through MPC. The externally
+supplied `expected_next_index` remains the authority for reveal safety; the DB
+is never trusted as the channel-state frontier.
 
 ## Frontier State
 

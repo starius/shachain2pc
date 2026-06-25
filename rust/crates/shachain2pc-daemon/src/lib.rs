@@ -7,6 +7,7 @@ use openssl::rand::rand_bytes;
 use openssl::symm::{decrypt_aead, encrypt_aead, Cipher};
 use pb::control_service_server::{ControlService, ControlServiceServer};
 use pb::peer_service_server::{PeerService, PeerServiceServer};
+use redb::{Database, Durability, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shachain2pc_circuit::{generate_from_seed, sha256_compress_gadget, Circuit};
@@ -46,6 +47,12 @@ const DB_AAD: &[u8] = b"shachain2pc daemon db v1";
 const DB_SALT_LEN: usize = 32;
 const DB_NONCE_LEN: usize = 12;
 const DB_TAG_LEN: usize = 16;
+const REDB_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("r");
+const REDB_META_VERIFIER: &[u8] = b"shachain2pc daemon redb verifier v1";
+const RECORD_META: u8 = 0;
+const RECORD_CHANNEL: u8 = 1;
+const RECORD_SECRET: u8 = 2;
+const RECORD_FRONTIER: u8 = 3;
 const DEFAULT_SSP_TARGET: u32 = 40;
 const DEFAULT_DELTA_CAP: u64 = 1u64 << 32;
 const PROTOCOL_VERSION: u32 = 1;
@@ -170,6 +177,7 @@ impl DaemonHandle {
 #[derive(Clone)]
 pub struct DaemonState {
     inner: Arc<Mutex<Inner>>,
+    db_writer: DbWriter,
     grpc_jobs: Arc<Mutex<BTreeMap<String, PendingGrpcJob>>>,
     pending_reveals: Arc<Mutex<BTreeMap<RevealRequestKey, PendingReveal>>>,
     pending_reveal_notify: Arc<Notify>,
@@ -183,7 +191,6 @@ struct Inner {
     cfg: DaemonConfig,
     master_secret: SecretBytes,
     cookie: String,
-    store: EncryptedStore,
     db: PlainDb,
     active_jobs: BTreeMap<String, JobRecord>,
     next_job_id: u64,
@@ -201,6 +208,34 @@ impl Drop for SecretBytes {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PlainDb {
     channels: BTreeMap<String, ChannelRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ChannelScalars {
+    enabled: bool,
+    last_observed_next_reveal_index: Option<u64>,
+    precompute_target: u64,
+    ssp_target: u32,
+    delta_lifetime_checked_units_cap: u64,
+    estimated_checked_units: u64,
+    attempted_checked_units: u64,
+    failed_precompute_jobs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredRecord {
+    record_type: u8,
+    channel_index: u64,
+    sub_id: u64,
+    payload: StoredPayload,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredPayload {
+    Meta { verifier_hex: String },
+    Channel(ChannelScalars),
+    Secret { secret_hex: String },
+    Frontier(WireRecord),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -332,75 +367,616 @@ enum PrecomputeSessionCommand {
     },
 }
 
-struct EncryptedStore {
-    path: PathBuf,
-    salt: [u8; DB_SALT_LEN],
+#[derive(Clone)]
+struct DbWriter {
+    tx: mpsc::Sender<WriteOp>,
 }
 
-impl EncryptedStore {
-    fn open(path: PathBuf, master_secret: &[u8]) -> Result<(Self, PlainDb)> {
-        if !path.exists() {
-            let mut salt = [0u8; DB_SALT_LEN];
-            rand_bytes(&mut salt).map_err(|e| DaemonError::Crypto(e.to_string()))?;
-            return Ok((Self { path, salt }, PlainDb::default()));
-        }
+enum WriteOp {
+    Batch {
+        mutations: Vec<Mutation>,
+        durability: DbDurability,
+    },
+    Flush {
+        ack: oneshot::Sender<Result<()>>,
+    },
+}
 
-        let bytes = fs::read(&path)?;
-        if bytes.len() < DB_MAGIC.len() + DB_SALT_LEN + DB_NONCE_LEN + DB_TAG_LEN
-            || &bytes[..DB_MAGIC.len()] != DB_MAGIC
-        {
-            return Err(DaemonError::Crypto(
-                "encrypted DB has an invalid header".to_owned(),
-            ));
-        }
-        let mut cursor = DB_MAGIC.len();
-        let salt = read_array::<DB_SALT_LEN>(&bytes, &mut cursor)?;
-        let nonce = read_array::<DB_NONCE_LEN>(&bytes, &mut cursor)?;
-        let tag = read_array::<DB_TAG_LEN>(&bytes, &mut cursor)?;
-        let ciphertext = &bytes[cursor..];
-        let key = derive_db_key(master_secret, &salt);
-        let plaintext = decrypt_aead(
-            Cipher::aes_256_gcm(),
-            &key,
-            Some(&nonce),
-            DB_AAD,
-            ciphertext,
-            &tag,
-        )
-        .map_err(|e| DaemonError::Crypto(e.to_string()))?;
-        let db = serde_json::from_slice(&plaintext)?;
-        Ok((Self { path, salt }, db))
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DbDurability {
+    Eventual,
+    Immediate,
+}
 
-    fn save(&self, master_secret: &[u8], db: &PlainDb) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
+#[derive(Clone, Debug)]
+enum Mutation {
+    Upsert {
+        key: LogicalKey,
+        record: StoredRecord,
+    },
+    Delete {
+        key: LogicalKey,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicalKey {
+    record_type: u8,
+    channel_index: u64,
+    sub_id: u64,
+}
+
+struct DbStore;
+
+impl DbStore {
+    fn open(path: PathBuf, master_secret: &[u8]) -> Result<(PlainDb, DbWriter)> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let plaintext = serde_json::to_vec_pretty(db)?;
-        let key = derive_db_key(master_secret, &self.salt);
-        let mut nonce = [0u8; DB_NONCE_LEN];
-        let mut tag = [0u8; DB_TAG_LEN];
-        rand_bytes(&mut nonce).map_err(|e| DaemonError::Crypto(e.to_string()))?;
-        let ciphertext = encrypt_aead(
-            Cipher::aes_256_gcm(),
-            &key,
-            Some(&nonce),
-            DB_AAD,
-            &plaintext,
-            &mut tag,
-        )
-        .map_err(|e| DaemonError::Crypto(e.to_string()))?;
-        let mut out = Vec::with_capacity(
-            DB_MAGIC.len() + DB_SALT_LEN + DB_NONCE_LEN + DB_TAG_LEN + ciphertext.len(),
-        );
-        out.extend_from_slice(DB_MAGIC);
-        out.extend_from_slice(&self.salt);
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&tag);
-        out.extend_from_slice(&ciphertext);
-        fs::write(&self.path, out)?;
-        Ok(())
+        if is_legacy_db_file(&path)? {
+            let legacy = read_legacy_db(&path, master_secret)?;
+            let migrated = path.with_extension(format!(
+                "{}.migrated",
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("db")
+            ));
+            fs::rename(&path, migrated)?;
+            migrate_legacy_db(&path, master_secret, &legacy)?;
+            return Self::open(path, master_secret);
+        }
+
+        let subkeys = DbSubkeys::derive(master_secret);
+        let database = if path.exists() {
+            Database::open(&path).map_err(redb_error)?
+        } else {
+            Database::create(&path).map_err(redb_error)?
+        };
+        ensure_meta_record(&database, &subkeys)?;
+        let db = load_redb_state(&database, &subkeys)?;
+        let writer = spawn_db_writer(database, subkeys);
+        Ok((db, writer))
     }
+}
+
+#[derive(Clone)]
+struct DbSubkeys {
+    key_prf: [u8; 32],
+    value_aead: [u8; 32],
+}
+
+impl DbSubkeys {
+    fn derive(master_secret: &[u8]) -> Self {
+        let mut key_prf = [0u8; 32];
+        let mut value_aead = [0u8; 32];
+        hkdf_expand(master_secret, b"", b"shachain-db-key-prf-v1", &mut key_prf);
+        hkdf_expand(
+            master_secret,
+            b"",
+            b"shachain-db-value-aead-v1",
+            &mut value_aead,
+        );
+        Self {
+            key_prf,
+            value_aead,
+        }
+    }
+}
+
+impl DbWriter {
+    async fn write_batch(&self, mutations: Vec<Mutation>, durability: DbDurability) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let op = WriteOp::Batch {
+            mutations,
+            durability,
+        };
+        match self.tx.try_send(op) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(op)) => {
+                eprintln!("WARNING: DB writer queue is full; waiting for enqueue");
+                self.tx
+                    .send(op)
+                    .await
+                    .map_err(|_| DaemonError::Crypto("DB writer stopped".to_owned()))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(DaemonError::Crypto("DB writer stopped".to_owned()))
+            }
+        }
+    }
+
+    async fn flush(&self) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.tx
+            .send(WriteOp::Flush { ack })
+            .await
+            .map_err(|_| DaemonError::Crypto("DB writer stopped".to_owned()))?;
+        rx.await
+            .map_err(|_| DaemonError::Crypto("DB writer stopped".to_owned()))?
+    }
+}
+
+fn spawn_db_writer(database: Database, subkeys: DbSubkeys) -> DbWriter {
+    let (tx, mut rx) = mpsc::channel(16_384);
+    let database = Arc::new(database);
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut mutations = Vec::new();
+            let mut acks = Vec::new();
+            let mut durability = DbDurability::Eventual;
+            collect_write_op(first, &mut mutations, &mut acks, &mut durability);
+            while let Ok(op) = rx.try_recv() {
+                collect_write_op(op, &mut mutations, &mut acks, &mut durability);
+            }
+            let result = if mutations.is_empty() && acks.is_empty() {
+                Ok(())
+            } else {
+                let database = Arc::clone(&database);
+                let subkeys = subkeys.clone();
+                tokio::task::spawn_blocking(move || {
+                    apply_mutations(&database, &subkeys, mutations, durability)
+                })
+                .await
+                .map_err(|e| DaemonError::Crypto(format!("DB writer task failed: {e}")))
+                .and_then(|inner| inner)
+            };
+            if let Err(err) = result {
+                let msg = err.to_string();
+                for ack in acks {
+                    let _ = ack.send(Err(DaemonError::Crypto(msg.clone())));
+                }
+                eprintln!("WARNING: DB writer failed: {err}");
+            } else {
+                for ack in acks {
+                    let _ = ack.send(Ok(()));
+                }
+            }
+        }
+    });
+    DbWriter { tx }
+}
+
+fn collect_write_op(
+    op: WriteOp,
+    mutations: &mut Vec<Mutation>,
+    acks: &mut Vec<oneshot::Sender<Result<()>>>,
+    durability: &mut DbDurability,
+) {
+    match op {
+        WriteOp::Batch {
+            mutations: batch,
+            durability: batch_durability,
+        } => {
+            mutations.extend(batch);
+            if batch_durability == DbDurability::Immediate {
+                *durability = DbDurability::Immediate;
+            }
+        }
+        WriteOp::Flush { ack } => {
+            *durability = DbDurability::Immediate;
+            acks.push(ack);
+        }
+    }
+}
+
+fn apply_mutations(
+    database: &Database,
+    subkeys: &DbSubkeys,
+    mutations: Vec<Mutation>,
+    durability: DbDurability,
+) -> Result<()> {
+    let mut write = database.begin_write().map_err(redb_error)?;
+    write.set_durability(match durability {
+        DbDurability::Eventual => Durability::Eventual,
+        DbDurability::Immediate => Durability::Immediate,
+    });
+    {
+        let mut table = write.open_table(REDB_TABLE).map_err(redb_error)?;
+        for mutation in mutations {
+            match mutation {
+                Mutation::Upsert { key, record } => {
+                    let stored_key = stored_key(subkeys, key);
+                    let value = encrypt_stored_record(subkeys, &stored_key, &record)?;
+                    table
+                        .insert(stored_key.as_slice(), value.as_slice())
+                        .map_err(redb_error)?;
+                }
+                Mutation::Delete { key } => {
+                    let stored_key = stored_key(subkeys, key);
+                    table.remove(stored_key.as_slice()).map_err(redb_error)?;
+                }
+            }
+        }
+    }
+    write.commit().map_err(redb_error)
+}
+
+fn ensure_meta_record(database: &Database, subkeys: &DbSubkeys) -> Result<()> {
+    let mut write = database.begin_write().map_err(redb_error)?;
+    write.set_durability(Durability::Immediate);
+    let key = LogicalKey::meta();
+    let stored_key = stored_key(subkeys, key);
+    {
+        let mut table = write.open_table(REDB_TABLE).map_err(redb_error)?;
+        let existing = table
+            .get(stored_key.as_slice())
+            .map_err(redb_error)?
+            .map(|value| value.value().to_vec());
+        if let Some(value) = existing {
+            let record = decrypt_stored_record(subkeys, &stored_key, &value)?;
+            validate_meta_record(&record)?;
+        } else {
+            let record = StoredRecord {
+                record_type: RECORD_META,
+                channel_index: 0,
+                sub_id: 0,
+                payload: StoredPayload::Meta {
+                    verifier_hex: to_hex(REDB_META_VERIFIER),
+                },
+            };
+            let value = encrypt_stored_record(subkeys, &stored_key, &record)?;
+            table
+                .insert(stored_key.as_slice(), value.as_slice())
+                .map_err(redb_error)?;
+        }
+    }
+    write.commit().map_err(redb_error)
+}
+
+fn load_redb_state(database: &Database, subkeys: &DbSubkeys) -> Result<PlainDb> {
+    let read = database.begin_read().map_err(redb_error)?;
+    let table = read.open_table(REDB_TABLE).map_err(redb_error)?;
+    let mut db = PlainDb::default();
+    for item in table.iter().map_err(redb_error)? {
+        let (key, value) = item.map_err(redb_error)?;
+        let key = key.value().to_vec();
+        let record = decrypt_stored_record(subkeys, &key, value.value())?;
+        apply_stored_record(&mut db, record)?;
+    }
+    Ok(db)
+}
+
+fn apply_stored_record(db: &mut PlainDb, record: StoredRecord) -> Result<()> {
+    match &record.payload {
+        StoredPayload::Meta { .. } => validate_meta_record(&record),
+        StoredPayload::Channel(scalars) => {
+            if record.record_type != RECORD_CHANNEL || record.sub_id != 0 {
+                return Err(DaemonError::Crypto(
+                    "stored channel record has a bad logical key".to_owned(),
+                ));
+            }
+            let channel = db
+                .channels
+                .entry(channel_key(record.channel_index))
+                .or_insert_with(empty_channel_record);
+            channel.apply_scalars(scalars.clone());
+            Ok(())
+        }
+        StoredPayload::Secret { secret_hex } => {
+            if record.record_type != RECORD_SECRET {
+                return Err(DaemonError::Crypto(
+                    "stored secret record has a bad logical key".to_owned(),
+                ));
+            }
+            let channel = db
+                .channels
+                .entry(channel_key(record.channel_index))
+                .or_insert_with(empty_channel_record);
+            channel
+                .known_secrets
+                .insert(record.sub_id.to_string(), secret_hex.clone());
+            Ok(())
+        }
+        StoredPayload::Frontier(wire) => {
+            if record.record_type != RECORD_FRONTIER {
+                return Err(DaemonError::Crypto(
+                    "stored frontier record has a bad logical key".to_owned(),
+                ));
+            }
+            let channel = db
+                .channels
+                .entry(channel_key(record.channel_index))
+                .or_insert_with(empty_channel_record);
+            channel
+                .frontier_nodes
+                .insert(record.sub_id.to_string(), wire.clone());
+            Ok(())
+        }
+    }
+}
+
+fn validate_meta_record(record: &StoredRecord) -> Result<()> {
+    match &record.payload {
+        StoredPayload::Meta { verifier_hex }
+            if record.record_type == RECORD_META
+                && record.channel_index == 0
+                && record.sub_id == 0
+                && verifier_hex == &to_hex(REDB_META_VERIFIER) =>
+        {
+            Ok(())
+        }
+        _ => Err(DaemonError::Crypto(
+            "encrypted DB verifier record is invalid".to_owned(),
+        )),
+    }
+}
+
+fn encrypt_stored_record(
+    subkeys: &DbSubkeys,
+    stored_key: &[u8; 32],
+    record: &StoredRecord,
+) -> Result<Vec<u8>> {
+    let plaintext = serde_json::to_vec(record)?;
+    let mut nonce = [0u8; DB_NONCE_LEN];
+    let mut tag = [0u8; DB_TAG_LEN];
+    rand_bytes(&mut nonce).map_err(|e| DaemonError::Crypto(e.to_string()))?;
+    let ciphertext = encrypt_aead(
+        Cipher::aes_256_gcm(),
+        &subkeys.value_aead,
+        Some(&nonce),
+        stored_key,
+        &plaintext,
+        &mut tag,
+    )
+    .map_err(|e| DaemonError::Crypto(e.to_string()))?;
+    let mut out = Vec::with_capacity(DB_NONCE_LEN + DB_TAG_LEN + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_stored_record(
+    subkeys: &DbSubkeys,
+    stored_key: &[u8],
+    value: &[u8],
+) -> Result<StoredRecord> {
+    if stored_key.len() != 32 {
+        return Err(DaemonError::Crypto(
+            "encrypted DB stored key has a bad length".to_owned(),
+        ));
+    }
+    if value.len() < DB_NONCE_LEN + DB_TAG_LEN {
+        return Err(DaemonError::Crypto(
+            "encrypted DB value is truncated".to_owned(),
+        ));
+    }
+    let nonce: [u8; DB_NONCE_LEN] = value[..DB_NONCE_LEN]
+        .try_into()
+        .expect("nonce length checked");
+    let tag: [u8; DB_TAG_LEN] = value[DB_NONCE_LEN..DB_NONCE_LEN + DB_TAG_LEN]
+        .try_into()
+        .expect("tag length checked");
+    let ciphertext = &value[DB_NONCE_LEN + DB_TAG_LEN..];
+    let plaintext = decrypt_aead(
+        Cipher::aes_256_gcm(),
+        &subkeys.value_aead,
+        Some(&nonce),
+        stored_key,
+        ciphertext,
+        &tag,
+    )
+    .map_err(|e| DaemonError::Crypto(e.to_string()))?;
+    Ok(serde_json::from_slice(&plaintext)?)
+}
+
+fn stored_key(subkeys: &DbSubkeys, key: LogicalKey) -> [u8; 32] {
+    // Deterministic HMAC keys keep records addressable while hiding channel
+    // ids and indices. The store still leaks record count and update pattern.
+    hmac_sha256(&subkeys.key_prf, &key.canonical_bytes())
+}
+
+fn is_legacy_db_file(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let bytes = fs::read(path)?;
+    Ok(bytes.starts_with(DB_MAGIC))
+}
+
+fn read_legacy_db(path: &Path, master_secret: &[u8]) -> Result<PlainDb> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < DB_MAGIC.len() + DB_SALT_LEN + DB_NONCE_LEN + DB_TAG_LEN
+        || &bytes[..DB_MAGIC.len()] != DB_MAGIC
+    {
+        return Err(DaemonError::Crypto(
+            "legacy encrypted DB has an invalid header".to_owned(),
+        ));
+    }
+    let mut cursor = DB_MAGIC.len();
+    let salt = read_array::<DB_SALT_LEN>(&bytes, &mut cursor)?;
+    let nonce = read_array::<DB_NONCE_LEN>(&bytes, &mut cursor)?;
+    let tag = read_array::<DB_TAG_LEN>(&bytes, &mut cursor)?;
+    let ciphertext = &bytes[cursor..];
+    let key = derive_db_key(master_secret, &salt);
+    let plaintext = decrypt_aead(
+        Cipher::aes_256_gcm(),
+        &key,
+        Some(&nonce),
+        DB_AAD,
+        ciphertext,
+        &tag,
+    )
+    .map_err(|e| DaemonError::Crypto(e.to_string()))?;
+    Ok(serde_json::from_slice(&plaintext)?)
+}
+
+fn migrate_legacy_db(path: &Path, master_secret: &[u8], db: &PlainDb) -> Result<()> {
+    let subkeys = DbSubkeys::derive(master_secret);
+    let database = Database::create(path).map_err(redb_error)?;
+    ensure_meta_record(&database, &subkeys)?;
+    apply_mutations(
+        &database,
+        &subkeys,
+        plain_db_mutations(db),
+        DbDurability::Immediate,
+    )
+}
+
+fn redb_error<E: fmt::Display>(error: E) -> DaemonError {
+    DaemonError::Crypto(format!("redb error: {error}"))
+}
+
+impl LogicalKey {
+    fn meta() -> Self {
+        Self {
+            record_type: RECORD_META,
+            channel_index: 0,
+            sub_id: 0,
+        }
+    }
+
+    fn channel(channel_index: u64) -> Self {
+        Self {
+            record_type: RECORD_CHANNEL,
+            channel_index,
+            sub_id: 0,
+        }
+    }
+
+    fn secret(channel_index: u64, index: u64) -> Self {
+        Self {
+            record_type: RECORD_SECRET,
+            channel_index,
+            sub_id: index,
+        }
+    }
+
+    fn frontier(channel_index: u64, mask: u64) -> Self {
+        Self {
+            record_type: RECORD_FRONTIER,
+            channel_index,
+            sub_id: mask,
+        }
+    }
+
+    fn canonical_bytes(self) -> [u8; 17] {
+        let mut out = [0u8; 17];
+        out[0] = self.record_type;
+        out[1..9].copy_from_slice(&self.channel_index.to_be_bytes());
+        out[9..17].copy_from_slice(&self.sub_id.to_be_bytes());
+        out
+    }
+}
+
+impl ChannelRecord {
+    fn scalars(&self) -> ChannelScalars {
+        ChannelScalars {
+            enabled: self.enabled,
+            last_observed_next_reveal_index: self.last_observed_next_reveal_index,
+            precompute_target: self.precompute_target,
+            ssp_target: self.ssp_target,
+            delta_lifetime_checked_units_cap: self.delta_lifetime_checked_units_cap,
+            estimated_checked_units: self.estimated_checked_units,
+            attempted_checked_units: self.attempted_checked_units,
+            failed_precompute_jobs: self.failed_precompute_jobs,
+        }
+    }
+
+    fn apply_scalars(&mut self, scalars: ChannelScalars) {
+        self.enabled = scalars.enabled;
+        self.last_observed_next_reveal_index = scalars.last_observed_next_reveal_index;
+        self.precompute_target = scalars.precompute_target;
+        self.ssp_target = scalars.ssp_target;
+        self.delta_lifetime_checked_units_cap = scalars.delta_lifetime_checked_units_cap;
+        self.estimated_checked_units = scalars.estimated_checked_units;
+        self.attempted_checked_units = scalars.attempted_checked_units;
+        self.failed_precompute_jobs = scalars.failed_precompute_jobs;
+    }
+}
+
+fn empty_channel_record() -> ChannelRecord {
+    ChannelRecord {
+        enabled: false,
+        last_observed_next_reveal_index: None,
+        precompute_target: 0,
+        ssp_target: DEFAULT_SSP_TARGET,
+        delta_lifetime_checked_units_cap: DEFAULT_DELTA_CAP,
+        frontier_nodes: BTreeMap::new(),
+        known_secrets: BTreeMap::new(),
+        estimated_checked_units: 0,
+        attempted_checked_units: 0,
+        failed_precompute_jobs: 0,
+    }
+}
+
+fn upsert_channel_mutation(channel_index: u64, channel: &ChannelRecord) -> Mutation {
+    Mutation::Upsert {
+        key: LogicalKey::channel(channel_index),
+        record: StoredRecord {
+            record_type: RECORD_CHANNEL,
+            channel_index,
+            sub_id: 0,
+            payload: StoredPayload::Channel(channel.scalars()),
+        },
+    }
+}
+
+fn upsert_secret_mutation(channel_index: u64, index: u64, secret_hex: String) -> Mutation {
+    Mutation::Upsert {
+        key: LogicalKey::secret(channel_index, index),
+        record: StoredRecord {
+            record_type: RECORD_SECRET,
+            channel_index,
+            sub_id: index,
+            payload: StoredPayload::Secret { secret_hex },
+        },
+    }
+}
+
+fn upsert_frontier_mutation(channel_index: u64, mask: u64, record: WireRecord) -> Mutation {
+    Mutation::Upsert {
+        key: LogicalKey::frontier(channel_index, mask),
+        record: StoredRecord {
+            record_type: RECORD_FRONTIER,
+            channel_index,
+            sub_id: mask,
+            payload: StoredPayload::Frontier(record),
+        },
+    }
+}
+
+fn delete_secret_mutation(channel_index: u64, index: u64) -> Mutation {
+    Mutation::Delete {
+        key: LogicalKey::secret(channel_index, index),
+    }
+}
+
+fn delete_frontier_mutation(channel_index: u64, mask: u64) -> Mutation {
+    Mutation::Delete {
+        key: LogicalKey::frontier(channel_index, mask),
+    }
+}
+
+fn plain_db_mutations(db: &PlainDb) -> Vec<Mutation> {
+    let mut out = Vec::new();
+    for (channel_s, channel) in &db.channels {
+        let Ok(channel_index) = channel_s.parse::<u64>() else {
+            continue;
+        };
+        out.push(upsert_channel_mutation(channel_index, channel));
+        for (index_s, secret_hex) in &channel.known_secrets {
+            if let Ok(index) = index_s.parse::<u64>() {
+                out.push(upsert_secret_mutation(
+                    channel_index,
+                    index,
+                    secret_hex.clone(),
+                ));
+            }
+        }
+        for (mask_s, record) in &channel.frontier_nodes {
+            if let Ok(mask) = mask_s.parse::<u64>() {
+                out.push(upsert_frontier_mutation(
+                    channel_index,
+                    mask,
+                    record.clone(),
+                ));
+            }
+        }
+    }
+    out
 }
 
 pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()> {
@@ -453,7 +1029,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             "master secret must contain at least 32 bytes".to_owned(),
         ));
     }
-    let (store, db) = EncryptedStore::open(cfg.db_path.clone(), &master_secret)?;
+    let (db, db_writer) = DbStore::open(cfg.db_path.clone(), &master_secret)?;
     let cookie = load_or_create_cookie(&cfg)?;
     let peer_channel = peer_channel_from_url(&cfg.peer_url, cfg.peer_tls.as_ref())?;
     let baseline_daemon_rss_bytes = current_rss_bytes().unwrap_or(0);
@@ -466,12 +1042,12 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
             cfg,
             master_secret: SecretBytes(master_secret),
             cookie,
-            store,
             db,
             active_jobs: BTreeMap::new(),
             next_job_id: 0,
             baseline_daemon_rss_bytes,
         })),
+        db_writer,
         grpc_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         pending_reveals: Arc::new(Mutex::new(BTreeMap::new())),
         pending_reveal_notify: Arc::new(Notify::new()),
@@ -595,7 +1171,14 @@ impl ControlService for ControlApi {
             channel.delta_lifetime_checked_units_cap = req.delta_lifetime_checked_units_cap;
         }
         let response = channel_response(req.channel_index, channel);
-        inner.save().map_err(to_status)?;
+        let mutations = vec![upsert_channel_mutation(req.channel_index, channel)];
+        drop(inner);
+        self.state
+            .db_writer
+            .write_batch(mutations, DbDurability::Immediate)
+            .await
+            .map_err(to_status)?;
+        self.state.db_writer.flush().await.map_err(to_status)?;
         Ok(Response::new(response))
     }
 
@@ -622,9 +1205,26 @@ impl ControlService for ControlApi {
             .get_mut(&key)
             .ok_or_else(|| Status::not_found("channel is not enabled"))?;
         channel.enabled = false;
+        let drop_masks = channel
+            .frontier_nodes
+            .keys()
+            .filter_map(|mask| mask.parse::<u64>().ok())
+            .collect::<Vec<_>>();
+        channel.frontier_nodes.clear();
         let response = channel_response(req.channel_index, channel);
-        inner.save().map_err(to_status)?;
+        let mut mutations = vec![upsert_channel_mutation(req.channel_index, channel)];
+        mutations.extend(
+            drop_masks
+                .into_iter()
+                .map(|mask| delete_frontier_mutation(req.channel_index, mask)),
+        );
         drop(inner);
+        self.state
+            .db_writer
+            .write_batch(mutations, DbDurability::Immediate)
+            .await
+            .map_err(to_status)?;
+        self.state.db_writer.flush().await.map_err(to_status)?;
         self.state.drop_precompute_session(req.channel_index).await;
         Ok(Response::new(response))
     }
@@ -1808,8 +2408,8 @@ impl DaemonState {
             }
         }
         if !redundant {
-            for key in drop_keys {
-                channel.known_secrets.remove(&key);
+            for key in &drop_keys {
+                channel.known_secrets.remove(key.as_str());
             }
             channel
                 .known_secrets
@@ -1817,7 +2417,25 @@ impl DaemonState {
         }
         channel.frontier_nodes.remove(&node_key(index.get()));
         channel.last_observed_next_reveal_index = Some(expected_next_index.saturating_sub(1));
-        inner.save()
+        let mut mutations = Vec::new();
+        if !redundant {
+            mutations.push(upsert_secret_mutation(
+                channel_index,
+                index.get(),
+                secret.to_hex(),
+            ));
+            for key in drop_keys {
+                if let Ok(index) = key.parse::<u64>() {
+                    mutations.push(delete_secret_mutation(channel_index, index));
+                }
+            }
+        }
+        mutations.push(delete_frontier_mutation(channel_index, index.get()));
+        mutations.push(upsert_channel_mutation(channel_index, channel));
+        drop(inner);
+        self.db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await
     }
 
     async fn run_full_derivation(&self, channel_index: u64, index: Index48) -> Result<Value32> {
@@ -1994,7 +2612,16 @@ impl DaemonState {
                 planned_checked_units,
             },
         );
-        inner.save()?;
+        let channel = inner
+            .db
+            .channels
+            .get(&key)
+            .expect("channel exists after attempted counter update");
+        let mutations = vec![upsert_channel_mutation(channel_index, channel)];
+        drop(inner);
+        self.db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await?;
         Ok(PrecomputeStart::Run(PrecomputeJob {
             job_id,
             planned_checked_units,
@@ -2016,7 +2643,11 @@ impl DaemonState {
             .attempted_checked_units
             .saturating_add(planned_checked_units);
         channel.failed_precompute_jobs = channel.failed_precompute_jobs.saturating_add(1);
-        inner.save()
+        let mutations = vec![upsert_channel_mutation(channel_index, channel)];
+        drop(inner);
+        self.db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await
     }
 
     async fn begin_incoming_precompute_session(
@@ -2150,7 +2781,16 @@ impl DaemonState {
                 planned_checked_units,
             },
         );
-        inner.save()?;
+        let channel = inner
+            .db
+            .channels
+            .get(&key)
+            .expect("channel exists after incoming attempted counter update");
+        let mutations = vec![upsert_channel_mutation(descriptor.channel_index, channel)];
+        drop(inner);
+        self.db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await?;
         Ok(IncomingPrecomputeJob { job_id })
     }
 
@@ -2202,15 +2842,19 @@ impl DaemonState {
             .channels
             .get_mut(&channel_key(channel_index))
             .ok_or_else(|| DaemonError::NotFound("channel is not enabled".to_owned()))?;
-        channel.frontier_nodes.insert(
-            node_key(mask),
-            WireRecord {
-                public_binding_hex: to_hex(&public),
-                local_binding_hex: to_hex(&local),
-                wires: SerializableWires::from_secure_wires(wires),
-            },
-        );
-        inner.save()
+        let record = WireRecord {
+            public_binding_hex: to_hex(&public),
+            local_binding_hex: to_hex(&local),
+            wires: SerializableWires::from_secure_wires(wires),
+        };
+        channel
+            .frontier_nodes
+            .insert(node_key(mask), record.clone());
+        let mutations = vec![upsert_frontier_mutation(channel_index, mask, record)];
+        drop(inner);
+        self.db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await
     }
 
     async fn store_precomputed_target_wires_and_finish_job(
@@ -2232,21 +2876,33 @@ impl DaemonState {
         if !channel.enabled {
             return Err(DaemonError::Refused("channel is disabled".to_owned()));
         }
-        channel.frontier_nodes.insert(
-            node_key(target_mask),
-            WireRecord {
-                public_binding_hex: to_hex(&public),
-                local_binding_hex: to_hex(&local),
-                wires: SerializableWires::from_secure_wires(&wires),
-            },
-        );
+        let record = WireRecord {
+            public_binding_hex: to_hex(&public),
+            local_binding_hex: to_hex(&local),
+            wires: SerializableWires::from_secure_wires(&wires),
+        };
+        channel
+            .frontier_nodes
+            .insert(node_key(target_mask), record.clone());
         if let Some(channel) = inner.db.channels.get_mut(&key) {
             channel.estimated_checked_units = channel
                 .estimated_checked_units
                 .saturating_add(planned_checked_units);
         }
         inner.active_jobs.remove(job_id);
-        inner.save()?;
+        let channel = inner
+            .db
+            .channels
+            .get(&key)
+            .expect("channel exists after update");
+        let mutations = vec![
+            upsert_frontier_mutation(channel_index, target_mask, record),
+            upsert_channel_mutation(channel_index, channel),
+        ];
+        drop(inner);
+        self.db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await?;
         Ok(1)
     }
 
@@ -2284,15 +2940,21 @@ impl DaemonState {
 
     async fn finish_job(&self, job_id: &str, failed: bool) {
         let mut inner = self.inner.lock().await;
+        let mut mutations = Vec::new();
         if let Some(job) = inner.active_jobs.remove(job_id) {
             if failed {
                 if let Some(channel) = inner.db.channels.get_mut(&channel_key(job.channel_index)) {
                     channel.failed_precompute_jobs =
                         channel.failed_precompute_jobs.saturating_add(1);
+                    mutations.push(upsert_channel_mutation(job.channel_index, channel));
                 }
             }
-            let _ = inner.save();
         }
+        drop(inner);
+        let _ = self
+            .db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await;
     }
 
     async fn reconcile_with_peer(&self, channel_index: u64) -> Result<()> {
@@ -2323,10 +2985,17 @@ impl DaemonState {
                 drop_masks.push(mask_s.clone());
             }
         }
+        let mut mutations = Vec::new();
         for mask in drop_masks {
             channel.frontier_nodes.remove(&mask);
+            if let Ok(mask) = mask.parse::<u64>() {
+                mutations.push(delete_frontier_mutation(channel_index, mask));
+            }
         }
-        inner.save()
+        drop(inner);
+        self.db_writer
+            .write_batch(mutations, DbDurability::Eventual)
+            .await
     }
 
     async fn derive_known(
@@ -2349,12 +3018,6 @@ impl DaemonState {
             }
         }
         Ok(None)
-    }
-}
-
-impl Inner {
-    fn save(&self) -> Result<()> {
-        self.store.save(&self.master_secret.0, &self.db)
     }
 }
 
@@ -2946,31 +3609,99 @@ mod tests {
         assert_eq!(b.as_bytes()[0] & 2, 0);
     }
 
-    #[test]
-    fn encrypted_store_round_trips_and_rejects_wrong_secret() {
+    #[tokio::test]
+    async fn redb_store_round_trips_and_rejects_wrong_secret() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db.enc");
         let master = vec![1u8; 32];
-        let (store, mut db) = EncryptedStore::open(path.clone(), &master).unwrap();
-        db.channels.insert(
-            "1".to_owned(),
-            ChannelRecord {
-                enabled: true,
-                last_observed_next_reveal_index: None,
-                precompute_target: 1,
-                ssp_target: 40,
-                delta_lifetime_checked_units_cap: 100,
-                frontier_nodes: BTreeMap::new(),
-                known_secrets: BTreeMap::new(),
-                estimated_checked_units: 0,
-                attempted_checked_units: 0,
-                failed_precompute_jobs: 0,
-            },
-        );
-        store.save(&master, &db).unwrap();
-        let (_, loaded) = EncryptedStore::open(path.clone(), &master).unwrap();
-        assert!(loaded.channels.contains_key("1"));
-        assert!(EncryptedStore::open(path, &[2u8; 32]).is_err());
+        let (_, writer) = DbStore::open(path.clone(), &master).unwrap();
+        let mut channel = empty_channel_record();
+        channel.enabled = true;
+        channel.precompute_target = 7;
+        channel.delta_lifetime_checked_units_cap = 100;
+        writer
+            .write_batch(
+                vec![
+                    upsert_channel_mutation(1, &channel),
+                    upsert_secret_mutation(1, 3, "11".repeat(32)),
+                    upsert_frontier_mutation(1, 5, sample_wire_record()),
+                ],
+                DbDurability::Immediate,
+            )
+            .await
+            .unwrap();
+        close_writer_for_test(writer).await;
+
+        let (loaded, writer) = DbStore::open(path.clone(), &master).unwrap();
+        close_writer_for_test(writer).await;
+        let loaded_channel = loaded.channels.get("1").unwrap();
+        assert!(loaded_channel.enabled);
+        assert_eq!(loaded_channel.precompute_target, 7);
+        assert!(loaded_channel.known_secrets.contains_key("3"));
+        assert!(loaded_channel.frontier_nodes.contains_key("5"));
+        assert!(DbStore::open(path, &[2u8; 32]).is_err());
+    }
+
+    #[test]
+    fn redb_stored_keys_are_opaque_and_addressable() {
+        let master = [1u8; 32];
+        let subkeys = DbSubkeys::derive(&master);
+        let other = DbSubkeys::derive(&[2u8; 32]);
+        let logical = LogicalKey::secret(42, 0x0102_0304_0506);
+        let key = stored_key(&subkeys, logical);
+        assert_eq!(key, stored_key(&subkeys, logical));
+        assert_ne!(key, stored_key(&other, logical));
+        assert_ne!(&key[..17], &logical.canonical_bytes());
+        assert!(!key.windows(8).any(|window| window == 42u64.to_be_bytes()));
+        assert!(!key
+            .windows(8)
+            .any(|window| window == 0x0102_0304_0506u64.to_be_bytes()));
+    }
+
+    #[tokio::test]
+    async fn redb_store_rejects_tampered_value() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db.redb");
+        let master = vec![3u8; 32];
+        let (_, writer) = DbStore::open(path.clone(), &master).unwrap();
+        let mut channel = empty_channel_record();
+        channel.enabled = true;
+        writer
+            .write_batch(
+                vec![upsert_channel_mutation(9, &channel)],
+                DbDurability::Immediate,
+            )
+            .await
+            .unwrap();
+        close_writer_for_test(writer).await;
+        tamper_first_redb_value(&path);
+        assert!(DbStore::open(path, &master).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_blob_migrates_to_redb() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db.enc");
+        let master = vec![4u8; 32];
+        let mut db = PlainDb::default();
+        let mut channel = empty_channel_record();
+        channel.enabled = true;
+        channel
+            .known_secrets
+            .insert("7".to_owned(), "22".repeat(32));
+        db.channels.insert("2".to_owned(), channel);
+        write_legacy_db_for_test(&path, &master, &db);
+
+        let (loaded, writer) = DbStore::open(path.clone(), &master).unwrap();
+        close_writer_for_test(writer).await;
+        assert!(loaded
+            .channels
+            .get("2")
+            .unwrap()
+            .known_secrets
+            .contains_key("7"));
+        assert!(path.exists());
+        assert!(dir.path().join("db.enc.migrated").exists());
     }
 
     #[test]
@@ -3101,7 +3832,6 @@ mod tests {
     fn test_inner(max_ram_bytes: u64, workers: u32, baseline_daemon_rss_bytes: u64) -> Inner {
         let dir = tempdir().unwrap();
         let master = vec![1u8; 32];
-        let (store, db) = EncryptedStore::open(dir.path().join("test.db"), &master).unwrap();
         Inner {
             cfg: DaemonConfig {
                 role: Role::Alice,
@@ -3119,11 +3849,82 @@ mod tests {
             },
             master_secret: SecretBytes(master),
             cookie: "cookie".to_owned(),
-            store,
-            db,
+            db: PlainDb::default(),
             active_jobs: BTreeMap::new(),
             next_job_id: 0,
             baseline_daemon_rss_bytes,
         }
+    }
+
+    fn sample_wire_record() -> WireRecord {
+        let wires = Ag2pcSecureWires {
+            lambda: vec![0, 1],
+            wire_bundle: vec![
+                AShareBundle {
+                    mac: Block::make(1, 2),
+                    key: Block::make(3, 4),
+                },
+                AShareBundle {
+                    mac: Block::make(5, 6),
+                    key: Block::make(7, 8),
+                },
+            ],
+            label0: Vec::new(),
+            eval_label: Vec::new(),
+        };
+        WireRecord {
+            public_binding_hex: "aa".repeat(32),
+            local_binding_hex: "bb".repeat(32),
+            wires: SerializableWires::from_secure_wires(&wires),
+        }
+    }
+
+    async fn close_writer_for_test(writer: DbWriter) {
+        writer.flush().await.unwrap();
+        drop(writer);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn tamper_first_redb_value(path: &Path) {
+        let database = Database::open(path).unwrap();
+        let write = database.begin_write().unwrap();
+        let (key, mut value) = {
+            let table = write.open_table(REDB_TABLE).unwrap();
+            let (key, value) = table.iter().unwrap().next().unwrap().unwrap();
+            (key.value().to_vec(), value.value().to_vec())
+        };
+        {
+            let mut table = write.open_table(REDB_TABLE).unwrap();
+            let last = value.last_mut().unwrap();
+            *last ^= 1;
+            table.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    fn write_legacy_db_for_test(path: &Path, master_secret: &[u8], db: &PlainDb) {
+        let salt = [9u8; DB_SALT_LEN];
+        let nonce = [8u8; DB_NONCE_LEN];
+        let key = derive_db_key(master_secret, &salt);
+        let plaintext = serde_json::to_vec(db).unwrap();
+        let mut tag = [0u8; DB_TAG_LEN];
+        let ciphertext = encrypt_aead(
+            Cipher::aes_256_gcm(),
+            &key,
+            Some(&nonce),
+            DB_AAD,
+            &plaintext,
+            &mut tag,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DB_MAGIC);
+        bytes.extend_from_slice(&salt);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&tag);
+        bytes.extend_from_slice(&ciphertext);
+        fs::write(path, bytes).unwrap();
     }
 }

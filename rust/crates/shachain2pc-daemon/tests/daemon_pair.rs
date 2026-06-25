@@ -291,7 +291,7 @@ async fn daemon_pair_seed_reveal_restart_and_local_cache() {
     pair.cli(&pair.bob_control, &["channel", "enable", "7"])
         .await;
 
-    let (alice, bob) = tokio::join!(
+    let (alice_out, bob_out) = tokio::join!(
         pair.cli(
             &pair.alice_control,
             &["reveal", "7", "0", "0", "--allow-seed-reveal"]
@@ -301,8 +301,10 @@ async fn daemon_pair_seed_reveal_restart_and_local_cache() {
             &["reveal", "7", "0", "0", "--allow-seed-reveal"]
         )
     );
-    let alice = parse_result(&alice);
-    let bob = parse_result(&bob);
+    assert_eq!(parse_cache(&alice_out), Some(false));
+    assert_eq!(parse_source(&alice_out), "seed_root");
+    let alice = parse_result(&alice_out);
+    let bob = parse_result(&bob_out);
     assert_eq!(alice, bob);
 
     let expected = channel_seed_share(&hex(MASTER_A), 7).xor(channel_seed_share(&hex(MASTER_B), 7));
@@ -320,6 +322,8 @@ async fn daemon_pair_seed_reveal_restart_and_local_cache() {
         )
         .await;
     assert_eq!(parse_result(&alice), expected.to_hex());
+    assert_eq!(parse_cache(&alice), Some(true));
+    assert_eq!(parse_source(&alice), "known");
     pair.stop().await;
 }
 
@@ -1303,6 +1307,14 @@ fn parse_cache(output: &str) -> Option<bool> {
         "CACHE false" => Some(false),
         _ => None,
     })
+}
+
+fn parse_source(output: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("SOURCE "))
+        .unwrap_or_else(|| panic!("missing SOURCE in {output:?}"))
+        .to_owned()
 }
 
 fn with_cookie<T>(message: T, cookie: &str) -> Request<T> {

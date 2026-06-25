@@ -7,7 +7,7 @@ use shachain2pc_circuit::{
 use shachain2pc_emp_compat::{
     Ag2pcProgram, Ag2pcSecureWires, Ag2pcSession, CompatError, HASH_DIGEST_BYTES,
 };
-use shachain2pc_emp_wire::{Ag2pcStreams, Block, EmpStream, TranscriptIo, WireError};
+use shachain2pc_emp_wire::{Ag2pcStreams, Block, EmpStream, IdleTrim, TranscriptIo, WireError};
 use shachain2pc_mpc_core::{reveal_local_share, reveal_recipient_bits, RevealError};
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX, VALUE_BITS};
 use std::collections::{BTreeMap, HashMap};
@@ -342,7 +342,7 @@ pub async fn run_precompute_path_job(
     run_precompute_path_with_streams(&mut streams, endpoint.role, share, index, delta, ssp).await
 }
 
-pub struct PrecomputeSession<S: TranscriptIo> {
+pub struct PrecomputeSession<S: TranscriptIo + IdleTrim> {
     streams: Ag2pcStreams<S>,
     session: Ag2pcSession,
     sha: Arc<Circuit>,
@@ -350,7 +350,7 @@ pub struct PrecomputeSession<S: TranscriptIo> {
     cache: BTreeMap<u32, (u64, Ag2pcSecureWires)>,
 }
 
-impl<S: TranscriptIo> PrecomputeSession<S> {
+impl<S: TranscriptIo + IdleTrim> PrecomputeSession<S> {
     pub async fn setup_with_streams(
         streams: Ag2pcStreams<S>,
         role: Role,
@@ -406,6 +406,7 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
                 .run_program(&mut self.streams, &root_program, &self.seed_inputs)
                 .await?;
             self.session.trim_idle_allocations();
+            self.streams.trim_idle_allocations();
             root.strip_labels_for_reveal();
             return Ok(root);
         }
@@ -445,6 +446,7 @@ impl<S: TranscriptIo> PrecomputeSession<S> {
         }
         prune_cache_for_target(&mut self.cache, target);
         self.session.trim_idle_allocations();
+        self.streams.trim_idle_allocations();
 
         let mut persisted = carried;
         persisted.strip_labels_for_reveal();

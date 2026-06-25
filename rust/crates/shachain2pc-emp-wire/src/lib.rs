@@ -348,6 +348,10 @@ pub trait TranscriptIo: ByteIo {
     fn get_digest(&self) -> Result<Block>;
 }
 
+pub trait IdleTrim {
+    fn trim_idle_allocations(&mut self) {}
+}
+
 /// In-memory byte stream backed by paired Tokio channels.
 ///
 /// This is used by non-EMP transports, such as daemon JobStream, after their
@@ -371,6 +375,12 @@ impl ChannelByteStream {
             fs_send: None,
             fs_recv: None,
         }
+    }
+}
+
+impl IdleTrim for ChannelByteStream {
+    fn trim_idle_allocations(&mut self) {
+        self.recv_buf.shrink_to_fit();
     }
 }
 
@@ -449,6 +459,8 @@ impl TranscriptIo for ChannelByteStream {
         Ok(first_digest_block(&digest))
     }
 }
+
+impl IdleTrim for EmpStream {}
 
 pub struct EmpStream {
     stream: TcpStream,
@@ -765,6 +777,13 @@ impl EmpStreams {
 pub struct Ag2pcStreams<S = EmpStream> {
     pub main: S,
     pub sibling: S,
+}
+
+impl<S: IdleTrim> Ag2pcStreams<S> {
+    pub fn trim_idle_allocations(&mut self) {
+        self.main.trim_idle_allocations();
+        self.sibling.trim_idle_allocations();
+    }
 }
 
 impl Ag2pcStreams<EmpStream> {
@@ -1084,6 +1103,8 @@ mod tests {
 
         alice.send_data(b"gamma").await.unwrap();
         assert_eq!(bob.recv_data(5).await.unwrap(), b"gamma");
+        alice.trim_idle_allocations();
+        bob.trim_idle_allocations();
 
         assert_eq!(
             alice.get_send_digest().unwrap(),

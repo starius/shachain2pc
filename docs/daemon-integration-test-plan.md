@@ -603,7 +603,7 @@ heaptrack <daemon-or-benchmark-command>
 valgrind --tool=massif <daemon-or-benchmark-command>
 ```
 
-Suggested calibration sequence:
+Suggested measurement sequence:
 
 1. **Baseline daemon RSS**
    - Start both daemons with mTLS, DB, local control, and peer services
@@ -663,6 +663,39 @@ Suggested calibration sequence:
      operator-sizing guidance. Candidates include glibc arena retention, gRPC
      buffers, HTTP/2 flow-control windows, DB serialization buffers, TLS state,
      pending fault-test channels, and retained known-secret/frontier vectors.
+
+Current retention findings:
+
+- Most high idle RSS after a 100-channel fill is private anonymous memory, not
+  DB files or mapped circuit data.
+- Calling `malloc_trim(0)` after fill released a large fraction of idle RSS,
+  which points to allocator arena retention/fragmentation rather than live
+  protocol state.
+- Running daemons with conservative glibc knobs (`MALLOC_ARENA_MAX=1`,
+  `MALLOC_TRIM_THRESHOLD_=131072`, `MALLOC_MMAP_THRESHOLD_=131072`,
+  `MALLOC_TOP_PAD_=131072`) reduced post-fill idle RSS substantially in the
+  measurement run. These are operational knobs, not protocol changes.
+- `ChannelByteStream` receive buffers can retain capacity after large
+  JobStream frames. They should be explicitly trimmed at precompute target
+  boundaries because their contents are only transport buffering, not protocol
+  state.
+
+Arena/scratch direction if allocator tuning is not enough:
+
+- First make the per-H working set explicit as a `JobScratch` object containing
+  the large temporary vectors allocated by `Ag2pcRunState`, triple-pool
+  bucketing, SoftSpoken plane transposes, garble chunks, and received vectors.
+- Keep `JobScratch` separate from live session state (`Delta`, transcript
+  hashes, SoftSpoken setup leaves, carried labeled frontier wires, and shachain
+  cache). Dropping scratch at the end of one `H` must not force deterministic
+  reuse of one-time material.
+- Prefer allocator-level fixes or scratch reuse before introducing a bump
+  arena. A bump arena is only safe for temporary buffers whose contents do not
+  need individual destructors and can be explicitly zeroized or proven
+  non-secret before reset.
+- Measure RSS before/after each step. The expected first wins are allocator
+  trimming knobs and transport buffer trimming; an invasive arena should be
+  justified by residual RSS after those are applied.
 
 The benchmark JSON should include configured knobs and measured values:
 

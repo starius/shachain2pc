@@ -1,5 +1,8 @@
 use shachain2pc_daemon::pb::control_service_client::ControlServiceClient;
-use shachain2pc_daemon::pb::{RevealRequest, RevealResponse};
+use shachain2pc_daemon::pb::peer_service_client::PeerServiceClient;
+use shachain2pc_daemon::pb::{
+    GetFrontierRequest, RevealCachedRequest, RevealRequest, RevealResponse,
+};
 use shachain2pc_daemon::{channel_seed_share, read_control_file, reference_for_channel};
 use shachain2pc_types::Index48;
 use std::net::{Ipv4Addr, TcpListener};
@@ -11,7 +14,7 @@ use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 
 const MASTER_A: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
@@ -755,6 +758,86 @@ async fn daemon_pair_rejects_ahead_reveal_without_expected_index() {
     pair.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_reveal_cached_requires_local_authorization() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "28"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "28"])
+        .await;
+    pair.cli(&pair.alice_control, &["precompute", "28", "1"])
+        .await;
+
+    let request = pair.reveal_cached_request_for_bob(28, 1).await;
+    let mut client = pair.bob_peer_client().await;
+    let out = client.reveal_cached(request).await;
+    assert!(out.is_err(), "{out:?}");
+    let err = out.unwrap_err();
+    assert!(
+        err.message().contains("matching local authorization"),
+        "{err}"
+    );
+    let channels = pair.cli(&pair.bob_control, &["channels"]).await;
+    assert_channel_contains(&channels, 28, "known=0");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_reveal_cached_rejects_binding_mismatch() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "29"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "29"])
+        .await;
+    pair.cli(&pair.alice_control, &["precompute", "29", "1"])
+        .await;
+
+    let mut request = pair.reveal_cached_request_for_bob(29, 1).await;
+    request.public_binding_hex.replace_range(0..2, "00");
+    let mut client = pair.bob_peer_client().await;
+    let bob = pair.cli_maybe_fail(&pair.bob_control, &["reveal", "29", "1", "1"]);
+    let peer = client.reveal_cached(request);
+    let (bob, peer) = tokio::join!(bob, peer);
+    assert!(!bob.status.success());
+    let err = peer.unwrap_err();
+    assert!(err.message().contains("binding"), "{err}");
+    let channels = pair.cli(&pair.bob_control, &["channels"]).await;
+    assert_channel_contains(&channels, 29, "known=0");
+    pair.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_pair_reveal_cached_rejects_tampered_share() {
+    let _guard = daemon_pair_lock().await;
+    let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["channel", "enable", "30"])
+        .await;
+    pair.cli(&pair.bob_control, &["channel", "enable", "30"])
+        .await;
+    pair.cli(&pair.alice_control, &["precompute", "30", "1"])
+        .await;
+
+    let mut request = pair.reveal_cached_request_for_bob(30, 1).await;
+    request.share_bits[0] ^= 1;
+    let mut client = pair.bob_peer_client().await;
+    let bob = pair.cli_maybe_fail(&pair.bob_control, &["reveal", "30", "1", "1"]);
+    let peer = client.reveal_cached(request);
+    let (bob, peer) = tokio::join!(bob, peer);
+    assert!(!bob.status.success());
+    let err = peer.unwrap_err();
+    assert!(
+        err.message().contains("MAC")
+            || err.message().contains("Feq")
+            || err.message().contains("equality check mismatch"),
+        "{err}"
+    );
+    let channels = pair.cli(&pair.bob_control, &["channels"]).await;
+    assert_channel_contains(&channels, 30, "known=0");
+    pair.stop().await;
+}
+
 struct DaemonPair {
     dir: TempDir,
     alice: ChildGuard,
@@ -1002,6 +1085,41 @@ impl DaemonPair {
         .unwrap()
     }
 
+    async fn bob_peer_client(&self) -> PeerServiceClient<Channel> {
+        let endpoint =
+            Endpoint::from_shared(format!("http://127.0.0.1:{}", self.ports.bob_peer)).unwrap();
+        PeerServiceClient::new(endpoint.connect_lazy())
+    }
+
+    async fn reveal_cached_request_for_bob(
+        &self,
+        channel_index: u64,
+        requested_index: u64,
+    ) -> RevealCachedRequest {
+        let mut client = self.bob_peer_client().await;
+        let frontier = client
+            .get_frontier(GetFrontierRequest { channel_index })
+            .await
+            .unwrap()
+            .into_inner();
+        let node = frontier
+            .nodes
+            .iter()
+            .find(|node| node.mask == requested_index)
+            .unwrap_or_else(|| panic!("missing frontier node {requested_index}"));
+        RevealCachedRequest {
+            channel_index,
+            requested_index,
+            expected_next_index: requested_index,
+            allow_seed_reveal: false,
+            share_bits: vec![0; 256],
+            mac_digest: vec![0; 32],
+            ssp_target: frontier.ssp_target,
+            delta_lifetime_checked_units_cap: frontier.delta_lifetime_checked_units_cap,
+            public_binding_hex: node.public_binding_hex.clone(),
+        }
+    }
+
     async fn cli(&self, control: &Path, args: &[&str]) -> String {
         let out = self.cli_maybe_fail(control, args).await;
         assert!(
@@ -1079,6 +1197,7 @@ fn spawn_daemon(
         .arg(control)
         .arg("--cookie-file")
         .arg(dir.join(format!("{name}.cookie")))
+        .env("SHACHAIN2PC_PEER_REVEAL_WAIT_MS", "1000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(tls) = tls {

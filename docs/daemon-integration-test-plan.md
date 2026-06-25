@@ -22,6 +22,8 @@ The current `daemon_pair` integration suite already covers:
 - live in-memory session reuse for adjacent targets (`2 -> 3`);
 - peer mTLS JobStream happy path;
 - peer mTLS cached reveal happy path;
+- cached reveal rejection for missing local authorization, binding mismatch, and
+  tampered peer shares;
 - one peer DB loss followed by joint frontier recompute;
 - background precompute to the shared target;
 - two concurrent channels over JobStream;
@@ -33,6 +35,9 @@ The current `daemon_pair` integration suite already covers:
 - disable behavior that refuses active precompute and frees live session state;
 - an ignored 100-channel benchmark that uses persistent local control gRPC
   clients and reports throughput, cached reveal latency, and per-node peak RSS.
+- encrypted redb persistence unit coverage for round-trip/reopen,
+  wrong-master rejection, tampered-value rejection, opaque deterministic keys,
+  and migration from the legacy encrypted JSON blob.
 
 The additions below should preserve that structure and keep tests serialized
 with the existing daemon-pair lock/port allocation style.
@@ -82,6 +87,21 @@ unpredictable. Prefer one of:
 The benchmark should emit machine-readable JSON plus a concise text summary.
 Do not hardcode pass/fail timing thresholds unless an environment variable asks
 for regression gating.
+
+## Persistence Status
+
+The full-file encrypted JSON store has been replaced by an encrypted redb store.
+Daemon state is authoritative in RAM; writes enqueue logical mutation batches to
+one background writer. Stored keys are deterministic HMAC-SHA256 PRFs over
+canonical logical keys, and stored values are AEAD encrypted with fresh nonces
+and the opaque stored key as AAD. This removes the per-reveal full-DB rewrite and
+uses redb transactions for crash-consistent snapshots.
+
+Lazy durability is intentional for reveal/precompute cache updates: losing the
+most recent tail after a crash costs recomputation, not an unsafe reveal.
+Channel enable/disable uses immediate flush because registry changes are rare.
+Legacy encrypted JSON blobs are migrated once into redb and renamed to
+`*.migrated`.
 
 ### Metrics
 

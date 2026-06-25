@@ -15,7 +15,7 @@ does not include the abandoned experimental windowing work.
 - Provide daemon-to-daemon gRPC for MPC coordination and data transport.
 - Provide a local CLI-to-daemon gRPC API for operator control.
 - Accept one local master secret at daemon startup.
-- Derive the encrypted database key from the local master secret.
+- Derive encrypted database subkeys from the local master secret.
 - Derive every local channel shachain seed share from the local master secret and
   a channel index.
 - Persist only durable, droppable state. Losing or rolling back the DB must cause
@@ -111,10 +111,16 @@ db_path:       encrypted persistent store path
 Derived keys:
 
 ```text
-db_key = HKDF-SHA256(
+db_key_prf = HKDF-SHA256(
     ikm  = master_secret,
-    salt = db_salt,
-    info = "shachain2pc daemon db key v1"
+    salt = empty,
+    info = "shachain-db-key-prf-v1"
+)
+
+db_value_aead = HKDF-SHA256(
+    ikm  = master_secret,
+    salt = empty,
+    info = "shachain-db-value-aead-v1"
 )
 
 channel_seed_share(channel_index) = HKDF-SHA256(
@@ -124,15 +130,56 @@ channel_seed_share(channel_index) = HKDF-SHA256(
 )
 ```
 
-`db_salt` may be stored cleartext next to the DB header because it protects only
-DB-key derivation hygiene. It must not affect channel seed shares or channel
-Delta, otherwise deleting the DB would change channel behavior.
+The database subkeys must not affect channel seed shares or channel Delta,
+otherwise deleting the DB would change channel behavior. Legacy encrypted JSON
+DBs used a salted `db_key`; those files are migrated once into the current redb
+store and renamed to `*.migrated`.
 
-Open decision for implementation: whether to use SQLCipher (`rusqlite` +
-SQLCipher) or an application-level encrypted store. SQLCipher is the most direct
-fit for indexed durable state and crash-safe transactions. Application-level AEAD
-over `redb`/`sled` is also possible but creates more footguns around indexing and
-partial writes. Prefer SQLCipher unless build constraints become painful.
+## Persistent Store
+
+Status: implemented with `redb`.
+
+The authoritative daemon state remains in RAM. The disk store is an encrypted
+recovery cache updated by a single background writer task. Operational hot paths
+mutate RAM first, enqueue logical deltas, and return without reserializing or
+rewriting the whole database. Rare registry changes such as channel
+enable/disable request an immediate flush; reveal and precompute updates use
+lazy durability because a crash can safely lose the most recent cache tail.
+
+The redb table has one opaque name and opaque keys:
+
+```text
+stored_key = HMAC-SHA256(db_key_prf, canonical_logical_key)
+```
+
+Keys are deterministic so records can be updated or deleted, and pseudorandom so
+channel ids, indices, and record types are not stored in plaintext. Values are
+AEAD encrypted with a fresh nonce per write:
+
+```text
+stored_value = nonce || tag || AES-256-GCM(db_value_aead, plaintext,
+                                          aad = stored_key)
+```
+
+Each plaintext value self-describes its logical key and payload because stored
+keys are one-way and cannot be inverted during startup scans. Stored values cover
+only:
+
+- channel scalar config and monitoring counters;
+- revealed shachain secrets;
+- exact revealable frontier leaves;
+- a master-secret verifier record.
+
+The residual accepted leak is record count and update/access pattern for opaque
+records. Hiding those patterns would require padding or ORAM and is out of
+scope.
+
+On startup, the daemon opens redb, verifies the encrypted meta record, scans and
+decrypts all values, and reconstructs RAM state. Wrong master secrets,
+per-record AEAD failures, or parse failures abort startup with a clear error.
+redb transactions make committed snapshots crash-consistent; tail loss from
+lazy durability is acceptable because every value is recomputable or gated by
+the externally supplied expected reveal index.
 
 ## Fixed Delta And Authenticated Frontier State
 

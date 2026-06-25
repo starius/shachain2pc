@@ -1750,15 +1750,8 @@ impl DaemonState {
                 "I=0 reveals the seed; pass allow_seed_reveal to proceed".to_owned(),
             ));
         }
-        let mut from_cache = false;
         if let Some(secret) = self.derive_known(channel_index, index).await? {
-            from_cache = true;
-            return Ok(pb::RevealResponse {
-                channel_index,
-                index: index.get(),
-                secret_hex: secret.to_hex(),
-                from_cache,
-            });
+            return Ok(reveal_response(channel_index, index, secret, true, "known"));
         }
         if requested_index != expected_next_index {
             return Err(DaemonError::Refused(
@@ -1779,15 +1772,16 @@ impl DaemonState {
                 .await?;
             self.store_known_secret(channel_index, index, expected_next_index, secret)
                 .await?;
-            return Ok(pb::RevealResponse {
+            return Ok(reveal_response(
                 channel_index,
-                index: index.get(),
-                secret_hex: secret.to_hex(),
-                from_cache: true,
-            });
+                index,
+                secret,
+                true,
+                "frontier",
+            ));
         }
         if index.get() == 0 {
-            let node = self.ensure_root(channel_index).await?;
+            let (node, root_from_cache) = self.ensure_root(channel_index).await?;
             let secret = self
                 .reveal_cached_node(
                     channel_index,
@@ -1799,22 +1793,28 @@ impl DaemonState {
                 .await?;
             self.store_known_secret(channel_index, index, expected_next_index, secret)
                 .await?;
-            Ok(pb::RevealResponse {
+            Ok(reveal_response(
                 channel_index,
-                index: index.get(),
-                secret_hex: secret.to_hex(),
-                from_cache,
-            })
+                index,
+                secret,
+                root_from_cache,
+                if root_from_cache {
+                    "frontier"
+                } else {
+                    "seed_root"
+                },
+            ))
         } else {
             let secret = self.run_full_derivation(channel_index, index).await?;
             self.store_known_secret(channel_index, index, expected_next_index, secret)
                 .await?;
-            Ok(pb::RevealResponse {
+            Ok(reveal_response(
                 channel_index,
-                index: index.get(),
-                secret_hex: secret.to_hex(),
-                from_cache,
-            })
+                index,
+                secret,
+                false,
+                "full_derivation",
+            ))
         }
     }
 
@@ -2479,9 +2479,9 @@ impl DaemonState {
         }
     }
 
-    async fn ensure_root(&self, channel_index: u64) -> Result<Ag2pcSecureWires> {
+    async fn ensure_root(&self, channel_index: u64) -> Result<(Ag2pcSecureWires, bool)> {
         if let Some(node) = self.load_node(channel_index, 0).await? {
-            return Ok(node);
+            return Ok((node, true));
         }
         let (endpoint, delta, ssp) = self.job_context(channel_index).await?;
         let share = self.channel_share(channel_index).await?;
@@ -2490,7 +2490,7 @@ impl DaemonState {
             run_seed_root_job_with_circuit(endpoint, share, delta, digest, ssp, self.sha.as_ref())
                 .await?;
         self.store_node(channel_index, 0, &root).await?;
-        Ok(root)
+        Ok((root, false))
     }
 
     async fn job_context(&self, channel_index: u64) -> Result<(MpcTcpEndpoint, Block, usize)> {
@@ -3068,6 +3068,22 @@ fn channel_response(index: u64, channel: &ChannelRecord) -> pb::ChannelResponse 
         estimated_checked_units: channel.estimated_checked_units,
         attempted_checked_units: channel.attempted_checked_units,
         failed_precompute_jobs: channel.failed_precompute_jobs,
+    }
+}
+
+fn reveal_response(
+    channel_index: u64,
+    index: Index48,
+    secret: Value32,
+    from_cache: bool,
+    source: &str,
+) -> pb::RevealResponse {
+    pb::RevealResponse {
+        channel_index,
+        index: index.get(),
+        secret_hex: secret.to_hex(),
+        from_cache,
+        source: source.to_owned(),
     }
 }
 

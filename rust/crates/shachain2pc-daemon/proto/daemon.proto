@@ -105,6 +105,7 @@ message RevealResponse {
   uint64 index = 2;
   string secret_hex = 3;
   bool from_cache = 4;
+  string source = 5;
 }
 
 message ListChannelsRequest {}

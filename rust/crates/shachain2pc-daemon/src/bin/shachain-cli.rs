@@ -227,6 +227,7 @@ async fn reveal(
         .into_inner();
     println!("RESULT {}", out.secret_hex);
     println!("CACHE {}", out.from_cache);
+    println!("SOURCE {}", out.source);
     Ok(())
 }
 

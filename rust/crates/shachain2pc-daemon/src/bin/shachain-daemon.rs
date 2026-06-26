@@ -5,7 +5,18 @@ use shachain2pc_daemon::{
 use std::env;
 use std::io::{self, Read};
 use std::net::SocketAddr;
+#[cfg(all(not(target_env = "msvc"), not(target_family = "wasm")))]
+use std::os::raw::c_char;
 use std::path::PathBuf;
+
+#[cfg(all(not(target_env = "msvc"), not(target_family = "wasm")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(not(target_env = "msvc"), not(target_family = "wasm")))]
+#[export_name = "_rjem_malloc_conf"]
+pub static JEMALLOC_CONF: Option<&'static c_char> =
+    Some(unsafe { &*c"background_thread:true,dirty_decay_ms:100,muzzy_decay_ms:100".as_ptr() });
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {

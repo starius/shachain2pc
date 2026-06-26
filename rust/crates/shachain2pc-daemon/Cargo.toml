@@ -33,6 +33,9 @@ tokio = { workspace = true, features = [
 tonic = { version = "0.12", features = ["transport", "tls"] }
 zeroize.workspace = true
 
+[target.'cfg(all(not(target_env = "msvc"), not(target_family = "wasm")))'.dependencies]
+tikv-jemallocator = "0.7"
+
 [build-dependencies]
 tonic-build = "0.12"
 

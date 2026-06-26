@@ -109,6 +109,10 @@
           shellHook = ''
             export CC='${ccBin}/cc'
             export CXX='${ccBin}/c++'
+            # tikv-jemalloc-sys runs autoconf probes with -Werror. Nix
+            # hardening enables _FORTIFY_SOURCE, and glibc warns if those
+            # probes compile at -O0, so keep C build scripts optimized.
+            export CFLAGS='-O2'
             export OPENSSL_ROOT_DIR='${opensslDev}'
             export OPENSSL_INCLUDE_DIR='${opensslDev}/include'
             export OPENSSL_CRYPTO_LIBRARY='${opensslLib}/lib/libcrypto.so'

@@ -22,36 +22,112 @@ const MASTER_B: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b
 static NEXT_PORT: AtomicUsize = AtomicUsize::new(23_000);
 static DAEMON_PAIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+struct GoodCaseBenchConfig {
+    channels: usize,
+    workers: u32,
+    frontier: u64,
+    base_channel: u64,
+    reveal_count: usize,
+    frontier_timeout: Duration,
+}
+
+impl GoodCaseBenchConfig {
+    fn from_env() -> Self {
+        let channels = bench_env_usize("SHACHAIN_BENCH_CHANNELS", 100);
+        let workers = bench_env_u32("SHACHAIN_BENCH_WORKERS", 4);
+        let frontier = bench_env_u64("SHACHAIN_BENCH_FRONTIER", 1);
+        let base_channel = bench_env_u64("SHACHAIN_BENCH_BASE_CHANNEL", 1000);
+        let reveal_count = bench_env_usize("SHACHAIN_BENCH_REVEALS", channels).min(channels);
+        let timeout_secs = bench_env_u64("SHACHAIN_BENCH_TIMEOUT_SECS", 600);
+        Self {
+            channels,
+            workers,
+            frontier,
+            base_channel,
+            reveal_count,
+            frontier_timeout: Duration::from_secs(timeout_secs),
+        }
+    }
+
+    fn committed(&self) -> u64 {
+        (self.channels as u64).saturating_mul(self.frontier)
+    }
+}
+
+fn bench_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn bench_env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn bench_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "benchmark harness; run explicitly"]
 async fn daemon_bench_100_channels_good_case() {
     let _guard = daemon_pair_lock().await;
+    let cfg = GoodCaseBenchConfig::from_env();
     let pair = DaemonPair::start_mtls().await;
-    pair.cli(&pair.alice_control, &["config", "workers", "4"])
+    let workers = cfg.workers.to_string();
+    let frontier = cfg.frontier.to_string();
+    let cap = (1u64 << 32).to_string();
+    pair.cli(&pair.alice_control, &["config", "workers", &workers])
         .await;
-    pair.cli(&pair.bob_control, &["config", "workers", "4"])
+    pair.cli(&pair.bob_control, &["config", "workers", &workers])
         .await;
-    pair.cli(&pair.alice_control, &["config", "precompute", "1"])
+    pair.cli(&pair.alice_control, &["config", "precompute", &frontier])
         .await;
-    pair.cli(&pair.bob_control, &["config", "precompute", "1"])
+    pair.cli(&pair.bob_control, &["config", "precompute", &frontier])
         .await;
 
-    let channels: Vec<u64> = (1000..1100).collect();
+    let channels: Vec<u64> = (cfg.base_channel..cfg.base_channel + cfg.channels as u64).collect();
     let setup_start = Instant::now();
     for channel in &channels {
         let channel_s = channel.to_string();
-        pair.cli(&pair.alice_control, &["channel", "enable", &channel_s])
-            .await;
-        pair.cli(&pair.bob_control, &["channel", "enable", &channel_s])
-            .await;
+        pair.cli(
+            &pair.bob_control,
+            &["channel", "enable", &channel_s, &frontier, "40", &cap],
+        )
+        .await;
+    }
+    for channel in &channels {
+        let channel_s = channel.to_string();
+        pair.cli(
+            &pair.alice_control,
+            &["channel", "enable", &channel_s, &frontier, "40", &cap],
+        )
+        .await;
     }
     let setup_ms = setup_start.elapsed().as_millis() as u64;
 
     let precompute_start = Instant::now();
-    pair.wait_frontier_total(&pair.alice_control, channels.len(), 1)
-        .await;
-    pair.wait_frontier_total(&pair.bob_control, channels.len(), 1)
-        .await;
+    pair.wait_frontier_total(
+        &pair.alice_control,
+        channels.len(),
+        cfg.frontier,
+        cfg.frontier_timeout,
+    )
+    .await;
+    pair.wait_frontier_total(
+        &pair.bob_control,
+        channels.len(),
+        cfg.frontier,
+        cfg.frontier_timeout,
+    )
+    .await;
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
     let precompute_ms = precompute_start.elapsed().as_millis() as u64;
@@ -60,8 +136,8 @@ async fn daemon_bench_100_channels_good_case() {
 
     let mut alice_control = ControlHarnessClient::connect(&pair.alice_control).await;
     let mut bob_control = ControlHarnessClient::connect(&pair.bob_control).await;
-    let mut reveal_latencies = Vec::with_capacity(channels.len());
-    for channel in &channels {
+    let mut reveal_latencies = Vec::with_capacity(cfg.reveal_count);
+    for channel in channels.iter().take(cfg.reveal_count) {
         let reveal_start = Instant::now();
         let (alice, bob) = tokio::join!(
             alice_control.reveal(*channel, 1, 1, false),
@@ -81,12 +157,16 @@ async fn daemon_bench_100_channels_good_case() {
     let bob_hwm = pair.bob.vm_hwm_bytes().unwrap_or(0);
     let summary = serde_json::json!({
         "channels": channels.len(),
-        "workers": 4,
+        "workers": cfg.workers,
+        "frontier": cfg.frontier,
+        "base_channel": cfg.base_channel,
+        "frontier_timeout_secs": cfg.frontier_timeout.as_secs(),
         "setup_ms": setup_ms,
         "precompute": {
-            "committed": channels.len(),
+            "committed": cfg.committed(),
             "wall_ms": precompute_ms,
-            "ms_per_secret": precompute_ms as f64 / channels.len() as f64
+            "ms_per_secret": precompute_ms as f64 / cfg.committed().max(1) as f64,
+            "secrets_per_second": cfg.committed() as f64 * 1000.0 / precompute_ms.max(1) as f64
         },
         "cached_reveal": {
             "count": reveal_latencies.len(),
@@ -141,10 +221,20 @@ async fn daemon_bench_100_channels_warm_refill() {
     pair.cli(&pair.bob_control, &["config", "precompute", "2"])
         .await;
     let cold_start = Instant::now();
-    pair.wait_frontier_total(&pair.alice_control, channels.len(), 2)
-        .await;
-    pair.wait_frontier_total(&pair.bob_control, channels.len(), 2)
-        .await;
+    pair.wait_frontier_total(
+        &pair.alice_control,
+        channels.len(),
+        2,
+        Duration::from_secs(600),
+    )
+    .await;
+    pair.wait_frontier_total(
+        &pair.bob_control,
+        channels.len(),
+        2,
+        Duration::from_secs(600),
+    )
+    .await;
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
     let cold_ms = cold_start.elapsed().as_millis() as u64;
@@ -156,10 +246,20 @@ async fn daemon_bench_100_channels_warm_refill() {
     pair.cli(&pair.bob_control, &["config", "precompute", "3"])
         .await;
     let warm_start = Instant::now();
-    pair.wait_frontier_total(&pair.alice_control, channels.len(), 3)
-        .await;
-    pair.wait_frontier_total(&pair.bob_control, channels.len(), 3)
-        .await;
+    pair.wait_frontier_total(
+        &pair.alice_control,
+        channels.len(),
+        3,
+        Duration::from_secs(600),
+    )
+    .await;
+    pair.wait_frontier_total(
+        &pair.bob_control,
+        channels.len(),
+        3,
+        Duration::from_secs(600),
+    )
+    .await;
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
     let warm_ms = warm_start.elapsed().as_millis() as u64;
@@ -227,10 +327,20 @@ async fn daemon_bench_1000_channels_idle_floor() {
     pair.cli(&pair.bob_control, &["config", "precompute", "1"])
         .await;
     let fill_start = Instant::now();
-    pair.wait_frontier_total(&pair.alice_control, channels.len(), 1)
-        .await;
-    pair.wait_frontier_total(&pair.bob_control, channels.len(), 1)
-        .await;
+    pair.wait_frontier_total(
+        &pair.alice_control,
+        channels.len(),
+        1,
+        Duration::from_secs(600),
+    )
+    .await;
+    pair.wait_frontier_total(
+        &pair.bob_control,
+        channels.len(),
+        1,
+        Duration::from_secs(600),
+    )
+    .await;
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
     let fill_ms = fill_start.elapsed().as_millis() as u64;
@@ -630,8 +740,10 @@ async fn daemon_pair_precomputes_two_channels_over_jobstream() {
         .await;
     }
 
-    pair.wait_frontier_total(&pair.alice_control, 2, 1).await;
-    pair.wait_frontier_total(&pair.bob_control, 2, 1).await;
+    pair.wait_frontier_total(&pair.alice_control, 2, 1, Duration::from_secs(600))
+        .await;
+    pair.wait_frontier_total(&pair.bob_control, 2, 1, Duration::from_secs(600))
+        .await;
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
 
@@ -1061,8 +1173,14 @@ impl DaemonPair {
         .unwrap()
     }
 
-    async fn wait_frontier_total(&self, control: &Path, expected: usize, frontier: u64) -> String {
-        timeout(Duration::from_secs(600), async {
+    async fn wait_frontier_total(
+        &self,
+        control: &Path,
+        expected: usize,
+        frontier: u64,
+        wait: Duration,
+    ) -> String {
+        timeout(wait, async {
             loop {
                 let channels = self.cli(control, &["channels"]).await;
                 let count = channels

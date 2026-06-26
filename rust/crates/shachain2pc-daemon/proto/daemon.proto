@@ -7,7 +7,6 @@ service ControlService {
   rpc SetConfig(SetConfigRequest) returns (SetConfigResponse);
   rpc EnableChannel(EnableChannelRequest) returns (ChannelResponse);
   rpc DisableChannel(DisableChannelRequest) returns (ChannelResponse);
-  rpc Precompute(PrecomputeRequest) returns (PrecomputeResponse);
   rpc Reveal(RevealRequest) returns (RevealResponse);
   rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
@@ -79,11 +78,6 @@ message ChannelResponse {
   uint64 estimated_checked_units = 8;
   uint64 attempted_checked_units = 9;
   uint64 failed_precompute_jobs = 10;
-}
-
-message PrecomputeRequest {
-  uint64 channel_index = 1;
-  uint64 target_index = 2;
 }
 
 message PrecomputeResponse {

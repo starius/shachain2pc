@@ -436,16 +436,10 @@ async fn daemon_pair_nonzero_reveal_matches_reference() {
 async fn daemon_pair_precomputed_frontier_survives_restart() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
-    pair.cli(&pair.alice_control, &["channel", "enable", "13"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "13"])
-        .await;
 
-    let alice_precompute = pair
-        .cli(&pair.alice_control, &["precompute", "13", "1"])
-        .await;
-    assert!(alice_precompute.contains("nodes=1"), "{alice_precompute}");
-    assert!(alice_precompute.contains("checked=1"), "{alice_precompute}");
+    let alice_channels = pair.fill_channel(13, 1).await;
+    assert_channel_contains(&alice_channels, 13, "frontier=1");
+    assert_channel_contains(&alice_channels, 13, "estimated=1");
     let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
     let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
     assert!(alice_channels.contains("frontier=1"), "{alice_channels}");
@@ -459,17 +453,9 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
         .any(|window| window == expected.to_hex().as_bytes()));
 
     let pair = DaemonPair::restart(pair).await;
-    let alice_precompute_again = pair
-        .cli(&pair.alice_control, &["precompute", "13", "1"])
-        .await;
-    assert!(
-        alice_precompute_again.contains("nodes=0"),
-        "{alice_precompute_again}"
-    );
-    assert!(
-        alice_precompute_again.contains("checked=0"),
-        "{alice_precompute_again}"
-    );
+    let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
+    assert_channel_contains(&alice_channels, 13, "frontier=1");
+    assert_channel_contains(&alice_channels, 13, "estimated=1");
     let (alice, bob) = tokio::join!(
         pair.cli(&pair.alice_control, &["reveal", "13", "1", "1"]),
         pair.cli(&pair.bob_control, &["reveal", "13", "1", "1"])
@@ -482,24 +468,18 @@ async fn daemon_pair_precomputed_frontier_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn daemon_pair_precompute_persists_only_requested_leaf() {
+async fn daemon_pair_background_frontier_survives_restart_for_multibit_index() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
-    pair.cli(&pair.alice_control, &["channel", "enable", "16"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "16"])
-        .await;
 
-    let alice_precompute = pair
-        .cli(&pair.alice_control, &["precompute", "16", "3"])
-        .await;
-    assert!(alice_precompute.contains("nodes=1"), "{alice_precompute}");
-    assert!(alice_precompute.contains("checked=2"), "{alice_precompute}");
+    let alice_channels = pair.fill_channel(16, 3).await;
+    assert_channel_contains(&alice_channels, 16, "frontier=3");
+    assert_channel_contains(&alice_channels, 16, "estimated=3");
 
     let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
     let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
-    assert_channel_contains(&alice_channels, 16, "frontier=1");
-    assert_channel_contains(&bob_channels, 16, "frontier=1");
+    assert_channel_contains(&alice_channels, 16, "frontier=3");
+    assert_channel_contains(&bob_channels, 16, "frontier=3");
 
     let expected =
         reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 16, Index48::new(3).unwrap());
@@ -519,29 +499,21 @@ async fn daemon_pair_precompute_persists_only_requested_leaf() {
 async fn daemon_pair_reuses_live_session_prefix_between_precomputes() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
-    pair.cli(&pair.alice_control, &["channel", "enable", "18"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "18"])
-        .await;
 
-    let first = pair
-        .cli(&pair.alice_control, &["precompute", "18", "2"])
-        .await;
-    assert!(first.contains("nodes=1"), "{first}");
-    assert!(first.contains("checked=1"), "{first}");
+    let first = pair.fill_channel(18, 2).await;
+    assert_channel_contains(&first, 18, "frontier=2");
+    assert_channel_contains(&first, 18, "estimated=2");
 
-    let second = pair
-        .cli(&pair.alice_control, &["precompute", "18", "3"])
-        .await;
-    assert!(second.contains("nodes=1"), "{second}");
-    assert!(second.contains("checked=1"), "{second}");
+    let second = pair.fill_channel(18, 3).await;
+    assert_channel_contains(&second, 18, "frontier=3");
+    assert_channel_contains(&second, 18, "estimated=3");
 
     let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
     let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
-    assert_channel_contains(&alice_channels, 18, "frontier=2");
-    assert_channel_contains(&alice_channels, 18, "estimated=2");
-    assert_channel_contains(&bob_channels, 18, "frontier=2");
-    assert_channel_contains(&bob_channels, 18, "estimated=2");
+    assert_channel_contains(&alice_channels, 18, "frontier=3");
+    assert_channel_contains(&alice_channels, 18, "estimated=3");
+    assert_channel_contains(&bob_channels, 18, "frontier=3");
+    assert_channel_contains(&bob_channels, 18, "estimated=3");
 
     let expected =
         reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 18, Index48::new(3).unwrap());
@@ -560,16 +532,10 @@ async fn daemon_pair_reuses_live_session_prefix_between_precomputes() {
 async fn daemon_pair_peer_mtls_precompute_jobstream() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start_mtls().await;
-    pair.cli(&pair.alice_control, &["channel", "enable", "24"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "24"])
-        .await;
 
-    let out = pair
-        .cli(&pair.alice_control, &["precompute", "24", "1"])
-        .await;
-    assert!(out.contains("nodes=1"), "{out}");
-    assert!(out.contains("checked=1"), "{out}");
+    let out = pair.fill_channel(24, 1).await;
+    assert_channel_contains(&out, 24, "frontier=1");
+    assert_channel_contains(&out, 24, "estimated=1");
 
     let expected =
         reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 24, Index48::new(1).unwrap());
@@ -588,26 +554,16 @@ async fn daemon_pair_peer_mtls_precompute_jobstream() {
 async fn daemon_pair_precompute_repairs_peer_frontier_rollback() {
     let _guard = daemon_pair_lock().await;
     let mut pair = DaemonPair::start().await;
-    pair.cli(&pair.alice_control, &["channel", "enable", "14"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "14"])
-        .await;
 
-    let first = pair
-        .cli(&pair.alice_control, &["precompute", "14", "1"])
-        .await;
-    assert!(first.contains("nodes=1"), "{first}");
+    let first = pair.fill_channel(14, 1).await;
+    assert_channel_contains(&first, 14, "frontier=1");
     pair.kill_children().await;
 
     let bob_db = pair.dir.path().join("bob.db");
     std::fs::remove_file(&bob_db).unwrap();
     let pair = DaemonPair::start_with_dir_and_ports(pair.dir, pair.ports).await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "14"])
-        .await;
-    let repaired = pair
-        .cli(&pair.alice_control, &["precompute", "14", "1"])
-        .await;
-    assert!(repaired.contains("nodes=1"), "{repaired}");
+    let repaired = pair.fill_channel(14, 1).await;
+    assert_channel_contains(&repaired, 14, "frontier=1");
 
     let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
     let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
@@ -635,7 +591,6 @@ async fn daemon_pair_background_precomputes_to_shared_target() {
         .await;
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
-    sleep(Duration::from_secs(1)).await;
 
     let expected =
         reference_for_channel(&hex(MASTER_A), &hex(MASTER_B), 15, Index48::new(1).unwrap());
@@ -658,21 +613,27 @@ async fn daemon_pair_precomputes_two_channels_over_jobstream() {
         .await;
     pair.cli(&pair.bob_control, &["config", "workers", "2"])
         .await;
+    pair.cli(&pair.alice_control, &["config", "precompute", "1"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "1"])
+        .await;
     for channel in ["20", "21"] {
-        pair.cli(&pair.alice_control, &["channel", "enable", channel])
-            .await;
-        pair.cli(&pair.bob_control, &["channel", "enable", channel])
-            .await;
+        pair.cli(
+            &pair.alice_control,
+            &["channel", "enable", channel, "1", "0", "0"],
+        )
+        .await;
+        pair.cli(
+            &pair.bob_control,
+            &["channel", "enable", channel, "1", "0", "0"],
+        )
+        .await;
     }
 
-    let (alice_20, alice_21) = tokio::join!(
-        pair.cli(&pair.alice_control, &["precompute", "20", "1"]),
-        pair.cli(&pair.alice_control, &["precompute", "21", "1"])
-    );
-    for output in [alice_20, alice_21] {
-        assert!(output.contains("nodes=1"), "{output}");
-        assert!(output.contains("checked=1"), "{output}");
-    }
+    pair.wait_frontier_total(&pair.alice_control, 2, 1).await;
+    pair.wait_frontier_total(&pair.bob_control, 2, 1).await;
+    pair.wait_jobs_empty(&pair.alice_control).await;
+    pair.wait_jobs_empty(&pair.bob_control).await;
 
     let alice_channels = pair.cli(&pair.alice_control, &["channels"]).await;
     let bob_channels = pair.cli(&pair.bob_control, &["channels"]).await;
@@ -691,15 +652,9 @@ async fn daemon_pair_precomputes_two_channels_over_jobstream() {
 async fn daemon_pair_disable_channel_drops_live_sessions() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
-    pair.cli(&pair.alice_control, &["channel", "enable", "26"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "26"])
-        .await;
 
-    let first = pair
-        .cli(&pair.alice_control, &["precompute", "26", "1"])
-        .await;
-    assert!(first.contains("nodes=1"), "{first}");
+    let first = pair.fill_channel(26, 1).await;
+    assert_channel_contains(&first, 26, "frontier=1");
     pair.wait_jobs_empty(&pair.alice_control).await;
     pair.wait_jobs_empty(&pair.bob_control).await;
 
@@ -717,14 +672,8 @@ async fn daemon_pair_disable_channel_drops_live_sessions() {
     pair.wait_status_field(&pair.bob_control, "live_sessions", 0)
         .await;
 
-    pair.cli(&pair.alice_control, &["channel", "enable", "26"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "26"])
-        .await;
-    let second = pair
-        .cli(&pair.alice_control, &["precompute", "26", "2"])
-        .await;
-    assert!(second.contains("nodes=1"), "{second}");
+    let second = pair.fill_channel(26, 2).await;
+    assert_channel_contains(&second, 26, "frontier=2");
     pair.stop().await;
 }
 
@@ -750,15 +699,9 @@ async fn daemon_pair_max_ram_does_not_limit_workers() {
     assert!(alice_status.contains("ram_warning=false"), "{alice_status}");
     assert!(bob_status.contains("ram_warning=false"), "{bob_status}");
 
-    pair.cli(&pair.alice_control, &["channel", "enable", "27"])
-        .await;
-    pair.cli(&pair.bob_control, &["channel", "enable", "27"])
-        .await;
-    let out = pair
-        .cli(&pair.alice_control, &["precompute", "27", "1"])
-        .await;
-    assert!(out.contains("nodes=1"), "{out}");
-    assert!(out.contains("checked=1"), "{out}");
+    let out = pair.fill_channel(27, 1).await;
+    assert_channel_contains(&out, 27, "frontier=1");
+    assert_channel_contains(&out, 27, "estimated=1");
     pair.stop().await;
 }
 
@@ -766,31 +709,30 @@ async fn daemon_pair_max_ram_does_not_limit_workers() {
 async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["config", "precompute", "3"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "3"])
+        .await;
     pair.cli(
         &pair.alice_control,
-        &["channel", "enable", "17", "0", "40", "1"],
+        &["channel", "enable", "17", "3", "40", "1"],
     )
     .await;
     pair.cli(
         &pair.bob_control,
-        &["channel", "enable", "17", "0", "40", "1"],
+        &["channel", "enable", "17", "3", "40", "1"],
     )
     .await;
-    let (alice, bob) = tokio::join!(
-        pair.cli_maybe_fail(&pair.alice_control, &["precompute", "17", "3"]),
-        pair.cli_maybe_fail(&pair.bob_control, &["precompute", "17", "3"])
-    );
-    assert!(!alice.status.success());
-    assert!(!bob.status.success());
-    assert!(
-        String::from_utf8_lossy(&alice.stderr).contains("Delta lifetime checked-unit cap"),
-        "{}",
-        String::from_utf8_lossy(&alice.stderr)
-    );
+    pair.wait_channel_contains(&pair.alice_control, 17, "frontier=1")
+        .await;
+    pair.wait_channel_contains(&pair.bob_control, 17, "frontier=1")
+        .await;
+    sleep(Duration::from_millis(1200)).await;
     let channels = pair.cli(&pair.alice_control, &["channels"]).await;
-    assert!(channels.contains("estimated=0"), "{channels}");
-    assert!(channels.contains("attempted=0"), "{channels}");
-    assert!(channels.contains("failed=0"), "{channels}");
+    assert_channel_contains(&channels, 17, "frontier=1");
+    assert_channel_contains(&channels, 17, "estimated=1");
+    assert_channel_contains(&channels, 17, "attempted=1");
+    assert_channel_contains(&channels, 17, "failed=0");
     pair.stop().await;
 }
 
@@ -798,30 +740,27 @@ async fn daemon_pair_precompute_refuses_delta_cap_overrun() {
 async fn daemon_pair_failed_precompute_attempt_is_counted() {
     let _guard = daemon_pair_lock().await;
     let pair = DaemonPair::start().await;
+    pair.cli(&pair.alice_control, &["config", "precompute", "1"])
+        .await;
+    pair.cli(&pair.bob_control, &["config", "precompute", "1"])
+        .await;
     pair.cli(
         &pair.alice_control,
-        &["channel", "enable", "19", "0", "40", "100"],
+        &["channel", "enable", "19", "1", "40", "100"],
     )
     .await;
     pair.cli(
         &pair.bob_control,
-        &["channel", "enable", "19", "0", "41", "100"],
+        &["channel", "enable", "19", "1", "41", "100"],
     )
     .await;
 
-    let alice = pair
-        .cli_maybe_fail(&pair.alice_control, &["precompute", "19", "1"])
+    let channels = pair
+        .wait_channel_field_at_least(&pair.alice_control, 19, "failed", 1)
         .await;
-    assert!(!alice.status.success());
-    assert!(
-        String::from_utf8_lossy(&alice.stderr).contains("security parameters do not match"),
-        "{}",
-        String::from_utf8_lossy(&alice.stderr)
-    );
-    let channels = pair.cli(&pair.alice_control, &["channels"]).await;
-    assert!(channels.contains("estimated=0"), "{channels}");
-    assert!(channels.contains("attempted=1"), "{channels}");
-    assert!(channels.contains("failed=1"), "{channels}");
+    assert_channel_contains(&channels, 19, "estimated=0");
+    assert!(channel_field(&channels, 19, "attempted").unwrap_or(0) >= 1);
+    assert!(channel_field(&channels, 19, "failed").unwrap_or(0) >= 1);
     pair.stop().await;
 }
 
@@ -851,8 +790,7 @@ async fn daemon_pair_reveal_cached_requires_local_authorization() {
         .await;
     pair.cli(&pair.bob_control, &["channel", "enable", "28"])
         .await;
-    pair.cli(&pair.alice_control, &["precompute", "28", "1"])
-        .await;
+    pair.fill_channel(28, 1).await;
 
     let request = pair.reveal_cached_request_for_bob(28, 1).await;
     let mut client = pair.bob_peer_client().await;
@@ -876,8 +814,7 @@ async fn daemon_pair_reveal_cached_rejects_binding_mismatch() {
         .await;
     pair.cli(&pair.bob_control, &["channel", "enable", "29"])
         .await;
-    pair.cli(&pair.alice_control, &["precompute", "29", "1"])
-        .await;
+    pair.fill_channel(29, 1).await;
 
     let mut request = pair.reveal_cached_request_for_bob(29, 1).await;
     request.public_binding_hex.replace_range(0..2, "00");
@@ -901,8 +838,7 @@ async fn daemon_pair_reveal_cached_rejects_tampered_share() {
         .await;
     pair.cli(&pair.bob_control, &["channel", "enable", "30"])
         .await;
-    pair.cli(&pair.alice_control, &["precompute", "30", "1"])
-        .await;
+    pair.fill_channel(30, 1).await;
 
     let mut request = pair.reveal_cached_request_for_bob(30, 1).await;
     request.share_bits[0] ^= 1;
@@ -1148,6 +1084,59 @@ impl DaemonPair {
             loop {
                 if self.cli(control, &["jobs"]).await.trim().is_empty() {
                     return;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn set_channel_target(&self, channel: u64, target: u64) {
+        let channel_s = channel.to_string();
+        let target_s = target.to_string();
+        self.cli(&self.alice_control, &["config", "precompute", &target_s])
+            .await;
+        self.cli(&self.bob_control, &["config", "precompute", &target_s])
+            .await;
+        self.cli(
+            &self.alice_control,
+            &["channel", "enable", &channel_s, &target_s, "0", "0"],
+        )
+        .await;
+        self.cli(
+            &self.bob_control,
+            &["channel", "enable", &channel_s, &target_s, "0", "0"],
+        )
+        .await;
+    }
+
+    async fn fill_channel(&self, channel: u64, target: u64) -> String {
+        self.set_channel_target(channel, target).await;
+        let target_s = format!("frontier={target}");
+        let alice = self
+            .wait_channel_contains(&self.alice_control, channel, &target_s)
+            .await;
+        self.wait_channel_contains(&self.bob_control, channel, &target_s)
+            .await;
+        self.wait_jobs_empty(&self.alice_control).await;
+        self.wait_jobs_empty(&self.bob_control).await;
+        alice
+    }
+
+    async fn wait_channel_field_at_least(
+        &self,
+        control: &Path,
+        channel: u64,
+        field: &str,
+        min_value: u64,
+    ) -> String {
+        timeout(Duration::from_secs(120), async {
+            loop {
+                let channels = self.cli(control, &["channels"]).await;
+                if channel_field(&channels, channel, field).is_some_and(|value| value >= min_value)
+                {
+                    return channels;
                 }
                 sleep(Duration::from_millis(200)).await;
             }
@@ -1414,6 +1403,22 @@ fn status_field(output: &str, key: &str) -> Option<u64> {
             None
         }
     })
+}
+
+fn channel_field(output: &str, channel: u64, key: &str) -> Option<u64> {
+    let prefix = format!("channel={channel} ");
+    output
+        .lines()
+        .find(|line| line.starts_with(&prefix))?
+        .split_whitespace()
+        .find_map(|part| {
+            let (name, value) = part.split_once('=')?;
+            if name == key {
+                value.parse().ok()
+            } else {
+                None
+            }
+        })
 }
 
 fn percentile(values: &mut [u64], pct: usize) -> u64 {

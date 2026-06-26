@@ -59,6 +59,7 @@ const PROTOCOL_VERSION: u32 = 1;
 const JOBSTREAM_SESSION_BINDING_DOMAIN: &[u8] = b"shachain2pc daemon JobStream precompute v1";
 const DEFAULT_PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_DB_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const SCHEDULER_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -179,6 +180,7 @@ pub struct DaemonState {
     grpc_jobs: Arc<Mutex<BTreeMap<String, PendingGrpcJob>>>,
     pending_reveals: Arc<Mutex<BTreeMap<RevealRequestKey, PendingReveal>>>,
     pending_reveal_notify: Arc<Notify>,
+    scheduler_notify: Arc<Notify>,
     precompute_sessions: Arc<Mutex<BTreeMap<u64, PrecomputeSessionHandle>>>,
     incoming_precompute_sessions: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
     peer_channel: Option<Channel>,
@@ -1174,8 +1176,11 @@ async fn wait_for_process_shutdown() {
 
 async fn scheduler_loop(state: DaemonState) {
     loop {
-        sleep(Duration::from_secs(1)).await;
         let _ = state.run_scheduler_once().await;
+        tokio::select! {
+            _ = state.scheduler_notify.notified() => {}
+            _ = sleep(SCHEDULER_FALLBACK_INTERVAL) => {}
+        }
     }
 }
 
@@ -1205,6 +1210,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
         grpc_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         pending_reveals: Arc::new(Mutex::new(BTreeMap::new())),
         pending_reveal_notify: Arc::new(Notify::new()),
+        scheduler_notify: Arc::new(Notify::new()),
         precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         incoming_precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         peer_channel,
@@ -1268,6 +1274,7 @@ impl ControlService for ControlApi {
             inner.cfg.precompute = v;
         }
         drop(inner);
+        self.state.wake_scheduler();
         let resources = self.state.resource_model().await;
         let inner = self.state.inner.lock().await;
         Ok(Response::new(pb::SetConfigResponse {
@@ -1333,6 +1340,7 @@ impl ControlService for ControlApi {
             .await
             .map_err(to_status)?;
         self.state.db_writer.flush().await.map_err(to_status)?;
+        self.state.wake_scheduler();
         Ok(Response::new(response))
     }
 
@@ -1380,21 +1388,8 @@ impl ControlService for ControlApi {
             .map_err(to_status)?;
         self.state.db_writer.flush().await.map_err(to_status)?;
         self.state.drop_precompute_session(req.channel_index).await;
+        self.state.wake_scheduler();
         Ok(Response::new(response))
-    }
-
-    async fn precompute(
-        &self,
-        request: Request<pb::PrecomputeRequest>,
-    ) -> std::result::Result<Response<pb::PrecomputeResponse>, Status> {
-        self.state.check_cookie(&request).await?;
-        let req = request.into_inner();
-        let out = self
-            .state
-            .precompute_path(req.channel_index, req.target_index)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(out))
     }
 
     async fn reveal(
@@ -1738,6 +1733,10 @@ async fn run_outgoing_precompute_session(
 }
 
 impl DaemonState {
+    fn wake_scheduler(&self) {
+        self.scheduler_notify.notify_one();
+    }
+
     async fn resource_model(&self) -> ResourceModel {
         let outgoing = self.precompute_sessions.lock().await.len() as u64;
         let incoming = self.incoming_precompute_sessions.lock().await.len() as u64;
@@ -1985,9 +1984,19 @@ impl DaemonState {
                 continue;
             }
             self.reconcile_with_peer(channel_index).await?;
-            let effective_precompute = self
-                .effective_precompute_target(channel_index, peer)
-                .await?;
+            let effective_precompute =
+                match self.effective_precompute_target(channel_index, peer).await {
+                    Ok(target) => target,
+                    Err(DaemonError::Refused(message))
+                        if message.contains("security parameters do not match") =>
+                    {
+                        let _ = self
+                            .record_failed_precompute_attempt(channel_index, 1)
+                            .await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
             if effective_precompute == 0 {
                 continue;
             }
@@ -2095,15 +2104,6 @@ impl DaemonState {
             }
         }
         Ok(None)
-    }
-
-    async fn precompute_path(
-        &self,
-        channel_index: u64,
-        target_index: u64,
-    ) -> Result<pb::PrecomputeResponse> {
-        self.precompute_path_jobstream(channel_index, target_index)
-            .await
     }
 
     async fn precompute_session_handle(
@@ -2589,7 +2589,9 @@ impl DaemonState {
         drop(inner);
         self.db_writer
             .write_batch(mutations, DbDurability::Eventual)
-            .await
+            .await?;
+        self.wake_scheduler();
+        Ok(())
     }
 
     async fn run_full_derivation(&self, channel_index: u64, index: Index48) -> Result<Value32> {
@@ -3045,6 +3047,7 @@ impl DaemonState {
         self.db_writer
             .write_batch(mutations, DbDurability::Eventual)
             .await?;
+        self.wake_scheduler();
         Ok(1)
     }
 
@@ -3095,6 +3098,7 @@ impl DaemonState {
             .db_writer
             .write_batch(mutations, DbDurability::Eventual)
             .await;
+        self.wake_scheduler();
     }
 
     async fn reconcile_with_peer(&self, channel_index: u64) -> Result<()> {

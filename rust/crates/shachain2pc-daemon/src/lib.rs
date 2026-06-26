@@ -57,6 +57,7 @@ const DEFAULT_SSP_TARGET: u32 = 40;
 const DEFAULT_DELTA_CAP: u64 = 1u64 << 32;
 const PROTOCOL_VERSION: u32 = 1;
 const JOBSTREAM_SESSION_BINDING_DOMAIN: &[u8] = b"shachain2pc daemon JobStream precompute v1";
+const JOBSTREAM_PAYLOAD_CHUNK_BYTES: usize = 512 * 1024;
 const DEFAULT_PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_DB_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const SCHEDULER_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
@@ -1608,9 +1609,11 @@ async fn open_peer_job_stream(
     let response_descriptor = descriptor.clone();
     tokio::spawn(async move {
         while let Some(payload) = out_rx.recv().await {
-            let frame = job_frame(&response_descriptor, channel, false, payload);
-            if response_tx.send(Ok(frame)).await.is_err() {
-                break;
+            for chunk in payload.chunks(JOBSTREAM_PAYLOAD_CHUNK_BYTES) {
+                let frame = job_frame(&response_descriptor, channel, false, chunk.to_vec());
+                if response_tx.send(Ok(frame)).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -1648,9 +1651,11 @@ async fn open_peer_job_channel(
     let request_tx_forward = request_tx.clone();
     tokio::spawn(async move {
         while let Some(payload) = out_rx.recv().await {
-            let frame = job_frame(&request_descriptor, channel, false, payload);
-            if request_tx_forward.send(frame).await.is_err() {
-                break;
+            for chunk in payload.chunks(JOBSTREAM_PAYLOAD_CHUNK_BYTES) {
+                let frame = job_frame(&request_descriptor, channel, false, chunk.to_vec());
+                if request_tx_forward.send(frame).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -3405,6 +3410,21 @@ fn job_frame(
     }
 }
 
+#[cfg(test)]
+fn job_payload_frames(
+    descriptor: &GrpcJobDescriptor,
+    channel: u32,
+    payload: Vec<u8>,
+) -> Vec<pb::JobFrame> {
+    if payload.is_empty() {
+        return Vec::new();
+    }
+    payload
+        .chunks(JOBSTREAM_PAYLOAD_CHUNK_BYTES)
+        .map(|chunk| job_frame(descriptor, channel, false, chunk.to_vec()))
+        .collect()
+}
+
 pub fn channel_seed_share(master_secret: &[u8], channel_index: u64) -> Value32 {
     let mut out = [0u8; 32];
     hkdf_expand(
@@ -3718,6 +3738,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn sample_job_descriptor() -> GrpcJobDescriptor {
+        GrpcJobDescriptor {
+            job_id: "job".to_owned(),
+            channel_index: 42,
+            target_index: 7,
+            ssp: 64,
+            ssp_target: 40,
+            delta_lifetime_checked_units_cap: 1_000_000,
+            digest: [9u8; 32],
+        }
+    }
+
     #[test]
     fn fixed_delta_derivation_is_role_structured_and_stable() {
         let master = [7u8; 32];
@@ -3729,6 +3761,38 @@ mod tests {
         assert_eq!(a.as_bytes()[0] & 2, 2);
         assert_eq!(b.as_bytes()[0] & 1, 1);
         assert_eq!(b.as_bytes()[0] & 2, 0);
+    }
+
+    #[test]
+    fn job_payload_frames_chunk_without_changing_stream_bytes() {
+        let descriptor = sample_job_descriptor();
+        let payload_len = JOBSTREAM_PAYLOAD_CHUNK_BYTES * 2 + 17;
+        let payload = (0..payload_len)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let frames = job_payload_frames(&descriptor, 2, payload.clone());
+        assert_eq!(frames.len(), 3);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.payload.len() <= JOBSTREAM_PAYLOAD_CHUNK_BYTES));
+        assert!(frames
+            .iter()
+            .all(|frame| validate_job_payload_context(frame, &descriptor)));
+        assert!(frames.iter().all(|frame| !frame.start));
+        assert!(frames.iter().all(|frame| frame.channel == 2));
+
+        let reconstructed = frames
+            .iter()
+            .flat_map(|frame| frame.payload.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(reconstructed, payload);
+    }
+
+    #[test]
+    fn job_payload_frames_drop_empty_byte_writes() {
+        let descriptor = sample_job_descriptor();
+        assert!(job_payload_frames(&descriptor, 1, Vec::new()).is_empty());
     }
 
     #[tokio::test]

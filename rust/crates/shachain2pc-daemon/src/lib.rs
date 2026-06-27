@@ -1949,6 +1949,32 @@ impl DaemonState {
                     .to_owned(),
             ));
         }
+        if let Some(node) = self.load_node(channel_index, index.get()).await? {
+            match self
+                .reveal_cached_node(
+                    channel_index,
+                    index,
+                    expected_next_index,
+                    allow_seed_reveal,
+                    &node,
+                )
+                .await
+            {
+                Ok(secret) => {
+                    self.store_known_secret(channel_index, index, expected_next_index, secret)
+                        .await?;
+                    return Ok(reveal_response(
+                        channel_index,
+                        index,
+                        secret,
+                        true,
+                        "frontier",
+                    ));
+                }
+                Err(err) if is_cached_reveal_cache_miss(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
         self.reconcile_with_peer(channel_index).await?;
         if let Some(node) = self.load_node(channel_index, index.get()).await? {
             let secret = self
@@ -3333,6 +3359,24 @@ fn to_status(err: DaemonError) -> Status {
             Status::invalid_argument(msg)
         }
         other => Status::internal(other.to_string()),
+    }
+}
+
+fn is_cached_reveal_cache_miss(err: &DaemonError) -> bool {
+    match err {
+        DaemonError::NotFound(msg) => msg.contains("cached reveal node is not stored"),
+        DaemonError::Refused(msg) => {
+            msg.contains("cached reveal node is not stored")
+                || msg.contains("timed out waiting for peer cached reveal")
+        }
+        DaemonError::TonicStatus(status) => {
+            (status.code() == tonic::Code::NotFound
+                || status.code() == tonic::Code::InvalidArgument)
+                && status
+                    .message()
+                    .contains("cached reveal node is not stored")
+        }
+        _ => false,
     }
 }
 

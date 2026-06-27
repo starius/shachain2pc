@@ -62,6 +62,9 @@ const DEFAULT_PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_DB_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const SCHEDULER_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
 const FULL_FRONTIER_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const PEER_HTTP2_STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+const PEER_HTTP2_CONNECTION_WINDOW_BYTES: u32 = 512 * 1024 * 1024;
+const PEER_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 4096;
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -1129,7 +1132,10 @@ pub async fn run_daemon(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<()>
         .serve_with_shutdown(bind, wait_for_shutdown(shutdown_rx.clone()));
     let peer_server = {
         let inner = state.inner.lock().await;
-        let mut builder = Server::builder();
+        let mut builder = Server::builder()
+            .initial_stream_window_size(Some(PEER_HTTP2_STREAM_WINDOW_BYTES))
+            .initial_connection_window_size(Some(PEER_HTTP2_CONNECTION_WINDOW_BYTES))
+            .max_concurrent_streams(Some(PEER_HTTP2_MAX_CONCURRENT_STREAMS));
         if let Some(tls) = &inner.cfg.peer_tls {
             builder = builder.tls_config(peer_server_tls_config(tls)?)?;
         }
@@ -3557,7 +3563,9 @@ fn peer_channel_from_url(
         return Ok(None);
     };
     let mut endpoint = Endpoint::from_shared(peer_url.clone())
-        .map_err(|e| DaemonError::Parse(format!("bad peer URL: {e}")))?;
+        .map_err(|e| DaemonError::Parse(format!("bad peer URL: {e}")))?
+        .initial_stream_window_size(Some(PEER_HTTP2_STREAM_WINDOW_BYTES))
+        .initial_connection_window_size(Some(PEER_HTTP2_CONNECTION_WINDOW_BYTES));
     if let Some(tls) = tls {
         endpoint = endpoint.tls_config(peer_client_tls_config(tls)?)?;
     }

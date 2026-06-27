@@ -65,6 +65,7 @@ const FULL_FRONTIER_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const PEER_HTTP2_STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 const PEER_HTTP2_CONNECTION_WINDOW_BYTES: u32 = 512 * 1024 * 1024;
 const PEER_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 4096;
+const PEER_GRPC_CHANNEL_SHARDS: usize = 32;
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -190,7 +191,7 @@ pub struct DaemonState {
     full_reconcile_after: Arc<Mutex<BTreeMap<u64, Instant>>>,
     precompute_sessions: Arc<Mutex<BTreeMap<u64, PrecomputeSessionHandle>>>,
     incoming_precompute_sessions: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
-    peer_channel: Option<Channel>,
+    peer_channels: Option<Arc<[Channel]>>,
     sha: Arc<Circuit>,
 }
 
@@ -1202,7 +1203,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
     }
     let (db, db_writer) = DbStore::open(cfg.db_path.clone(), &master_secret)?;
     let cookie = load_or_create_cookie(&cfg)?;
-    let peer_channel = peer_channel_from_url(&cfg.peer_url, cfg.peer_tls.as_ref())?;
+    let peer_channels = peer_channels_from_url(&cfg.peer_url, cfg.peer_tls.as_ref())?;
     let sha = Arc::new(
         sha256_compress_gadget()
             .map_err(|e| DaemonError::Crypto(format!("failed to load SHA circuit: {e}")))?,
@@ -1225,7 +1226,7 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
         full_reconcile_after: Arc::new(Mutex::new(BTreeMap::new())),
         precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         incoming_precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
-        peer_channel,
+        peer_channels,
         sha,
     })
 }
@@ -1751,6 +1752,26 @@ async fn run_outgoing_precompute_session(
 impl DaemonState {
     fn wake_scheduler(&self) {
         self.scheduler_notify.notify_one();
+    }
+
+    fn has_peer_channels(&self) -> bool {
+        self.peer_channels
+            .as_ref()
+            .is_some_and(|channels| !channels.is_empty())
+    }
+
+    fn peer_channel_for_optional(&self, channel_index: u64) -> Option<Channel> {
+        let channels = self.peer_channels.as_ref()?;
+        if channels.is_empty() {
+            return None;
+        }
+        let shard = channel_index as usize % channels.len();
+        Some(channels[shard].clone())
+    }
+
+    fn peer_channel_for(&self, channel_index: u64) -> Result<Channel> {
+        self.peer_channel_for_optional(channel_index)
+            .ok_or_else(|| DaemonError::Refused("peer URL is not configured".to_owned()))
     }
 
     async fn resource_model(&self) -> ResourceModel {
@@ -2375,7 +2396,7 @@ impl DaemonState {
         if index.get() == 0 {
             return self.reveal_persisted_node(channel_index, index, node).await;
         }
-        match (self.role().await, self.peer_channel.is_some()) {
+        match (self.role().await, self.has_peer_channels()) {
             (Role::Alice, true) => {
                 self.reveal_cached_node_via_peer(
                     channel_index,
@@ -2411,10 +2432,7 @@ impl DaemonState {
         let (delta, ssp_target, cap, public_binding_hex) =
             self.reveal_node_context(channel_index, index.get()).await?;
         let local = reveal_node_local_share(node)?;
-        let peer_channel = self
-            .peer_channel
-            .clone()
-            .ok_or_else(|| DaemonError::Refused("peer URL is not configured".to_owned()))?;
+        let peer_channel = self.peer_channel_for(channel_index)?;
         let mut client = pb::peer_service_client::PeerServiceClient::new(peer_channel);
         let response = client
             .reveal_cached(pb::RevealCachedRequest {
@@ -3022,10 +3040,7 @@ impl DaemonState {
         &self,
         descriptor: &GrpcJobDescriptor,
     ) -> Result<Ag2pcStreams<ChannelByteStream>> {
-        let peer_channel = self
-            .peer_channel
-            .clone()
-            .ok_or_else(|| DaemonError::Refused("peer URL is not configured".to_owned()))?;
+        let peer_channel = self.peer_channel_for(descriptor.channel_index)?;
         let main = open_peer_job_channel(peer_channel.clone(), descriptor, 1).await?;
         let sibling = open_peer_job_channel(peer_channel, descriptor, 2).await?;
         Ok(Ag2pcStreams { main, sibling })
@@ -3142,7 +3157,7 @@ impl DaemonState {
         &self,
         channel_index: u64,
     ) -> Result<Option<(pb::GetFrontierResponse, PeerFrontierConfig)>> {
-        let Some(peer_channel) = self.peer_channel.clone() else {
+        let Some(peer_channel) = self.peer_channel_for_optional(channel_index) else {
             return Ok(None);
         };
         let mut client = pb::peer_service_client::PeerServiceClient::new(peer_channel);
@@ -3555,21 +3570,25 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn peer_channel_from_url(
+fn peer_channels_from_url(
     peer_url: &Option<String>,
     tls: Option<&PeerTlsConfig>,
-) -> Result<Option<Channel>> {
+) -> Result<Option<Arc<[Channel]>>> {
     let Some(peer_url) = peer_url else {
         return Ok(None);
     };
-    let mut endpoint = Endpoint::from_shared(peer_url.clone())
-        .map_err(|e| DaemonError::Parse(format!("bad peer URL: {e}")))?
-        .initial_stream_window_size(Some(PEER_HTTP2_STREAM_WINDOW_BYTES))
-        .initial_connection_window_size(Some(PEER_HTTP2_CONNECTION_WINDOW_BYTES));
-    if let Some(tls) = tls {
-        endpoint = endpoint.tls_config(peer_client_tls_config(tls)?)?;
+    let mut channels = Vec::with_capacity(PEER_GRPC_CHANNEL_SHARDS);
+    for _ in 0..PEER_GRPC_CHANNEL_SHARDS {
+        let mut endpoint = Endpoint::from_shared(peer_url.clone())
+            .map_err(|e| DaemonError::Parse(format!("bad peer URL: {e}")))?
+            .initial_stream_window_size(Some(PEER_HTTP2_STREAM_WINDOW_BYTES))
+            .initial_connection_window_size(Some(PEER_HTTP2_CONNECTION_WINDOW_BYTES));
+        if let Some(tls) = tls {
+            endpoint = endpoint.tls_config(peer_client_tls_config(tls)?)?;
+        }
+        channels.push(endpoint.connect_lazy());
     }
-    Ok(Some(endpoint.connect_lazy()))
+    Ok(Some(Arc::from(channels)))
 }
 
 fn peer_server_tls_config(tls: &PeerTlsConfig) -> Result<ServerTlsConfig> {

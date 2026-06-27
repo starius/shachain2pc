@@ -44,7 +44,7 @@ PLAIN_BINS := $(BUILD)/ref_kat $(BUILD)/ref_cli $(BUILD)/verify_circuit \
 # fpre_*/c2pc_* probes) and measure_io/compat_probe target the OLD emp API
 # (emp-ag2pc/helper.h, fpre.h, 2pc.h, the old emp::C2PC) which the new emp install
 # no longer provides; their tools/*.cpp are kept for the eventual Rust re-port but
-# are NOT built. See docs/new-emp-ag2pc-notes.md.
+# are NOT built. See ../docs/new-emp-ag2pc-notes.md.
 EMP_BINS := $(BUILD)/party $(BUILD)/ag2pc_session_probe \
             $(BUILD)/ag2pc_transport_probe $(BUILD)/softspoken_probe \
             $(BUILD)/softspoken_helper_probe $(BUILD)/csw_helper_probe \
@@ -179,17 +179,17 @@ test-softspoken-probe: $(BUILD)/softspoken_probe
 
 test-softspoken-helper-probe: $(BUILD)/softspoken_helper_probe
 	./$(BUILD)/softspoken_helper_probe >$(BUILD)/softspoken_helper_probe.json
-	diff -u compat/ag2pc/softspoken-helper-v1.json \
+	diff -u ../compat/ag2pc/softspoken-helper-v1.json \
 	  $(BUILD)/softspoken_helper_probe.json
 
 test-csw-helper-probe: $(BUILD)/csw_helper_probe
 	./$(BUILD)/csw_helper_probe >$(BUILD)/csw_helper_probe.json
-	diff -u compat/ag2pc/csw-helper-v1.json \
+	diff -u ../compat/ag2pc/csw-helper-v1.json \
 	  $(BUILD)/csw_helper_probe.json
 
 test-mitccrh-helper-probe: $(BUILD)/mitccrh_helper_probe
 	./$(BUILD)/mitccrh_helper_probe >$(BUILD)/mitccrh_helper_probe.json
-	diff -u compat/ag2pc/mitccrh-helper-v1.json \
+	diff -u ../compat/ag2pc/mitccrh-helper-v1.json \
 	  $(BUILD)/mitccrh_helper_probe.json
 
 test-ag2pc-triple-pool-probe: $(BUILD)/ag2pc_triple_pool_probe

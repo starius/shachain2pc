@@ -4,7 +4,7 @@
 # canonical circuit, so the two generated circuit digests differ and both sides
 # abort before any value is returned.
 #
-# Run inside the flake shell:  nix develop -c ./demo/run_cheat.sh
+# Run inside the flake shell:  nix develop -c ./cpp/demo/run_cheat.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

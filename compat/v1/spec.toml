@@ -9,10 +9,10 @@ accept_i_zero = true
 proxy_required = false
 
 [sources]
-emp_path = ".deps/emp"
+emp_path = "cpp/.deps/emp"
 emp_git_commit = "f8d04faac7d1a6850dc1f0d099a975c550e3da06"
 emp_include_tree_sha256 = "c4ab76d9a96e33913f3251ae6d079f3261e74142056c472c363c9e56e940cf9a"
-sha256_gadget_path = ".deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt"
+sha256_gadget_path = "cpp/.deps/emp/include/emp-tool/circuits/files/bristol_format/sha-256.txt"
 
 [build]
 cxx_standard = "c++17"

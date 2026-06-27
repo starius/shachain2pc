@@ -1,5 +1,5 @@
 {
-  description = "shachain2pc: maliciously-secure two-party shachain (emp-ag2pc backend)";
+  description = "shachain2pc: maliciously-secure two-party shachain";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -17,7 +17,7 @@
         ccBin = "${shellStdenv.cc}/bin";
 
         # Reproducible, patched emp stack (emp-tool + emp-ot + emp-ag2pc) built into
-        # /nix/store. Replaces tools/bootstrap-emp.sh (which cloned into ./.deps).
+        # /nix/store. Replaces cpp/tools/bootstrap-emp.sh.
         # Pins match the bootstrap script's commit set; the prg-alignment patch is
         # applied here so cross-mode and assert-enabled builds are correct.
         # Built with a fixed -march (x86-64-v3 + AES/PCLMUL) instead of -march=native
@@ -39,8 +39,8 @@
           sha256 = "14whakbbfb4ph7mgahxlnzvsh66qr4w98z8rpkw36czdkg7yk7kk";
         };
         # The current emp-tool dropped the legacy Bristol circuit files, but
-        # protocol/circuit_gen loads the standard sha-256.txt. Pull it from the last
-        # emp-tool commit that shipped it.
+        # both implementations load the standard sha-256.txt. Pull it from the
+        # last emp-tool commit that shipped it.
         sha256Txt = pkgs.fetchurl {
           url = "https://raw.githubusercontent.com/emp-toolkit/emp-tool/11093a7d2160e7e7a4dcae3ffd9e6935bf2b8c1c/emp-tool/circuits/files/bristol_format/sha-256.txt";
           sha256 = "1qlg30ff6k6228hjp456vci4pn72ic4xqsh8nyma2q7p905xiriv";
@@ -117,7 +117,7 @@
             export OPENSSL_INCLUDE_DIR='${opensslDev}/include'
             export OPENSSL_CRYPTO_LIBRARY='${opensslLib}/lib/libcrypto.so'
             # emp is built reproducibly by nix in /nix/store. EMP_PREFIX points at
-            # it; the Makefile and both the C++ and Rust SHA-256 gadget paths read
+            # it; the C++ Makefile and Rust SHA-256 gadget path read
             # EMP_PREFIX directly, so no .deps checkout/symlink is involved.
             export EMP_PREFIX='${emp}'
           '';

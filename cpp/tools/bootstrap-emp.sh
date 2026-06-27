@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Fetch and build the emp-toolkit malicious-2PC stack (emp-tool, emp-ot,
-# emp-ag2pc = authenticated garbling, WRK17) into ./.deps/emp.
+# emp-ag2pc = authenticated garbling, WRK17) into cpp/.deps/emp.
 #
-# Run under the flake shell:  nix develop -c ./tools/bootstrap-emp.sh
+# Run under the flake shell:  nix develop -c ./cpp/tools/bootstrap-emp.sh
 #
 # Pinned to a commit set known to build together.
 #
@@ -24,7 +24,7 @@ set -euo pipefail
 # DEPRECATED: emp is now built reproducibly by the nix flake (packages.emp).
 # Running `nix develop` builds the patched emp stack into /nix/store and exports
 # EMP_PREFIX pointing at it -- no bootstrap needed. This script is retained only
-# as a non-nix fallback; it builds the same pins + patch into ./.deps/emp, the
+# as a non-nix fallback; it builds the same pins + patch into cpp/.deps/emp, the
 # layout EMP_PREFIX falls back to when it is unset.
 echo "NOTE: bootstrap-emp.sh is deprecated; 'nix develop' builds emp via nix." >&2
 
@@ -33,6 +33,7 @@ echo "NOTE: bootstrap-emp.sh is deprecated; 'nix develop' builds emp via nix." >
 export NIX_ENFORCE_NO_NATIVE=0
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
 
 case "$(uname -m)" in
   x86_64 | amd64) ;;
@@ -77,7 +78,7 @@ checkout "$SRC/emp-tool"   https://github.com/emp-toolkit/emp-tool.git   "$EMP_T
 checkout "$SRC/emp-ot"     https://github.com/emp-toolkit/emp-ot.git     "$EMP_OT_COMMIT"
 checkout "$SRC/emp-ag2pc"  https://github.com/emp-toolkit/emp-ag2pc.git  "$EMP_AG2PC_COMMIT"
 apply_patch_once "$SRC/emp-ag2pc" \
-  "$ROOT_DIR/patches/emp-ag2pc-546d5e4-align-prg-random-data.patch"
+  "$REPO_ROOT/patches/emp-ag2pc-546d5e4-align-prg-random-data.patch"
 
 rm -rf "$PREFIX"; mkdir -p "$PREFIX"
 

@@ -4,7 +4,7 @@
 # malicious-secure authenticated garbling; both obtain H(I). The result is
 # cross-checked against the single-party reference oracle.
 #
-# Run inside the flake shell:  nix develop -c ./demo/run_demo.sh
+# Run inside the flake shell:  nix develop -c ./cpp/demo/run_demo.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

@@ -3,26 +3,27 @@
 # RESULT against ref_cli.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
+CPP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$CPP_ROOT/.." && pwd)"
+cd "$CPP_ROOT"
 
-CPP_BIN="${CPP_BIN:-$ROOT/.build/party}"
-RUST_BIN="${RUST_BIN:-$ROOT/rust/target/release/party}"
-REF_BIN="${REF_BIN:-$ROOT/.build/ref_cli}"
+CPP_BIN="${CPP_BIN:-$CPP_ROOT/.build/party}"
+RUST_BIN="${RUST_BIN:-$REPO_ROOT/rust/target/release/party}"
+REF_BIN="${REF_BIN:-$CPP_ROOT/.build/ref_cli}"
 
 if [[ ! -x "$CPP_BIN" ]]; then
   echo "missing C++ party binary: $CPP_BIN" >&2
-  echo "build it with: nix develop -c make .build/party .build/ref_cli" >&2
+  echo "build it with: nix develop -c make -C cpp .build/party .build/ref_cli" >&2
   exit 1
 fi
 if [[ ! -x "$RUST_BIN" ]]; then
   echo "missing Rust party binary: $RUST_BIN" >&2
-  echo "build it with: nix develop -c cargo build -p shachain2pc-party --release" >&2
+  echo "build it with: cd rust && nix develop -c cargo build -p shachain2pc-party --release" >&2
   exit 1
 fi
 if [[ ! -x "$REF_BIN" ]]; then
   echo "missing reference binary: $REF_BIN" >&2
-  echo "build it with: nix develop -c make .build/ref_cli" >&2
+  echo "build it with: nix develop -c make -C cpp .build/ref_cli" >&2
   exit 1
 fi
 

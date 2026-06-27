@@ -29,7 +29,7 @@ What was tested locally:
   `10-1f`: passed.
 - Active Rust/C++ helper probes for CSW, SoftSpoken, AG2PC triple-pool draw,
   AG2PC input/reveal protocol, and AG2PC compute-in-place: passed.
-- `demo/cross_mode_tamper_smoke.sh` passes in both role directions for chunked,
+- `cpp/demo/cross_mode_tamper_smoke.sh` passes in both role directions for chunked,
   tree, cache-tile, and cache-fallback mode tampering.
 
 Remaining validation:

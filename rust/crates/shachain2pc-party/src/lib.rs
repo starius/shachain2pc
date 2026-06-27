@@ -1319,7 +1319,7 @@ impl PhaseTiming {
 fn ensure_index_allowed(index: &IndexSpec, allow_seed_reveal: bool) -> Result<(), PartyError> {
     // Index 0 is the shachain seed (generate_from_seed runs no SHA round at I=0),
     // not a normal per-commitment reveal, so require an explicit local override.
-    // The C++ party (demo/party.cpp) enforces the same guard, including ranges
+    // The C++ party (cpp/demo/party.cpp) enforces the same guard, including ranges
     // that contain 0.
     if index.contains_seed() && !allow_seed_reveal {
         Err(PartyError::SeedRevealRefused)

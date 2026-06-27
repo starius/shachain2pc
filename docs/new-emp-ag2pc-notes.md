@@ -70,7 +70,7 @@ uint32_t out = sess.reveal(c, PUBLIC).value();   // reveal returns std::optional
 The one-time session cost (the SoftSpoken COT mesh set up in the `AG2PCSession`
 ctor + the per-party input authentication) is **constant per session**, not per
 circuit. So evaluating N circuits that share inputs under one session pays it once.
-`run/derive.h::RunDerivationBatch` does exactly this for an I-range:
+`cpp/run/derive.h::RunDerivationBatch` does exactly this for an I-range:
 
 - **Authenticate the two seed shares once**, then `run_artifact` each index's
   circuit reusing those same authenticated inputs (only the circuit changes).
@@ -125,7 +125,7 @@ return value type. `prog` is a `circuit::BooleanProgram`
 output wire is exactly `num_inputs + i` (dense, single-def, topological, ≤1 Const0
 and ≤1 Const1). `run_artifact`/the engine assert this (`backend/canonical.h`); a
 non-canonical (e.g. Bristol-numbered) program is rejected. We renumber our
-derivation circuit into this form in `run/derive.h::ToBooleanProgram`.
+derivation circuit into this form in `cpp/run/derive.h::ToBooleanProgram`.
 Args to `run_artifact` are concatenated in wire order (our order: BOB share → wires
 `[0,256)`, ALICE share → `[256,512)`).
 

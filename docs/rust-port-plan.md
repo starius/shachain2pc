@@ -159,7 +159,7 @@ Important distinction:
 
 The existing binary does more than a single TCP request/response:
 
-1. `demo/party.cpp` parses the CLI, creates an EMP `NetIO`, then calls
+1. `cpp/demo/party.cpp` parses the CLI, creates an EMP `NetIO`, then calls
    `run::RunDerivation`.
 2. `RunDerivation` builds the circuit from `I`, converts it to EMP's Bristol
    in-memory format, and exchanges a 32-byte circuit digest. ALICE sends first;
@@ -378,7 +378,7 @@ Small shared types with no networking and no async runtime:
 - `Role::{Alice, Bob}`;
 - `Index48`;
 - `Value32`;
-- hex parsing/formatting matching `util/hex.h`;
+- hex parsing/formatting matching `cpp/util/hex.h`;
 - output/error conventions;
 - zeroization helpers where practical.
 
@@ -386,8 +386,8 @@ Small shared types with no networking and no async runtime:
 
 Pure deterministic circuit/reference code:
 
-- port `protocol/bristol.*`;
-- port `protocol/circuit_gen.*`;
+- port `cpp/protocol/bristol.*`;
+- port `cpp/protocol/circuit_gen.*`;
 - port the SHA-256 compression gadget path used by C++;
 - port `reference::GenerateFromSeed`;
 - compute the exact same circuit digest as `run::CircuitDigest`.

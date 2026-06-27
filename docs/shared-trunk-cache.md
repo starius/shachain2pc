@@ -164,7 +164,7 @@ added.)
 **never re-input**. A peer cannot substitute a different `T` — the MAC fails and
 the run aborts. Verified: tampering a branch's flip aborts at the leaky-AND F_eq
 check *even with the reused trunk* (`make test-cache-tamper`, which runs
-`demo/cache_tamper_test.sh`).
+`cpp/demo/cache_tamper_test.sh`).
 This is exactly the steering the Go cache was vulnerable to and could not close.
 
 ### 2c. Selective failure — the real accumulation.
@@ -339,7 +339,7 @@ channel). The demo/research default 40 is too thin for funds (`2^{-20}` over
   cross-instance amplification beyond the standard sum).
 - Descendant-derivability is shachain-inherent: revealing `H(I)` lets anyone
   derive `H(I')` for descendants `I'`. For "reveal a subset later," reveal in
-  ancestor-last order or accept derivable descendants (see `run/derive.h` /
+  ancestor-last order or accept derivable descendants (see `cpp/run/derive.h` /
   README). The cache does not change this.
 - The seed (I=0) is never cached and is CLI-gated.
 

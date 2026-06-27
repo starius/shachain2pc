@@ -5,11 +5,12 @@
 #   e.g. measure_cross.sh 800000000000-8000000003ff \
 #          SHACHAIN2PC_CACHE=1 SHACHAIN2PC_CHUNK_BLOCKS=16 SHACHAIN2PC_TILE_FANOUT=16
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
-CPP_BIN="${CPP_BIN:-$ROOT/.build/party}"
-RUST_BIN="${RUST_BIN:-$ROOT/rust/target/release/party}"
-REF_BIN="${REF_BIN:-$ROOT/.build/ref_cli}"
+CPP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$CPP_ROOT/.." && pwd)"
+cd "$CPP_ROOT"
+CPP_BIN="${CPP_BIN:-$CPP_ROOT/.build/party}"
+RUST_BIN="${RUST_BIN:-$REPO_ROOT/rust/target/release/party}"
+REF_BIN="${REF_BIN:-$CPP_ROOT/.build/ref_cli}"
 for b in "$CPP_BIN" "$RUST_BIN" "$REF_BIN"; do
   [[ -x "$b" ]] || { echo "missing binary: $b" >&2; exit 1; }
 done

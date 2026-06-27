@@ -899,6 +899,10 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
     }
 
+    fn cpp_root() -> PathBuf {
+        repo_root().join("cpp")
+    }
+
     fn fixture_records() -> Vec<Value> {
         let path = repo_root().join("compat/v1/probes/cpp-compat-probe.jsonl");
         let data = std::fs::read_to_string(path).unwrap();
@@ -1137,7 +1141,7 @@ mod tests {
             Role::Bob => Role::Alice,
         };
         let mut child = Command::new(bin)
-            .current_dir(repo_root())
+            .current_dir(cpp_root())
             .arg(cpp_role.party_id().to_string())
             .arg(port.to_string())
             .arg("127.0.0.1")
@@ -1210,7 +1214,7 @@ mod tests {
             Role::Bob => Role::Alice,
         };
         let mut child = Command::new(bin)
-            .current_dir(repo_root())
+            .current_dir(cpp_root())
             .arg(cpp_role.party_id().to_string())
             .arg(port.to_string())
             .arg("127.0.0.1")
@@ -1500,7 +1504,7 @@ mod tests {
     }
 
     fn cpp_wire_probe() -> PathBuf {
-        let root = repo_root();
+        let root = cpp_root();
         let bin = root.join(".build/emp_wire_probe");
         if !bin.exists() {
             let status = Command::new("make")
@@ -1519,7 +1523,7 @@ mod tests {
 
     #[cfg(feature = "cpp-probes")]
     fn cpp_ag2pc_transport_probe() -> PathBuf {
-        let root = repo_root();
+        let root = cpp_root();
         let bin = root.join(".build/ag2pc_transport_probe");
         if !bin.exists() {
             let status = Command::new("make")

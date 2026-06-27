@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=../../../Makefile");
-    println!("cargo:rerun-if-changed=../../../tools/emp_wire_probe.cpp");
-    println!("cargo:rerun-if-changed=../../../tools/ag2pc_transport_probe.cpp");
+    println!("cargo:rerun-if-changed=../../../cpp/Makefile");
+    println!("cargo:rerun-if-changed=../../../cpp/tools/emp_wire_probe.cpp");
+    println!("cargo:rerun-if-changed=../../../cpp/tools/ag2pc_transport_probe.cpp");
     println!("cargo:rerun-if-env-changed=SHACHAIN2PC_BUILD_CPP_PROBES");
 
     let env_enabled = env::var("SHACHAIN2PC_BUILD_CPP_PROBES").as_deref() == Ok("1");
@@ -19,10 +19,10 @@ fn main() {
 
 fn build_cpp_probe(target: &str) {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = manifest_dir.join("../../..");
+    let cpp_root = manifest_dir.join("../../../cpp");
     let status = Command::new("make")
         .arg(target)
-        .current_dir(&repo_root)
+        .current_dir(&cpp_root)
         .status()
         .unwrap_or_else(|_| panic!("failed to run make {target}"));
     assert!(status.success(), "failed to build {target}");

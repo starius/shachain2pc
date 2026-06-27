@@ -370,13 +370,17 @@ the legacy one-shot transport. The persisted `lambda` plus `wire_bundle`
 MAC/key material is still required DB material for restart reveal;
 `strip_labels_for_reveal` must continue to remove only session-local labels.
 
-The latest 100-channel good-case release runs show that setup was not the only
-remaining latency source. With peer gRPC cached reveal, persistent local control
-clients, and revealed-node DB compaction, sequential cached reveals still landed
-in the same broad range as the earlier CLI/EMP path once background refill and
-DB writes were included. The final drained run averaged 443.52 ms (p50 429 ms,
-p95 691 ms, p99 794 ms). Treat this as a mixed consume/refill measurement, not
-as isolated reveal latency.
+The current release RTT measurements show that cached reveal is now a
+lightweight path. After moving peer frontier reconciliation off the common
+cached path, a one-channel release run measured cached reveal at 1 ms on
+loopback, 21 ms at 10.3 ms RTT, 51 ms at 25.4 ms RTT, and 102 ms at 50.2 ms
+RTT. This is roughly two RTTs plus local work.
+
+Precompute remains the remote-latency-sensitive path. The same one-channel
+release sweep measured one-H precompute at 203 ms on loopback, 446 ms at
+10.3 ms RTT, 765 ms at 25.4 ms RTT, and 1327 ms at 50.2 ms RTT. This implies
+about 22-24 RTT-equivalent turns per H, so remote co-signers need a large enough
+frontier to keep reveal off the critical path.
 
 Remaining work:
 

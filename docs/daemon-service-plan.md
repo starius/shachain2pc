@@ -608,12 +608,18 @@ Reveal path:
 1. Validate the caller-provided `expected_next_reveal_index`.
 2. Validate requested reveal is sequential or locally derivable from known later
    secrets.
-3. If locally derivable, return without peer MPC.
-4. Otherwise promote required path to foreground priority.
-5. Compute missing one-H edges until the target authenticated node exists.
-6. Run interactive reveal for exactly that secret.
-7. Insert the clear revealed secret using shachain rules.
-8. Return the same secret on both local CLIs.
+3. For a nonzero exact persisted frontier leaf, try the cached MAC-open path
+   immediately. `RevealCached` verifies the peer share, public binding,
+   security parameters, and IT-MAC digest, so a successful open is sufficient
+   and does not require a preceding `GetFrontier` reconciliation.
+4. If the cached open reports that a frontier node is missing, reconcile with
+   the peer and fall back to recomputation from the channel seed share.
+5. If locally derivable, return without peer MPC.
+6. Otherwise promote required path to foreground priority.
+7. Compute missing one-H edges until the target authenticated node exists.
+8. Run interactive reveal for exactly that secret.
+9. Insert the clear revealed secret using shachain rules.
+10. Return the same secret on both local CLIs.
 
 This avoids batch reveal and preserves the current sequential channel-update
 model.
@@ -685,6 +691,9 @@ frames.
   - nonzero persisted daemon cached reveals now use peer gRPC `RevealCached`
     with two-sided local authorization and fixed-Delta MAC-open shares instead
     of fresh AG2PC setup;
+  - the common cached path tries the local persisted node before peer frontier
+    reconciliation, cutting the WAN path to about two RTTs in release
+    measurements;
   - persisted `lambda` and MAC/key bundles remain required DB material for
     restart reveal;
   - `I=0` seed reveal and full-derivation fallback remain on the legacy
@@ -723,10 +732,15 @@ frames.
 6. **RAM sizing.** The daemon does not enforce a RAM budget. Operators choose
    worker counts from benchmark RSS and host capacity; too many workers can OOM
    the process.
-7. **Peer asymmetry.** Both sides may have different cache state. The protocol
+7. **RTT sensitivity.** Cached reveals are lightweight, but one-H precompute is
+   still a high-round protocol. Release measurements show roughly two RTTs for
+   cached reveal and about 22-24 RTT-equivalent turns per one-H precompute.
+   Remote co-signers need enough background frontier to absorb this; high
+   throughput assumes low RTT or many channels filling concurrently.
+8. **Peer asymmetry.** Both sides may have different cache state. The protocol
    must routinely fall back to joint recomputation from a common authenticated
    ancestor or a revealed shachain ancestor.
-8. **Operational security.** The master secret unlocks both DB and future
+9. **Operational security.** The master secret unlocks both DB and future
    channel shares. CLI input, logs, core dumps, and process memory all matter.
 9. **Peer-budget griefing.** A peer can reduce liveness by advertising tiny
    worker or precompute budgets. This should produce clear status and alerts,

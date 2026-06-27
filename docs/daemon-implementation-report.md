@@ -119,9 +119,12 @@ Cached daemon reveal for nonzero persisted leaves now uses a peer gRPC
 waits for Bob's matching local reveal authorization, verifies Alice's share
 against Bob's persisted `lambda + wire_bundle` material and fixed channel
 Delta, returns Bob's MAC-open share, and both daemons store the same opened
-secret. This keeps the two-sided reveal rendezvous and makes both parties
-verify the persisted authenticated material. The explicit `I=0` seed-reveal
-path remains on the legacy one-shot reveal transport.
+secret. The daemon first tries the exact locally persisted frontier node and
+only falls back to `GetFrontier` reconciliation when the cached open reports a
+cache miss. This keeps the two-sided reveal rendezvous and makes both parties
+verify the persisted authenticated material without paying a control-plane
+round trip on the normal cached path. The explicit `I=0` seed-reveal path
+remains on the legacy one-shot reveal transport.
 
 After a secret is revealed and inserted into the durable shachain store, the
 exact persisted frontier node for that index is removed. The authenticated node
@@ -197,3 +200,27 @@ mismatched authenticated value ever reaches reveal.
   fallback, and the legacy C++-compatible `party` transport.
 - The local API currently uses loopback TCP plus a cookie. Peer API mTLS is
   available for daemon-to-daemon gRPC and is covered by integration tests.
+
+## Release RTT Measurements
+
+The daemon is correct over WAN-style RTT, but precompute is highly
+latency-sensitive. The following release-mode measurements used one channel,
+one worker, frontier 25, and emulated loopback RTT:
+
+| RTT | cached reveal | precompute per H |
+| --- | ---: | ---: |
+| 0.039 ms | 1 ms | 203 ms |
+| 10.315 ms | 21 ms | 446 ms |
+| 25.352 ms | 51 ms | 765 ms |
+| 50.160 ms | 102 ms | 1327 ms |
+
+The cached reveal path is now approximately two RTTs plus local work. A future
+protocol can target one RTT, but the old per-reveal `GetFrontier` round trip is
+off the common path.
+
+Precompute has a much steeper slope: the one-H path costs about 22-24
+RTT-equivalent turns plus roughly 200 ms of local release-mode work on the
+measured host. This is acceptable for background fill when the frontier stays
+ahead, but a remote 50 ms co-signer should be sized with a larger frontier and
+enough channels/workers to hide latency. Low-latency, co-located co-signers are
+the intended high-throughput deployment shape.

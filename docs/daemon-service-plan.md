@@ -2,9 +2,10 @@
 
 Status: implemented design record. This document began as the daemon plan; the
 daemon, CLI, peer gRPC/JobStream transport, mTLS, live per-channel sessions,
-durable reveal leaves, and RAM-aware worker gate have since landed. Remaining
+durable reveal leaves, and worker-based admission have since landed. Remaining
 benchmark and RAM-optimization work is tracked in
-`docs/daemon-integration-test-plan.md`.
+`docs/daemon-integration-test-plan.md`. Single-hot-channel throughput ideas are
+tracked in `docs/channel-bound-parallelism.md`.
 
 This document intentionally starts from the current optimized Rust/AG2PC code and
 does not include the abandoned experimental windowing work.

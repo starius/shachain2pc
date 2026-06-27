@@ -24,7 +24,7 @@ use shachain2pc_party::{
     PrecomputeSession,
 };
 use shachain2pc_types::{Index48, Role, Value32, INDEX_BITS, MAX_INDEX};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tokio::task::AbortHandle;
-use tokio::time::{sleep, timeout, Duration, MissedTickBehavior};
+use tokio::time::{sleep, timeout, Duration, Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{
     Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
@@ -61,6 +61,7 @@ const JOBSTREAM_PAYLOAD_CHUNK_BYTES: usize = 512 * 1024;
 const DEFAULT_PEER_REVEAL_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_DB_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const SCHEDULER_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
+const FULL_FRONTIER_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -182,6 +183,8 @@ pub struct DaemonState {
     pending_reveals: Arc<Mutex<BTreeMap<RevealRequestKey, PendingReveal>>>,
     pending_reveal_notify: Arc<Notify>,
     scheduler_notify: Arc<Notify>,
+    scheduled_precompute_channels: Arc<Mutex<BTreeSet<u64>>>,
+    full_reconcile_after: Arc<Mutex<BTreeMap<u64, Instant>>>,
     precompute_sessions: Arc<Mutex<BTreeMap<u64, PrecomputeSessionHandle>>>,
     incoming_precompute_sessions: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
     peer_channel: Option<Channel>,
@@ -1212,6 +1215,8 @@ pub fn init_daemon_state(cfg: DaemonConfig, master_secret: Vec<u8>) -> Result<Da
         pending_reveals: Arc::new(Mutex::new(BTreeMap::new())),
         pending_reveal_notify: Arc::new(Notify::new()),
         scheduler_notify: Arc::new(Notify::new()),
+        scheduled_precompute_channels: Arc::new(Mutex::new(BTreeSet::new())),
+        full_reconcile_after: Arc::new(Mutex::new(BTreeMap::new())),
         precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         incoming_precompute_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         peer_channel,
@@ -1982,52 +1987,35 @@ impl DaemonState {
         }
         let candidates = self.scheduler_candidates().await;
         for channel_index in candidates {
-            let Some(peer) = self.peer_frontier(channel_index).await? else {
-                continue;
-            };
-            if !peer.channel_enabled {
-                continue;
-            }
-            self.reconcile_with_peer(channel_index).await?;
-            let effective_precompute =
-                match self.effective_precompute_target(channel_index, peer).await {
-                    Ok(target) => target,
-                    Err(DaemonError::Refused(message))
-                        if message.contains("security parameters do not match") =>
-                    {
-                        let _ = self
-                            .record_failed_precompute_attempt(channel_index, 1)
-                            .await;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-            if effective_precompute == 0 {
-                continue;
-            }
-            if let Some(target) = self
-                .next_missing_frontier(channel_index, effective_precompute)
-                .await?
-            {
-                let state = self.clone();
-                tokio::spawn(async move {
-                    let _ = state.precompute_path_jobstream(channel_index, target).await;
-                });
-            }
+            let state = self.clone();
+            tokio::spawn(async move {
+                state.run_scheduled_precompute(channel_index).await;
+            });
         }
         Ok(())
     }
 
     async fn scheduler_candidates(&self) -> Vec<u64> {
         let resources = self.resource_model().await;
+        let mut scheduled = self.scheduled_precompute_channels.lock().await;
+        let mut full_reconcile_after = self.full_reconcile_after.lock().await;
         let inner = self.inner.lock().await;
         if inner.cfg.workers == 0 || inner.cfg.precompute == 0 {
             return Vec::new();
         }
-        if inner.active_jobs.len() >= resources.effective_workers as usize {
+        let now = Instant::now();
+        let active_channels = inner
+            .active_jobs
+            .values()
+            .map(|job| job.channel_index)
+            .collect::<BTreeSet<_>>();
+        let in_flight = active_channels.union(&*scheduled).count();
+        let effective_workers = resources.effective_workers as usize;
+        if in_flight >= effective_workers {
             return Vec::new();
         }
-        inner
+        let available = effective_workers - in_flight;
+        let candidates = inner
             .db
             .channels
             .iter()
@@ -2036,16 +2024,89 @@ impl DaemonState {
                 if !channel.enabled || channel.precompute_target == 0 {
                     return None;
                 }
-                let busy = inner
-                    .active_jobs
-                    .values()
-                    .any(|job| job.channel_index == channel_index);
-                if busy {
+                let local_precompute = channel.precompute_target.min(inner.cfg.precompute);
+                if local_precompute == 0 {
                     return None;
                 }
-                Some(channel_index)
+                let has_missing_frontier = (1..=local_precompute.min(MAX_INDEX)).any(|index| {
+                    let key = node_key(index);
+                    let (public, local) = binding_pair(&inner, channel_index, index);
+                    !channel.frontier_nodes.get(&key).is_some_and(|record| {
+                        record.public_binding_hex == to_hex(&public)
+                            && record.local_binding_hex == to_hex(&local)
+                    })
+                });
+                if !has_missing_frontier {
+                    if full_reconcile_after
+                        .get(&channel_index)
+                        .is_some_and(|deadline| *deadline > now)
+                    {
+                        return None;
+                    }
+                }
+                if active_channels.contains(&channel_index) || scheduled.contains(&channel_index) {
+                    return None;
+                }
+                Some((channel_index, !has_missing_frontier))
             })
+            .take(available)
+            .collect::<Vec<_>>();
+        for (channel_index, local_frontier_full) in &candidates {
+            scheduled.insert(*channel_index);
+            if *local_frontier_full {
+                full_reconcile_after.insert(*channel_index, now + FULL_FRONTIER_RECONCILE_INTERVAL);
+            }
+        }
+        candidates
+            .into_iter()
+            .map(|(channel_index, _)| channel_index)
             .collect()
+    }
+
+    async fn run_scheduled_precompute(&self, channel_index: u64) {
+        let result = self.run_scheduled_precompute_inner(channel_index).await;
+        self.scheduled_precompute_channels
+            .lock()
+            .await
+            .remove(&channel_index);
+        if matches!(result, Ok(true)) {
+            self.wake_scheduler();
+        }
+    }
+
+    async fn run_scheduled_precompute_inner(&self, channel_index: u64) -> Result<bool> {
+        let Some(peer) = self.peer_frontier(channel_index).await? else {
+            return Ok(false);
+        };
+        if !peer.channel_enabled {
+            return Ok(false);
+        }
+        self.reconcile_with_peer(channel_index).await?;
+        let effective_precompute = match self.effective_precompute_target(channel_index, peer).await
+        {
+            Ok(target) => target,
+            Err(DaemonError::Refused(message))
+                if message.contains("security parameters do not match") =>
+            {
+                let _ = self
+                    .record_failed_precompute_attempt(channel_index, 1)
+                    .await;
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+        if effective_precompute == 0 {
+            return Ok(false);
+        }
+        if let Some(target) = self
+            .next_missing_frontier(channel_index, effective_precompute)
+            .await?
+        {
+            self.precompute_path_jobstream(channel_index, target)
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn validate_peer_security_params(
@@ -2188,6 +2249,14 @@ impl DaemonState {
     }
 
     async fn drop_precompute_session(&self, channel_index: u64) {
+        self.scheduled_precompute_channels
+            .lock()
+            .await
+            .remove(&channel_index);
+        self.full_reconcile_after
+            .lock()
+            .await
+            .remove(&channel_index);
         self.precompute_sessions.lock().await.remove(&channel_index);
         if let Some(handle) = self
             .incoming_precompute_sessions

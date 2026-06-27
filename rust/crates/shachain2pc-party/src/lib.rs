@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
@@ -144,6 +144,19 @@ pub enum PartyOutput {
 
 pub const AG2PC_SSP: usize = 40;
 
+static SHARED_SHA_CIRCUIT: OnceLock<Arc<Circuit>> = OnceLock::new();
+
+fn shared_sha_circuit() -> Arc<Circuit> {
+    SHARED_SHA_CIRCUIT
+        .get_or_init(|| {
+            Arc::new(
+                sha256_compress_gadget()
+                    .expect("embedded SHA-256 compression circuit should parse"),
+            )
+        })
+        .clone()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MpcTcpEndpoint {
     pub role: Role,
@@ -220,7 +233,7 @@ pub async fn run_party(args: Args) -> Result<PartyOutput, PartyError> {
     }
 
     let mut timing = PhaseTiming::new(args.role, index);
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     let circuit = build_circuit_for_index(index, &sha)?;
     let digest = batch_digest(&[index.get()], &sha);
     let program = Ag2pcProgram::from_circuit(&circuit)?;
@@ -255,7 +268,7 @@ pub async fn run_seed_root_job(
     digest: [u8; 32],
     ssp: usize,
 ) -> Result<Ag2pcSecureWires, PartyError> {
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     run_seed_root_job_with_circuit(endpoint, share, delta, digest, ssp, &sha).await
 }
 
@@ -297,7 +310,7 @@ pub async fn run_one_hash_job(
             "one-H job bit is outside the 48-bit shachain index",
         ));
     }
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     run_one_hash_job_with_circuit(endpoint, parent, bit, delta, digest, ssp, &sha).await
 }
 
@@ -358,8 +371,8 @@ impl<S: TranscriptIo + IdleTrim> PrecomputeSession<S> {
         delta: shachain2pc_emp_wire::Block,
         ssp: usize,
     ) -> Result<Self, PartyError> {
-        let sha = sha256_compress_gadget()?;
-        Self::setup_with_streams_and_circuit(streams, role, share, delta, ssp, Arc::new(sha)).await
+        let sha = shared_sha_circuit();
+        Self::setup_with_streams_and_circuit(streams, role, share, delta, ssp, sha).await
     }
 
     pub async fn setup_with_streams_and_circuit(
@@ -483,7 +496,7 @@ pub async fn run_precompute_path_with_streams<S: TranscriptIo>(
     delta: shachain2pc_emp_wire::Block,
     ssp: usize,
 ) -> Result<Vec<(u64, Ag2pcSecureWires)>, PartyError> {
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     run_precompute_path_with_streams_and_circuit(streams, role, share, index, delta, ssp, &sha)
         .await
 }
@@ -678,7 +691,7 @@ async fn run_derivation_batch(
         .first()
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
     let mut timing = PhaseTiming::new(role, first_index);
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     let index_values: Vec<u64> = indices.iter().map(|index| index.get()).collect();
     let digest = batch_digest(&index_values, &sha);
     timing.mark("build_batch_circuits");
@@ -722,7 +735,7 @@ async fn run_derivation_tree(
         .first()
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?;
     let mut timing = PhaseTiming::new(role, first_index);
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     let (_, low_mask, high_mask) = range_split_masks(indices)?;
     let trunk_groups = split_chain_bits(
         first_index.get() & high_mask,
@@ -800,7 +813,7 @@ async fn run_derivation_cache(
         .ok_or(PartyError::UnsupportedMode("range must not be empty"))?
         .get();
     let mut timing = PhaseTiming::new(role, Index48::new(lo).expect("parser checked index"));
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     let tile_height = tile_height_for_fanout(tile_fanout)?;
     let (split, low_mask, high_mask) = range_split_masks(&[
         Index48::new(lo).expect("parser checked index"),
@@ -1167,7 +1180,7 @@ async fn run_derivation_chunked(
     blocks_per_chunk: usize,
 ) -> Result<Value32, PartyError> {
     let mut timing = PhaseTiming::new(role, index);
-    let sha = sha256_compress_gadget()?;
+    let sha = shared_sha_circuit();
     let groups = split_chain_bits(index.get(), blocks_per_chunk)?;
     let tamper_chunk = tamper_step_from_env();
     let digest = chunk_spec_digest(index.get(), blocks_per_chunk as i32, &sha);
@@ -1698,6 +1711,14 @@ mod tests {
     const INDEX_ZERO_RESULT: &str =
         "0101010101010101010101010101010101010101010101010101010101010101";
     static PARTY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn party_uses_shared_sha_circuit() {
+        let first = shared_sha_circuit();
+        let second = shared_sha_circuit();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.n3, VALUE_BITS as i32);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rust_party_i0_honest_matches_reference() {

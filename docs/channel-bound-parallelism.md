@@ -230,6 +230,41 @@ The likely sequence is:
 
 The two ideas compose: each lane can eventually use multi-output tile circuits.
 
+## Initial Investigation Log
+
+Code inspection confirms the current single-channel bottleneck:
+
+- `PrecomputeSessionHandle` sends `Plan` and `Precompute` commands into one
+  per-session `mpsc` loop;
+- `run_outgoing_precompute_session` processes those commands serially because
+  one `Ag2pcSession` owns the carried labels and cache;
+- scheduler admission is keyed by `channel_index`, so a channel cannot have two
+  active background precompute jobs today.
+
+The existing standalone party cache path was used as a sanity check for idea 2
+before daemon changes. The command shape is:
+
+```text
+SHACHAIN2PC_CACHE=1 SHACHAIN2PC_TILE_FANOUT=<1|16> \
+  target/release/party <role> <port> <lo>-<hi> <share>
+```
+
+Release-mode, no emulated RTT, aligned range, both parties on loopback:
+
+| leaves | fanout | wall | per secret | notes |
+| ---: | ---: | ---: | ---: | --- |
+| 16 | 1 | 3.78 s | 236 ms | trunk dominates |
+| 16 | 16 | 3.85 s | 241 ms | one tile, trunk dominates |
+| 256 | 1 | 18.62 s | 72.7 ms | one-SHA cache steps |
+| 256 | 16 | 16.34 s | 63.8 ms | recursive tile path |
+
+This measurement is deliberately narrow. It proves the current tile path works
+and gives a modest low-RTT win, but it does not prove the daemon optimization.
+At low RTT the run is mostly local compute and setup; the expected value of
+multi-output circuits is larger under nonzero RTT because they reduce
+latency-bearing AG2PC program instances. The next measurement must repeat the
+same comparison at 50 ms RTT and include peak RSS.
+
 ## Security And Accounting Rules
 
 Both ideas must preserve these invariants:
@@ -262,4 +297,3 @@ the parked import/relabel protocol.
 5. Keep both prototypes off by default until the benchmark report shows a
    throughput/RSS win and integration tests cover restart, disable, rollback,
    tamper, and expected-index reveal safety.
-

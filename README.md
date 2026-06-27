@@ -45,7 +45,6 @@ The daemon design adds these operational invariants:
 | [cpp/](cpp/) | Legacy C++ EMP implementation and C++ compatibility probes. |
 | [compat/](compat/) | Compatibility specs and frozen C++ probe fixtures used by Rust tests. |
 | [docs/](docs/) | Design notes, security notes, migration plans, and benchmark reports. |
-| [patches/](patches/) | Patch applied to the pinned EMP stack by the nix flake. |
 
 ## Rust Architecture
 
@@ -76,7 +75,7 @@ tests, and benchmarks.
 ## Build
 
 The repo uses a nix flake to pin the C/C++ toolchain, Rust toolchain, OpenSSL,
-protobuf, and the patched EMP dependency stack.
+protobuf, and the EMP dependency stack.
 
 ```sh
 nix develop -c cargo build --manifest-path rust/Cargo.toml --release

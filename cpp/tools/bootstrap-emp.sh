@@ -6,26 +6,16 @@
 #
 # Pinned to a commit set known to build together.
 #
-# Bumped to the rewritten emp-ag2pc (session/backend "byte-bool" API, KRRW18
-# half-gate leaky-AND, SoftSpoken COT). The previous pin (emp-ag2pc 356cfd82,
-# fpre.h == upstream 2f079f0) had a latent uninitialized-memory bug: at
-# fpre_threads=1 its single-shot C2PC combine fills only permute_batch_size
-# triples but reads all num_ands from an un-memset MAC_res, so every circuit with
-# num_ands>3100 read uninitialized heap (correct only by zeroed-page luck;
-# MALLOC_PERTURB_ flips the output). The rewrite sizes to num_ands with zero-init
-# vectors and drops the cap. emp-tool / emp-ot are header/lib deps that emp-ag2pc
-# tracks as "main" (per its .github/workflows/*.dep) -- a MOVING target. emp-tool
-# main has since renamed the Session concept (DirectCtx/direct_ctx() -> ctx_t/
-# ctx()), which fails emp-ag2pc 546d5e4's static_asserts. So we pin emp-tool /
-# emp-ot to their main commits as of emp-ag2pc 546d5e4's commit date (2026-06-15),
-# the set it was actually written against.
+# Pinned to the current upstream emp-tool / emp-ot / emp-ag2pc session backend
+# API. These repositories track each other closely, so keep this commit set in
+# sync with the nix flake rather than mixing arbitrary main revisions.
 set -euo pipefail
 
 # DEPRECATED: emp is now built reproducibly by the nix flake (packages.emp).
-# Running `nix develop` builds the patched emp stack into /nix/store and exports
+# Running `nix develop` builds the pinned emp stack into /nix/store and exports
 # EMP_PREFIX pointing at it -- no bootstrap needed. This script is retained only
-# as a non-nix fallback; it builds the same pins + patch into cpp/.deps/emp, the
-# layout EMP_PREFIX falls back to when it is unset.
+# as a non-nix fallback; it builds the same pins into cpp/.deps/emp, the layout
+# EMP_PREFIX falls back to when it is unset.
 echo "NOTE: bootstrap-emp.sh is deprecated; 'nix develop' builds emp via nix." >&2
 
 # Allow -march=native through nix's cc-wrapper (it strips native arch by default
@@ -33,16 +23,15 @@ echo "NOTE: bootstrap-emp.sh is deprecated; 'nix develop' builds emp via nix." >
 export NIX_ENFORCE_NO_NATIVE=0
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
 
 case "$(uname -m)" in
   x86_64 | amd64) ;;
   *) echo "emp-ag2pc bootstrap supports x86_64 hosts only." >&2; exit 1 ;;
 esac
 
-EMP_TOOL_COMMIT="22e3387dcdf99a7f13b0f5505b4b8d515d4cde3a"   # emp-tool main @ emp-ag2pc 546d5e4 date
-EMP_OT_COMMIT="95719775bf18082701d0f544c697b1246a3cb3e4"     # emp-ot   main @ emp-ag2pc 546d5e4 date
-EMP_AG2PC_COMMIT="546d5e442e084958d5b5c9ca85c83b91aa3d9cc9"  # emp-ag2pc main @ bump (rewrite)
+EMP_TOOL_COMMIT="2ea73a31c54091bd15979ff884e24fa77c3f9673"
+EMP_OT_COMMIT="39b207ec320001c0901c62819bf083194026b6a9"
+EMP_AG2PC_COMMIT="a245ca0f67abaf2d48c711e3c050ce961e60ad29"
 
 # emp-tool commit that still ships the legacy Bristol circuit files (the new
 # emp-tool dropped them); used below to restore sha-256.txt for protocol/.
@@ -65,20 +54,10 @@ checkout() { # path url commit
   git -C "$1" checkout --detach "$3"
 }
 
-apply_patch_once() { # repo patch
-  if git -C "$1" apply --check "$2"; then
-    git -C "$1" apply "$2"
-  elif ! git -C "$1" apply --reverse --check "$2"; then
-    git -C "$1" apply --check "$2"
-  fi
-}
-
 mkdir -p "$SRC" "$BUILD"
 checkout "$SRC/emp-tool"   https://github.com/emp-toolkit/emp-tool.git   "$EMP_TOOL_COMMIT"
 checkout "$SRC/emp-ot"     https://github.com/emp-toolkit/emp-ot.git     "$EMP_OT_COMMIT"
 checkout "$SRC/emp-ag2pc"  https://github.com/emp-toolkit/emp-ag2pc.git  "$EMP_AG2PC_COMMIT"
-apply_patch_once "$SRC/emp-ag2pc" \
-  "$REPO_ROOT/patches/emp-ag2pc-546d5e4-align-prg-random-data.patch"
 
 rm -rf "$PREFIX"; mkdir -p "$PREFIX"
 

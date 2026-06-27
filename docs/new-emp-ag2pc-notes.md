@@ -1,9 +1,10 @@
 # Notes on the rewritten emp-ag2pc (session/backend API)
 
 Captured while porting the C++ side from the old single-shot `emp::C2PC` to the
-rewritten upstream emp-ag2pc (`546d5e4`, "session/backend, byte-bool contract").
-These are things worth knowing for future work — especially the resumability /
-async features that the old API did not have.
+rewritten upstream emp-ag2pc session/backend API. The current pin uses the
+`ctx_t` / `ctx()` naming from upstream main. These are things worth knowing for
+future work — especially the resumability / async features that the old API did
+not have.
 
 ## Why we moved
 
@@ -28,7 +29,7 @@ Header-only **C++20**. The whole 2PC is one object, `emp::AG2PCSession`:
 NetIO *io = ...;                         // single full-duplex socket; the session
 ThreadPool pool(4);                      //   spawns its own sibling channel
 AG2PCSession sess(io, &pool, party, /*ssp=*/40);
-using Ctx = AG2PCSession::DirectCtx;     // == AG2PCCtx, a pure BooleanContext recorder
+using Ctx = AG2PCSession::ctx_t;         // == AG2PCCtx, a pure BooleanContext recorder
 auto a = sess.input<UInt_T<Ctx,32>>(ALICE, x);   // each party owns its input; PUBLIC = constant
 auto c = a + b;                          // operators record gates into the current chunk
 uint32_t out = sess.reveal(c, PUBLIC).value();   // reveal returns std::optional<clear_t>
@@ -139,10 +140,9 @@ Args to `run_artifact` are concatenated in wire order (our order: BOB share → 
 ## Build gotchas (for the bootstrap)
 
 - emp-tool / emp-ot are external `find_package` deps that emp-ag2pc tracks as
-  **`main`** (a moving target). emp-tool main has since renamed the `Session`
-  concept (`DirectCtx`/`direct_ctx()` → `ctx_t`/`ctx()`), which fails emp-ag2pc
-  `546d5e4`'s `static_assert`s. Pin emp-tool/emp-ot to their main commits **as of
-  emp-ag2pc's commit date**, not bleeding HEAD.
+  **`main`** (a moving target). Keep the three pins synchronized; mixing old
+  `DirectCtx` / `direct_ctx()` emp-tool headers with newer `ctx_t` / `ctx()`
+  emp-ag2pc headers fails the session concept checks.
 - Disable tests with the real toggles `EMP_TOOL_BUILD_TESTS` / `EMP_OT_BUILD_TESTS`
   / `EMP_AG2PC_BUILD_TESTS` (default ON for a top-level configure — `BUILD_TESTING`
   is ignored).

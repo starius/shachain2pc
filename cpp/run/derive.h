@@ -297,7 +297,7 @@ inline std::vector<protocol::Value> RunDerivationBatch(
     emp::NetIO* io, ThreadPool* pool, int party,
     const std::vector<uint64_t>& indices, const protocol::Value& my_share,
     BatchTiming& timing) {
-  using Ctx = emp::AG2PCSession::DirectCtx;
+  using Ctx = emp::AG2PCSession::ctx_t;
   using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;  // 256-bit input/output
   using Clock = std::chrono::steady_clock;
   auto secs = [](Clock::time_point a, Clock::time_point b) {
@@ -466,7 +466,7 @@ inline protocol::Value RunDerivationChunked(emp::NetIO* io, ThreadPool* pool,
                                             int blocks_per_chunk,
                                             ChunkTiming& timing,
                                             int tamper_chunk = -1) {
-  using Ctx = emp::AG2PCSession::DirectCtx;
+  using Ctx = emp::AG2PCSession::ctx_t;
   using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;
   using Clock = std::chrono::steady_clock;
   auto secs = [](Clock::time_point a, Clock::time_point b) {
@@ -620,7 +620,7 @@ inline std::vector<protocol::Value> RunDerivationTree(
     emp::NetIO* io, ThreadPool* pool, int party,
     const std::vector<uint64_t>& indices, const protocol::Value& my_share,
     int trunk_chunk_blocks, TreeTiming& timing, int tamper_branch = -1) {
-  using Ctx = emp::AG2PCSession::DirectCtx;
+  using Ctx = emp::AG2PCSession::ctx_t;
   using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;
   using Clock = std::chrono::steady_clock;
   auto secs = [](Clock::time_point a, Clock::time_point b) {
@@ -832,7 +832,7 @@ inline std::optional<std::array<bool, protocol::kValueBits>> RevealTileSlotRaw(
 // ---- recursive tiling helpers (height-generic) ----------------------------
 // The cache session uses one fixed wire context, so the tile value types are
 // concrete (no per-call Ctx templating). A height-H tile carries 2^H * 256 bits.
-using CacheCtx = emp::AG2PCSession::DirectCtx;
+using CacheCtx = emp::AG2PCSession::ctx_t;
 using CacheBV = emp::BitVec_T<CacheCtx, protocol::kValueBits>;
 template <int H>
 using CacheTileBV = emp::BitVec_T<CacheCtx, (1 << H) * protocol::kValueBits>;
@@ -992,7 +992,7 @@ inline std::vector<protocol::Value> RunDerivationCache(
     emp::NetIO* io, ThreadPool* pool, int party, uint64_t lo, uint64_t hi,
     const protocol::Value& my_share, int trunk_chunk_blocks, int tile_fanout,
     CacheTiming& timing, long tamper_step = -1) {
-  using Ctx = emp::AG2PCSession::DirectCtx;
+  using Ctx = emp::AG2PCSession::ctx_t;
   using BV = emp::BitVec_T<Ctx, protocol::kValueBits>;
   using TileBV = emp::BitVec_T<Ctx, kCacheTileBits>;
   using Clock = std::chrono::steady_clock;

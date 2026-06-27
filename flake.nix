@@ -16,27 +16,25 @@
         shellStdenv = if pkgs ? gcc14Stdenv then pkgs.gcc14Stdenv else pkgs.stdenv;
         ccBin = "${shellStdenv.cc}/bin";
 
-        # Reproducible, patched emp stack (emp-tool + emp-ot + emp-ag2pc) built into
+        # Reproducible emp stack (emp-tool + emp-ot + emp-ag2pc) built into
         # /nix/store. Replaces cpp/tools/bootstrap-emp.sh.
-        # Pins match the bootstrap script's commit set; the prg-alignment patch is
-        # applied here so cross-mode and assert-enabled builds are correct.
         # Built with a fixed -march (x86-64-v3 + AES/PCLMUL) instead of -march=native
         # so the derivation is reproducible; the header-only AG2PC hot path is still
         # recompiled with the consumer's own flags when it includes these headers.
         empTool = pkgs.fetchFromGitHub {
           owner = "emp-toolkit"; repo = "emp-tool";
-          rev = "22e3387dcdf99a7f13b0f5505b4b8d515d4cde3a";
-          sha256 = "1wlphrb55z40ry9j5jj336skdrvxximmj9zdjvq1rqsv4mb34rc4";
+          rev = "2ea73a31c54091bd15979ff884e24fa77c3f9673";
+          hash = "sha256-A6Z8GpJsRqvJvVLBiHdTbO5XaRW8Xkm36TuelNrTKd8=";
         };
         empOt = pkgs.fetchFromGitHub {
           owner = "emp-toolkit"; repo = "emp-ot";
-          rev = "95719775bf18082701d0f544c697b1246a3cb3e4";
-          sha256 = "1q7k2wbw6s59axhbmfma8byqv38h8cvamgiw4jwcd3mknha8sh6y";
+          rev = "39b207ec320001c0901c62819bf083194026b6a9";
+          hash = "sha256-5eVTaG0KDSQLu+4/X4gCMguAT+piNLdzzncY8CU6C2M=";
         };
         empAg2pc = pkgs.fetchFromGitHub {
           owner = "emp-toolkit"; repo = "emp-ag2pc";
-          rev = "546d5e442e084958d5b5c9ca85c83b91aa3d9cc9";
-          sha256 = "14whakbbfb4ph7mgahxlnzvsh66qr4w98z8rpkw36czdkg7yk7kk";
+          rev = "a245ca0f67abaf2d48c711e3c050ce961e60ad29";
+          hash = "sha256-SuyZmtjeqOmLtJaZnpv6S6nuCLa/ZAi5U/p91JU7XZU=";
         };
         # The current emp-tool dropped the legacy Bristol circuit files, but
         # both implementations load the standard sha-256.txt. Pull it from the
@@ -48,7 +46,7 @@
 
         emp = shellStdenv.mkDerivation {
           pname = "emp-shachain2pc";
-          version = "ag2pc-546d5e4";
+          version = "ag2pc-a245ca0";
           dontUnpack = true;
           dontConfigure = true;
           dontInstall = true;
@@ -60,7 +58,6 @@
             cp -r ${empOt} emp-ot
             cp -r ${empAg2pc} emp-ag2pc
             chmod -R u+w emp-tool emp-ot emp-ag2pc
-            ( cd emp-ag2pc && patch -p1 < ${./patches/emp-ag2pc-546d5e4-align-prg-random-data.patch} )
 
             flags="-O3 -march=x86-64-v3 -maes -mpclmul"
             for pkg in emp-tool emp-ot emp-ag2pc; do

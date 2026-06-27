@@ -23,7 +23,6 @@ the Rust port and to preserve historical behavior.
 Shared compatibility fixtures are intentionally outside this directory:
 
 - [../compat/](../compat/) contains frozen C++ fixture outputs used by Rust.
-- [../patches/](../patches/) contains the EMP patch applied by the nix flake.
 
 ## Build
 
@@ -40,7 +39,7 @@ cd cpp
 nix develop -c make
 ```
 
-The nix flake builds the pinned, patched EMP stack and exports `EMP_PREFIX`.
+The nix flake builds the pinned EMP stack and exports `EMP_PREFIX`.
 Without nix, `tools/bootstrap-emp.sh` is a deprecated fallback that installs the
 same EMP pins under `cpp/.deps/emp`.
 

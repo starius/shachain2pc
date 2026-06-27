@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     SetTransportTimeout(sess.protocol().sib);
     io.flush();
 
-    using Ctx = emp::AG2PCSession::DirectCtx;
+    using Ctx = emp::AG2PCSession::ctx_t;
     using Bit = emp::Bit_T<Ctx>;
     Probe probe(party, sess, &io);
     probe.Emit("session_setup", "");
@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
     batch.finish();
     probe.Emit("input_batch_two_bits", "");
 
-    Bit public_true = Bit::constant(sess.direct_ctx(), true);
+    Bit public_true = Bit::constant(sess.ctx(), true);
     std::optional<bool> public_reveal =
         RevealBit(sess, public_true, emp::PUBLIC);
     probe.Emit("public_true_reveal",
@@ -223,12 +223,12 @@ int main(int argc, char** argv) {
     probe.Emit("carried_and_reveal",
                OptionalBoolField("result", carried_reveal));
 
-    Bit alice_true = Bit::constant(sess.direct_ctx(), true);
+    Bit alice_true = Bit::constant(sess.ctx(), true);
     Bit to_alice = alice ^ alice_true;
     std::optional<bool> alice_only = RevealBit(sess, to_alice, emp::ALICE);
     probe.Emit("reveal_to_alice", OptionalBoolField("result", alice_only));
 
-    Bit bob_true = Bit::constant(sess.direct_ctx(), true);
+    Bit bob_true = Bit::constant(sess.ctx(), true);
     Bit to_bob = bob ^ bob_true;
     std::optional<bool> bob_only = RevealBit(sess, to_bob, emp::BOB);
     probe.Emit("reveal_to_bob", OptionalBoolField("result", bob_only));

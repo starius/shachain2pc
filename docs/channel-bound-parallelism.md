@@ -502,6 +502,42 @@ multi-output circuits is larger under nonzero RTT because they reduce
 latency-bearing AG2PC program instances. The next measurement must repeat the
 same comparison at 50 ms RTT and include peak RSS.
 
+50 ms RTT validation, release-mode, 64 aligned leaves:
+
+| fanout | wall | per secret | subtree programs | subtree rounds | pair peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 98.63 s | 1541 ms | 64 | 252 | 285 MB |
+| 2 | 98.38 s | 1537 ms | 63 | 252 | 284 MB |
+| 4 | 51.39 s | 803 ms | 21 | 84 | 284 MB |
+| 8 | 38.43 s | 601 ms | 9 | 36 | 285 MB |
+| 16 | 34.46 s | 538 ms | 5 | 20 | 284 MB |
+
+Here "rounds" are EMP-stream direction-change counters summed across the main
+and sibling streams for the `cache_single` / `cache_tile` phase. They are not a
+formal proof-round count, but they track the latency-bearing protocol turns well
+enough for this comparison.
+
+The decisive comparison is the subtree phase:
+
+```text
+fanout 1:  64 one-H programs, 80.06 s, 252 rounds
+fanout 16:  5 subtree programs, 15.92 s,  20 rounds
+```
+
+So the subtree batching premise is confirmed under RTT. The end-to-end wall win
+for 64 leaves is smaller than the subtree-phase win because trunk setup and
+sequential public reveal remain fixed costs:
+
+```text
+trunk chunks: ~10.8 s
+public reveal: ~6.4 s
+```
+
+The fanout-2 row confirms the shachain-shape concern: a one-bit subtree mostly
+repackages one useful H edge plus a no-op output, so it does not help. Useful
+subtree acceleration starts at height 2 / fanout 4. Fanout 16 gives the best
+measured RTT throughput here without increasing pair peak RSS.
+
 ## Security And Accounting Rules
 
 Both ideas must preserve these invariants:

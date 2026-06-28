@@ -858,29 +858,32 @@ async fn run_derivation_cache(
     timing.mark("build_cache_circuits");
 
     let mut streams = open_ag2pc_streams_after_digest(role, port, peer_ip, digest).await?;
-    timing.mark("open_streams");
+    timing.mark_streams("open_streams", &streams);
     let mut session = Ag2pcSession::setup(&mut streams, role, AG2PC_SSP).await?;
     streams.main.flush().await?;
-    timing.mark("ag2pc_setup");
+    timing.mark_streams("ag2pc_setup", &streams);
 
     let seed_inputs = authenticate_seed_inputs(&mut session, &mut streams, role, share).await?;
-    timing.mark("input_auth");
+    timing.mark_streams("input_auth", &streams);
     let first_trunk_program = chunk_program(&sha, &trunk_groups[0], true, false)?;
     let mut trunk = session
         .run_program(&mut streams, &first_trunk_program, &seed_inputs)
         .await?;
     drop(first_trunk_program);
-    timing.mark("cache_trunk_0");
+    timing.mark_streams("cache_trunk_0", &streams);
 
     for (chunk, bits) in trunk_groups.iter().enumerate().skip(1) {
         let program = chunk_program(&sha, bits, false, false)?;
         trunk = session.run_program(&mut streams, &program, &trunk).await?;
-        timing.mark(match chunk {
-            1 => "cache_trunk_1",
-            2 => "cache_trunk_2",
-            3 => "cache_trunk_3",
-            _ => "cache_trunk",
-        });
+        timing.mark_streams(
+            match chunk {
+                1 => "cache_trunk_1",
+                2 => "cache_trunk_2",
+                3 => "cache_trunk_3",
+                _ => "cache_trunk",
+            },
+            &streams,
+        );
     }
 
     if let Some(levels) = &recursive_levels {
@@ -911,7 +914,7 @@ async fn run_derivation_cache(
                         .await?;
                     tile.strip_labels_for_reveal();
                     tiles.push(tile);
-                    timing.mark("cache_tile");
+                    timing.mark_streams("cache_tile", &streams);
                     tamper.advance();
                 }
 
@@ -934,7 +937,7 @@ async fn run_derivation_cache(
                     reveal_index -= 1;
                 }
                 streams.main.flush().await?;
-                timing.mark("cache_reveal");
+                timing.mark_streams("cache_reveal", &streams);
 
                 let outputs = indices
                     .iter()
@@ -972,7 +975,7 @@ async fn run_derivation_cache(
                 for slot in 0..(1usize << level.height) {
                     next.push(tile.slice(slot * VALUE_BITS, (slot + 1) * VALUE_BITS)?);
                 }
-                timing.mark("cache_tile");
+                timing.mark_streams("cache_tile", &streams);
                 tamper.advance();
             }
             roots = next;
@@ -1027,7 +1030,7 @@ async fn run_derivation_cache(
                 .await?;
             tile.strip_labels_for_reveal();
             tile_outs.insert(tile_base, tile);
-            timing.mark("cache_tile");
+            timing.mark_streams("cache_tile", &streams);
             tamper.advance();
 
             if tile_base == lo {
@@ -1051,7 +1054,7 @@ async fn run_derivation_cache(
         let mut out = stack.last().clone();
         out.strip_labels_for_reveal();
         single_outs.insert(index, out);
-        timing.mark("cache_single");
+        timing.mark_streams("cache_single", &streams);
         if index == lo {
             break;
         }
@@ -1082,7 +1085,7 @@ async fn run_derivation_cache(
         reveal_index -= 1;
     }
     streams.main.flush().await?;
-    timing.mark("cache_reveal");
+    timing.mark_streams("cache_reveal", &streams);
 
     let outputs = indices
         .iter()
@@ -1280,6 +1283,7 @@ struct PhaseTiming {
     index: Index48,
     start: Instant,
     last: Instant,
+    last_wire: Option<WireSnapshot>,
 }
 
 impl PhaseTiming {
@@ -1294,6 +1298,7 @@ impl PhaseTiming {
             index,
             start: now,
             last: now,
+            last_wire: None,
         }
     }
 
@@ -1313,6 +1318,75 @@ impl PhaseTiming {
             total_ms
         );
         self.last = now;
+    }
+
+    fn mark_streams(&mut self, phase: &str, streams: &Ag2pcStreams<EmpStream>) {
+        if !self.enabled {
+            return;
+        }
+        let current = WireSnapshot::from_streams(streams);
+        let delta = self.last_wire.map(|last| current.saturating_sub(last));
+        self.last_wire = Some(current);
+
+        let now = Instant::now();
+        let phase_ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
+        let total_ms = now.duration_since(self.start).as_secs_f64() * 1000.0;
+        if let Some(delta) = delta {
+            eprintln!(
+                "TIMING role={} index={} phase={} phase_ms={:.3} total_ms={:.3} send_bytes={} recv_bytes={} rounds={} flushes={}",
+                self.role.party_id(),
+                self.index.to_hex12(),
+                phase,
+                phase_ms,
+                total_ms,
+                delta.send_bytes,
+                delta.recv_bytes,
+                delta.rounds,
+                delta.flushes
+            );
+        } else {
+            eprintln!(
+                "TIMING role={} index={} phase={} phase_ms={:.3} total_ms={:.3} send_bytes={} recv_bytes={} rounds={} flushes={}",
+                self.role.party_id(),
+                self.index.to_hex12(),
+                phase,
+                phase_ms,
+                total_ms,
+                current.send_bytes,
+                current.recv_bytes,
+                current.rounds,
+                current.flushes
+            );
+        }
+        self.last = now;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WireSnapshot {
+    send_bytes: u64,
+    recv_bytes: u64,
+    rounds: u64,
+    flushes: u64,
+}
+
+impl WireSnapshot {
+    fn from_streams(streams: &Ag2pcStreams<EmpStream>) -> Self {
+        Self {
+            send_bytes: streams.main.send_counter() + streams.sibling.send_counter(),
+            recv_bytes: streams.main.recv_counter() + streams.sibling.recv_counter(),
+            rounds: streams.main.rounds() + streams.sibling.rounds(),
+            flushes: streams.main.flushes_count() + streams.sibling.flushes_count(),
+        }
+    }
+
+    fn saturating_sub(self, rhs: Self) -> Self {
+        Self {
+            send_bytes: self.send_bytes.saturating_sub(rhs.send_bytes),
+            recv_bytes: self.recv_bytes.saturating_sub(rhs.recv_bytes),
+            rounds: self.rounds.saturating_sub(rhs.rounds),
+            flushes: self.flushes.saturating_sub(rhs.flushes),
+        }
     }
 }
 

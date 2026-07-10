@@ -1,0 +1,8 @@
+/cpp/.deps/
+/cpp/.build/
+/cpp/.sources/
+/.deps/
+/.build/
+/.sources/
+/circuit.txt
+/rust/target/

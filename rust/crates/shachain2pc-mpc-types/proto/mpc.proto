@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package shachain2pc.mpc.v1;
+
+message MpcFrame {
+  uint32 protocol_version = 1;
+  bytes job_id = 2;
+  uint32 sender_role = 3;
+  uint32 channel = 4;
+  uint64 sequence = 5;
+  uint32 message_kind = 6;
+  bytes payload = 7;
+  uint32 flags = 8;
+}
+
+message SessionStart {
+  uint32 ssp = 1;
+  bytes circuit_digest = 2;
+  bytes job_binding = 3;
+}
+
+message SessionStartAck {
+  bytes transcript_binding = 1;
+}
+
+message PhaseBytes {
+  bytes body = 1;
+}
+
+message Abort {
+  uint32 code = 1;
+  string reason = 2;
+}

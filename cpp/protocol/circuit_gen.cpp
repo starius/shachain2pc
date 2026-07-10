@@ -1,0 +1,278 @@
+#include "circuit_gen.h"
+
+#include <stdexcept>
+#include <vector>
+
+#include "wire_layout.h"
+
+namespace shachain2pc::protocol {
+namespace {
+
+// Incremental Bristol circuit builder. Input wires are reserved first, so they
+// occupy [0, n1+n2); every other wire is allocated on demand with a strictly
+// increasing id, keeping the gate list in topological order.
+class Builder {
+ public:
+  explicit Builder(int num_inputs) : next_(num_inputs) {}
+
+  int Alloc() { return next_++; }
+
+  void And(int a, int b, int o) { gates_.push_back({Gate::kAnd, a, b, o}); }
+  void Xor(int a, int b, int o) { gates_.push_back({Gate::kXor, a, b, o}); }
+  void Inv(int a, int o) { gates_.push_back({Gate::kInv, a, -1, o}); }
+
+  int XorW(int a, int b) {
+    int o = Alloc();
+    Xor(a, b, o);
+    return o;
+  }
+  int InvW(int a) {
+    int o = Alloc();
+    Inv(a, o);
+    return o;
+  }
+
+  // Instantiate a sub-circuit gadget: its input wires (gadget ids [0, gn1+gn2))
+  // are bound to the supplied wire ids; all other gadget wires get fresh ids.
+  // Returns the gadget's n3 output wires (its highest gadget ids), in order.
+  std::vector<int> ApplyGadget(const Circuit& g, const std::vector<int>& in) {
+    const int gin = g.n1 + g.n2;
+    if (static_cast<int>(in.size()) != gin) {
+      throw std::runtime_error("ApplyGadget: wrong gadget input width");
+    }
+    std::vector<int> map(g.num_wire);
+    for (int w = 0; w < gin; ++w) map[w] = in[w];
+    for (int w = gin; w < g.num_wire; ++w) map[w] = Alloc();
+    for (const Gate& ge : g.gates) {
+      switch (ge.type) {
+        case Gate::kAnd:
+          And(map[ge.in0], map[ge.in1], map[ge.out]);
+          break;
+        case Gate::kXor:
+          Xor(map[ge.in0], map[ge.in1], map[ge.out]);
+          break;
+        case Gate::kInv:
+          Inv(map[ge.in0], map[ge.out]);
+          break;
+      }
+    }
+    std::vector<int> out(g.n3);
+    for (int i = 0; i < g.n3; ++i) out[i] = map[g.num_wire - g.n3 + i];
+    return out;
+  }
+
+  Circuit Finish(int n1, int n2, int n3) {
+    Circuit c;
+    c.n1 = n1;
+    c.n2 = n2;
+    c.n3 = n3;
+    c.num_wire = next_;
+    c.gates = std::move(gates_);
+    return c;
+  }
+
+ private:
+  int next_;
+  std::vector<Gate> gates_;
+};
+
+// PaddingBits returns the 256 constant bits that pad a 32-byte value into one
+// SHA-256 block (bits 256..511 of the message), MSB-first big-endian.
+std::vector<uint8_t> PaddingBits() {
+  std::array<uint8_t, 32> pad{};
+  pad[0] = 0x80;   // byte 32 of the block
+  pad[30] = 0x01;  // byte 62: bit length 256 = 0x0100, big-endian
+  std::vector<uint8_t> bits(256);
+  for (int j = 0; j < 32; ++j)
+    for (int k = 0; k < 8; ++k) bits[8 * j + k] = (pad[j] >> (7 - k)) & 1;
+  return bits;
+}
+
+int PopCountInt(int x) {
+  int n = 0;
+  while (x != 0) {
+    n += x & 1;
+    x >>= 1;
+  }
+  return n;
+}
+
+int LowestSetBit(int x) {
+  for (int b = 0; b < kIndexBits; ++b) {
+    if ((x >> b) & 1) return b;
+  }
+  throw std::runtime_error("LowestSetBit: zero has no set bit");
+}
+
+}  // namespace
+
+Circuit BuildDerivationCircuit(const Circuit& sha, uint64_t I) {
+  if (I > kMaxIndex) {
+    throw std::runtime_error("BuildDerivationCircuit: index exceeds 48 bits");
+  }
+  if (sha.n1 + sha.n2 != 512 || sha.n3 != kValueBits) {
+    throw std::runtime_error("BuildDerivationCircuit: gadget is not 512->256");
+  }
+
+  Builder b(2 * kValueBits);  // 256 ALICE input wires, then 256 BOB input wires
+
+  // Constant wires: c0 = w0 XOR w0 = 0; c1 = NOT c0 = 1.
+  const int c0 = b.XorW(0, 0);
+  const int c1 = b.InvW(c0);
+  const std::vector<uint8_t> pad = PaddingBits();
+
+  // seed = aliceShare XOR bobShare, bit by bit (MSB-first layout).
+  std::vector<int> p(kValueBits);
+  for (int i = 0; i < kValueBits; ++i) {
+    p[i] = b.XorW(i, kValueBits + i);
+  }
+
+  // For each set chain-bit B from 47 down to 0: flip then hash.
+  for (int bit = kIndexBits - 1; bit >= 0; --bit) {
+    if (((I >> bit) & 1) == 0) continue;
+    const int idx = FlipBitIndex(bit);
+    p[idx] = b.InvW(p[idx]);  // public constant flip
+
+    std::vector<int> block(512);
+    for (int i = 0; i < kValueBits; ++i) block[i] = p[i];
+    for (int i = 0; i < kValueBits; ++i) block[kValueBits + i] = pad[i] ? c1 : c0;
+    p = b.ApplyGadget(sha, block);
+  }
+
+  // Copy the final value into fresh wires so the output occupies the top n3
+  // wires regardless of how many hashes ran (handles popcount(I) == 0 too).
+  std::vector<int> out(kValueBits);
+  for (int i = 0; i < kValueBits; ++i) out[i] = b.XorW(p[i], c0);
+
+  return b.Finish(kValueBits, kValueBits, kValueBits);
+}
+
+std::vector<std::vector<int>> SplitChainBits(uint64_t I, int blocks_per_chunk) {
+  if (blocks_per_chunk < 1) {
+    throw std::runtime_error("SplitChainBits: blocks_per_chunk must be >= 1");
+  }
+  if (I > kMaxIndex) {
+    throw std::runtime_error("SplitChainBits: index exceeds 48 bits");
+  }
+  // Flat list of set chain-bits, high to low (the reference processing order).
+  std::vector<int> bits;
+  for (int bit = kIndexBits - 1; bit >= 0; --bit) {
+    if ((I >> bit) & 1) bits.push_back(bit);
+  }
+  std::vector<std::vector<int>> groups;
+  groups.emplace_back();  // chunk 0 always exists (does the seed XOR)
+  for (size_t i = 0; i < bits.size(); ++i) {
+    if (!groups.back().empty() &&
+        static_cast<int>(groups.back().size()) == blocks_per_chunk) {
+      groups.emplace_back();
+    }
+    groups.back().push_back(bits[i]);
+  }
+  return groups;
+}
+
+Circuit BuildChunkCircuit(const Circuit& sha, const std::vector<int>& chain_bits,
+                          bool first) {
+  if (sha.n1 + sha.n2 != 512 || sha.n3 != kValueBits) {
+    throw std::runtime_error("BuildChunkCircuit: gadget is not 512->256");
+  }
+  const int num_inputs = first ? 2 * kValueBits : kValueBits;
+  Builder b(num_inputs);
+
+  const int c0 = b.XorW(0, 0);
+  const int c1 = b.InvW(c0);
+  const std::vector<uint8_t> pad = PaddingBits();
+
+  // Starting value: chunk 0 recombines the two shares; later chunks take the
+  // carried value directly on their input wires (no re-input -> not steerable).
+  std::vector<int> p(kValueBits);
+  if (first) {
+    for (int i = 0; i < kValueBits; ++i) p[i] = b.XorW(i, kValueBits + i);
+  } else {
+    for (int i = 0; i < kValueBits; ++i) p[i] = i;
+  }
+
+  for (int bit : chain_bits) {  // already high-to-low within the chunk
+    const int idx = FlipBitIndex(bit);
+    p[idx] = b.InvW(p[idx]);  // public constant flip
+    std::vector<int> block(512);
+    for (int i = 0; i < kValueBits; ++i) block[i] = p[i];
+    for (int i = 0; i < kValueBits; ++i) block[kValueBits + i] = pad[i] ? c1 : c0;
+    p = b.ApplyGadget(sha, block);
+  }
+
+  std::vector<int> out(kValueBits);
+  for (int i = 0; i < kValueBits; ++i) out[i] = b.XorW(p[i], c0);
+
+  return b.Finish(kValueBits, first ? kValueBits : 0, kValueBits);
+}
+
+Circuit BuildTileCircuit(const Circuit& sha, int bit_offset, int tile_height) {
+  if (tile_height < 1 || tile_height > kIndexBits) {
+    throw std::runtime_error("BuildTileCircuit: invalid tile height");
+  }
+  if (bit_offset < 0 || bit_offset + tile_height > kIndexBits) {
+    throw std::runtime_error("BuildTileCircuit: bit window out of range");
+  }
+  if (sha.n1 + sha.n2 != 512 || sha.n3 != kValueBits) {
+    throw std::runtime_error("BuildTileCircuit: gadget is not 512->256");
+  }
+  const int leaves = 1 << tile_height;
+  Builder b(kValueBits);  // one carried tile root input
+
+  const int c0 = b.XorW(0, 0);
+  const int c1 = b.InvW(c0);
+  const std::vector<uint8_t> pad = PaddingBits();
+
+  std::vector<std::vector<int>> node(leaves);
+  node[0].resize(kValueBits);
+  for (int i = 0; i < kValueBits; ++i) node[0][i] = i;
+
+  for (int depth = 1; depth <= tile_height; ++depth) {
+    for (int suffix = 1; suffix < leaves; ++suffix) {
+      if (PopCountInt(suffix) != depth) continue;
+      // suffix bit j maps to chain bit (bit_offset + j); process high to low,
+      // so the lowest set bit (added last) becomes the final hash from parent.
+      const int bit = bit_offset + LowestSetBit(suffix);
+      const int parent = suffix & (suffix - 1);
+      std::vector<int> p = node[parent];
+      p[FlipBitIndex(bit)] = b.InvW(p[FlipBitIndex(bit)]);
+
+      std::vector<int> block(512);
+      for (int i = 0; i < kValueBits; ++i) block[i] = p[i];
+      for (int i = 0; i < kValueBits; ++i) block[kValueBits + i] = pad[i] ? c1 : c0;
+      node[suffix] = b.ApplyGadget(sha, block);
+    }
+  }
+
+  for (int suffix = 0; suffix < leaves; ++suffix) {
+    for (int i = 0; i < kValueBits; ++i) {
+      (void)b.XorW(node[suffix][i], c0);
+    }
+  }
+
+  return b.Finish(kValueBits, 0, kValueBits * leaves);
+}
+
+std::vector<TileLevel> PlanTileLevels(int depth, int tile_height) {
+  if (tile_height < 1) {
+    throw std::runtime_error("PlanTileLevels: tile_height must be >= 1");
+  }
+  if (depth < tile_height) {
+    throw std::runtime_error("PlanTileLevels: depth must be >= tile_height");
+  }
+  std::vector<TileLevel> levels;
+  int remaining = depth;
+  const int r = depth % tile_height;
+  if (r != 0) {
+    levels.push_back({depth - r, r});  // partial top level (most significant bits)
+    remaining = depth - r;
+  }
+  // Full-height levels, top to bottom; the last sits at bit_offset 0 (leaves).
+  for (int off = remaining - tile_height; off >= 0; off -= tile_height) {
+    levels.push_back({off, tile_height});
+  }
+  return levels;
+}
+
+}  // namespace shachain2pc::protocol
